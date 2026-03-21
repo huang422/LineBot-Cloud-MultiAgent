@@ -8,6 +8,7 @@ touching code.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from src.config import Settings
@@ -101,8 +102,6 @@ class BaseAgent(ABC):
         )
 
         if prompt:
-            from datetime import datetime, timezone, timedelta
-
             tw_tz = timezone(timedelta(hours=8))
             now = datetime.now(tw_tz).strftime("%Y-%m-%d %A %H:%M")
             prompt = prompt.replace("{current_time}", now)

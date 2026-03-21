@@ -178,7 +178,7 @@ cp .env.example .env
 6. Cloud Build 內執行測試與語法檢查
 7. 建置並推送新 image
 8. 部署到 Cloud Run
-9. 若有設定 `GCS_BUCKET_NAME`，部署流程會自動把 Cloud Run runtime service account 補上 `roles/iam.serviceAccountTokenCreator`
+9. 若有設定 `GCS_BUCKET_NAME`，部署流程會自動把 Cloud Run runtime service account 補上 `roles/iam.serviceAccountTokenCreator`，並檢查 / 補上 bucket 的 3 天 lifecycle 保底刪除規則
 10. 對 `/health` 和 `/webhook` 做 smoke check
 11. 清理舊 revision / image
 

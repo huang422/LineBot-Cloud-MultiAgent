@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from src.config import Settings
 from src.services import line_service as line_service_module
@@ -10,6 +10,10 @@ from src.services import storage_service as storage_service_module
 
 
 class SettingsValidationTests(unittest.TestCase):
+    def test_settings_default_gcs_cleanup_delay_is_two_days(self) -> None:
+        settings = Settings(_env_file=None)
+        self.assertEqual(settings.gcs_media_cleanup_delay_seconds, 172800)
+
     def test_settings_allow_unlisted_model_ids(self) -> None:
         settings = Settings(
             _env_file=None,
@@ -251,6 +255,40 @@ class StorageStatsTests(unittest.TestCase):
         self.assertEqual(stats["deleted_objects"], 1)
         self.assertEqual(stats["cleanup_delay_seconds"], 90)
         self.assertEqual(stats["scope"], "per-instance")
+
+    def test_storage_service_resolves_metadata_service_account_email(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            gcs_bucket_name="gcp-banana",
+            gcs_media_cleanup_delay_seconds=90,
+        )
+        credentials = SimpleNamespace(service_account_email="default")
+        fake_client = SimpleNamespace(
+            bucket=Mock(return_value=Mock()),
+            _credentials=credentials,
+        )
+        metadata_response = MagicMock()
+        metadata_response.getcode.return_value = 200
+        metadata_response.read.return_value = b"runtime@example.com\n"
+        metadata_request = MagicMock()
+        metadata_request.__enter__.return_value = metadata_response
+        metadata_request.__exit__.return_value = False
+
+        with patch.object(
+            storage_service_module,
+            "get_settings",
+            return_value=settings,
+        ), patch(
+            "google.cloud.storage.Client",
+            return_value=fake_client,
+        ), patch.object(
+            storage_service_module,
+            "urlopen",
+            return_value=metadata_request,
+        ):
+            service = storage_service_module.StorageService()
+
+        self.assertEqual(service._service_account_email, "runtime@example.com")
 
     def test_storage_service_uses_iam_signer_credentials_for_unsigned_credentials(self) -> None:
         settings = Settings(

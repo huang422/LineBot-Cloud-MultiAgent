@@ -131,16 +131,14 @@ def record_conversation(
     *,
     assistant_delivered: bool = True,
 ) -> None:
-    """Record both user message and bot response in conversation history."""
-    conv_svc = get_conversation_service()
+    """Record the bot's assistant response in conversation history.
 
-    if request.text:
-        conv_svc.add_message(
-            request.group_id,
-            ConversationMessage(role="user", content=request.text),
-        )
-
+    User messages are already recorded proactively by
+    ``_record_group_message`` in ``main.py`` for all incoming events,
+    so we only add the assistant reply here.
+    """
     if assistant_delivered and response_text:
+        conv_svc = get_conversation_service()
         conv_svc.add_message(
             request.group_id,
             ConversationMessage(role="assistant", content=response_text),

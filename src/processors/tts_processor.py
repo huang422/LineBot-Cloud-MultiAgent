@@ -47,13 +47,20 @@ async def text_to_speech(text: str, voice: str | None = None) -> UploadedMedia |
     try:
         comm = edge_tts.Communicate(text, voice)
         await comm.save(str(tmp_path))
-        logger.info(f"TTS generated: {tmp_path.name} ({tmp_path.stat().st_size} bytes)")
+
+        file_size = tmp_path.stat().st_size
+        duration_ms = _get_mp3_duration_ms(tmp_path)
+        logger.info(
+            f"TTS generated: {tmp_path.name} "
+            f"({file_size} bytes, {duration_ms}ms)"
+        )
 
         # Upload to GCS
         storage = get_storage_service()
         uploaded = await storage.upload_file(str(tmp_path), content_type="audio/mpeg")
 
         if uploaded:
+            uploaded.duration_ms = duration_ms
             logger.info(f"TTS uploaded to GCS")
             return uploaded
         else:
@@ -69,3 +76,15 @@ async def text_to_speech(text: str, voice: str | None = None) -> UploadedMedia |
             tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def _get_mp3_duration_ms(path: Path) -> int:
+    """Read actual MP3 duration using mutagen. Falls back to estimate from file size."""
+    try:
+        from mutagen.mp3 import MP3
+        audio = MP3(str(path))
+        return int(audio.info.length * 1000)
+    except Exception:
+        # Fallback: estimate from file size (128kbps ≈ 16KB/sec)
+        size = path.stat().st_size
+        return max(1000, int(size / 16))

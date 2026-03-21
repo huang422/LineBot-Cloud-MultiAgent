@@ -33,7 +33,35 @@ class RouterDecision:
 
 # Keywords that suggest the user wants an image generated
 _IMAGE_GEN_KEYWORDS = re.compile(
-    r"(畫|繪|生成圖|產生圖|畫一|幫我畫|draw|generate.*image|create.*image|make.*picture)",
+    r"("
+    # Chinese: explicit generation verbs
+    r"(?:幫我|請|幫忙|可以)?(?:畫|繪製|繪|生成|產生|做|創建|製作|設計|重畫|改畫|重新畫|重新繪|再畫)"
+    r"(?:一[張幅個]|[張幅個]|出)?(?:圖|圖片|畫|照片|海報|插畫|壁紙|頭像|logo|LOGO|貼圖|漫畫)?"
+    # Chinese: "I want a picture of..." — allow optional 的/.../的 between quantity and noun
+    r"|(?:我想要|我要|給我|來)(?:一[張幅個]|[張幅個]).{0,6}(?:圖|圖片|畫|照片|海報|插畫|壁紙|頭像|貼圖|漫畫)"
+    # Chinese: "generate/create image" compound
+    r"|生成圖|產生圖|生成一|產生一|做一張|做張"
+    # English
+    r"|(?:please\s+)?(?:draw|paint|sketch|illustrate|generate|create|make|design|produce)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+)?(?:image|picture|photo|illustration|poster|wallpaper|avatar|logo|icon|art|drawing|painting)"
+    r"|generate\s+(?:a\s+|an\s+)?image"
+    r"|create\s+(?:a\s+|an\s+)?(?:image|picture)"
+    r"|draw\s+(?:a\s+|an\s+|me\s+)?"
+    r")",
+    re.IGNORECASE,
+)
+
+# Negative patterns that look like image_gen but aren't
+_IMAGE_GEN_NEGATIVES = re.compile(
+    r"("
+    # "畫面" (screen/scene), "畫素" (pixel), "畫質" (quality) are NOT requests to draw
+    r"畫面|畫素|畫質|畫風(?:是|分析|像|怎麼)|畫法"
+    # Asking about drawing concepts, not requesting generation
+    r"|(?:怎麼|如何|什麼是|怎樣)(?:畫|繪|生成|畫圖|繪圖)"
+    # Drawing tools/techniques, not generation requests
+    r"|(?:畫|繪|生成)(?:軟體|工具|app|技巧|方法|步驟)"
+    # "圖表" (chart), "地圖" (map) analysis
+    r"|看(?:這[張個])?圖|分析(?:這[張個])?圖|圖(?:表|中|裡|上|內)"
+    r")",
     re.IGNORECASE,
 )
 
@@ -202,8 +230,13 @@ class Orchestrator(BaseAgent):
         has_image = request.input_type in (InputType.IMAGE, InputType.IMAGE_TEXT)
         text = request.text.strip()
 
+        wants_image_gen = (
+            _IMAGE_GEN_KEYWORDS.search(text)
+            and not _IMAGE_GEN_NEGATIVES.search(text)
+        )
+
         # Image with generation keywords
-        if has_image and _IMAGE_GEN_KEYWORDS.search(text):
+        if has_image and wants_image_gen:
             return RouterDecision("image_gen", "image", text, "image + gen keywords")
 
         # Image with no text or analysis text → vision
@@ -214,7 +247,7 @@ class Orchestrator(BaseAgent):
             return RouterDecision("vision", "text", text, "image with question")
 
         # Text-only rules
-        if _IMAGE_GEN_KEYWORDS.search(text):
+        if wants_image_gen:
             return RouterDecision("image_gen", "image", text, "draw/generate keywords")
 
         if _URL_PATTERN.search(text):
@@ -276,6 +309,12 @@ class Orchestrator(BaseAgent):
                 if output not in _VALID_OUTPUTS:
                     output = "text"
 
+                # Enforce consistency: image_gen ↔ image output
+                if agent == "image_gen":
+                    output = "image"
+                elif output == "image" and agent != "image_gen":
+                    output = "text"
+
                 return RouterDecision(
                     agent=agent,
                     output_format=output,
@@ -285,4 +324,5 @@ class Orchestrator(BaseAgent):
             except json.JSONDecodeError:
                 continue
 
+        logger.warning(f"Orchestrator LLM returned unparseable response: {text[:200]}")
         return RouterDecision("chat", "text", user_text, "could not parse LLM response")

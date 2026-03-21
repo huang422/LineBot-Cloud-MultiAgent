@@ -188,7 +188,9 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             main_module, "get_message_cache_service", return_value=cache_service
         ), patch.object(
             main_module, "_process_event", AsyncMock()
-        ) as process_event:
+        ) as process_event, patch.object(
+            main_module, "_record_group_message"
+        ):
             response = client.post(
                 "/webhook",
                 content=body,
@@ -215,7 +217,9 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             main_module, "get_message_cache_service", return_value=cache_service
         ), patch.object(
             main_module, "_process_event", AsyncMock()
-        ) as process_event:
+        ) as process_event, patch.object(
+            main_module, "_record_group_message"
+        ):
             response = client.post(
                 "/webhook",
                 content=body,

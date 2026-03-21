@@ -33,7 +33,7 @@ LineBot-CloudAgent receives LINE webhook events, routes them through a smart orc
 | Vision | Accepts images, screenshots, and photos for analysis |
 | Web search | Tavily search results are injected into the prompt before synthesis |
 | Webpage reading | If the user posts a URL, Tavily Extract fetches the page body and injects the webpage content into the prompt before synthesis |
-| Image generation | Stage 1 prompt refinement through the text-agent reasoning chain, then Sourceful Riverflow v2 Pro image generation via OpenRouter |
+| Image generation | Stage 1 prompt refinement through the text-agent reasoning chain, then NVIDIA Stable Diffusion 3 image generation via the NVIDIA API |
 | Voice reply | `edge-tts` produces audio, uploads it to GCS, and sends a LINE audio reply |
 | Quoted context | Reply to an earlier text or image and recover the original content from local cache |
 | Scheduled messages | APScheduler can send recurring group reminders and yearly birthday messages |
@@ -72,7 +72,7 @@ The rate tracker skips exhausted models before sending a request, so a `429` can
 | Text reasoning LLM | OpenRouter `nvidia/nemotron-3-super-120b-a12b:free` |
 | Vision LLM | NVIDIA Qwen3.5 397B |
 | Fallback LLMs | Trinity / Gemma / `openrouter/free` (task-dependent) |
-| Image generation | Sourceful Riverflow v2 Pro via OpenRouter |
+| Image generation | NVIDIA Stable Diffusion 3 (`stabilityai/stable-diffusion-3-medium`) |
 | Web search | Tavily |
 | Voice | `edge-tts` |
 | Object storage | Google Cloud Storage |
@@ -130,9 +130,11 @@ Recommended deploy values:
 
 Common runtime optional values:
 
-- `NVIDIA_API_KEY`
+- `NVIDIA_API_KEY` (required for image generation; recommended for chat/vision quality)
 - `TAVILY_API_KEY`
 - `GCS_BUCKET_NAME`
+- `GCS_SIGNED_URL_EXPIRY_HOURS` (default: `48`)
+- `GCS_MEDIA_CLEANUP_DELAY_SECONDS` (default: `172800`, i.e. 2 days)
 - `LINE_PUSH_MONTHLY_LIMIT`
 - `SCHEDULED_MESSAGES_ENABLED`
 - `SCHEDULED_GROUP_ID`
@@ -173,7 +175,7 @@ What the wrapper does:
 5. Runs `pytest` and `compileall` in Cloud Build before deployment.
 6. Builds and pushes a uniquely tagged container image.
 7. Deploys to the same Cloud Run service and routes 100% traffic to the latest revision.
-8. If `GCS_BUCKET_NAME` is configured, the deploy flow ensures the runtime service account has `roles/iam.serviceAccountTokenCreator` on itself so voice/image signed URLs work on Cloud Run.
+8. If `GCS_BUCKET_NAME` is configured, the deploy flow ensures the runtime service account has `roles/iam.serviceAccountTokenCreator` on itself so voice/image signed URLs work on Cloud Run, and it verifies a 3-day bucket lifecycle delete rule as a safety net.
 9. Runs smoke checks against `/health` and `/webhook`.
 10. Keeps the newest 1 revision by default and the newest 3 image digests by default.
 
@@ -245,7 +247,7 @@ Use this mode only when the target Cloud Run service already has its environment
 | LLM calls | Per-model RPM/RPD tracking and automatic fallback on `429` |
 | LINE push | Monthly push counter controlled by `LINE_PUSH_MONTHLY_LIMIT` |
 | Web search | Monthly quota counter controlled by `WEB_SEARCH_MONTHLY_QUOTA` |
-| GCS media | Auto-cleanup after delivery and signed URL expiry |
+| GCS media | Signed URLs expire after 48 hours, app cleanup runs after 2 days by default, and deploy verifies a 3-day bucket lifecycle safety net |
 | User requests | Per-user sliding-window rate limit |
 | Cloud Run | `max-instances=1`, `min-instances` auto-derived (`0` normally, `1` for in-process scheduled jobs unless overridden) |
 
@@ -254,7 +256,7 @@ Use this mode only when the target Cloud Run service already has its environment
 ## Operational notes
 
 - `/health` can return `200` even when `ready_for_webhook=false`; check the payload, not only the HTTP status.
-- Voice and generated-image delivery require `GCS_BUCKET_NAME`. Without it, text replies still work.
+- Voice and generated-image delivery require `GCS_BUCKET_NAME`. Without it, text replies still work. With the defaults, signed URLs expire after 48 hours, app cleanup waits 2 days, and the deploy flow verifies a 3-day bucket lifecycle fallback.
 - Scheduled messages require `SCHEDULED_MESSAGES_ENABLED=true`, `LINE_PUSH_FALLBACK_ENABLED=true`, a `SCHEDULED_GROUP_ID`, and at least one configured scheduled job.
 - Prompts are loaded from `prompts/*.md`, so you can change routing or tone without editing Python source.
 

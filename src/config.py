@@ -114,8 +114,8 @@ class Settings(BaseSettings):
 
     # ── GCP Cloud Storage ─────────────────────────────────────
     gcs_bucket_name: str = ""
-    gcs_signed_url_expiry_hours: int = 1
-    gcs_media_cleanup_delay_seconds: int = 600
+    gcs_signed_url_expiry_hours: int = 48
+    gcs_media_cleanup_delay_seconds: int = 172800  # best-effort in-process cleanup (2 days)
 
     # ── Tavily Web Search ─────────────────────────────────────
     tavily_api_key: str = ""

@@ -71,42 +71,76 @@ class NvidiaProvider:
     ) -> ProviderResponse:
         """Call NVIDIA chat completions API and return a unified response.
 
-        Reasoning mode depends on the model family (per NVIDIA docs):
-        - **Qwen3.5**: outputs ``<think>`` tags natively, no API param needed.
-        - **Nemotron Super V1 / Ultra V1**: system prompt ``"detailed thinking on"``
+        Reasoning mode depends on the model family (per official docs):
+        - **Qwen3/3.5**: ``/think`` soft switch + ``chat_template_kwargs``
           (recommended temp=0.6, top_p=0.95).
-        - **Nemotron 3 Nano / Super**: ``chat_template_kwargs: {enable_thinking: true}``
-          in extra_body.
+        - **Nemotron Super V1 / Ultra V1**: system prompt ``"detailed thinking on"``.
+        - **Nemotron 3 Nano / Super**: ``chat_template_kwargs: {enable_thinking: true}``.
         - **GPT-OSS**: ``reasoning_effort`` at top level.
         """
         from src.providers.model_registry import supports_reasoning as _supports_reasoning
 
         model = model.strip()
         if not model:
-            raise ProviderError("<empty>", 400, "Model ID must not be empty")
+            raise ProviderError("<empty>", 400, "Model ID must not be empty", provider="NVIDIA")
 
         expect_reasoning = self._thinking_enabled and _supports_reasoning(model)
         model_lower = model.lower()
 
-        # --- Model-family-specific reasoning activation (NVIDIA docs) ---
+        # --- Model-family-specific reasoning activation (per official docs) ---
         if expect_reasoning:
             if "nemotron-3-" in model_lower:
                 # Nemotron 3 Nano / Super: chat_template_kwargs
                 pass  # handled below in payload
             elif "nemotron" in model_lower:
-                # Nemotron Super V1 / Ultra V1: system prompt
-                thinking_prompt = {"role": "system", "content": "detailed thinking on"}
+                # Nemotron Super V1 / Ultra V1: system prompt "detailed thinking on"
+                messages = list(messages)
                 if not messages or messages[0].get("role") != "system":
-                    messages = [thinking_prompt] + list(messages)
+                    messages.insert(0, {"role": "system", "content": "detailed thinking on"})
                 elif "detailed thinking" not in messages[0].get("content", ""):
-                    messages = [thinking_prompt] + list(messages)
+                    # Merge into existing system message to avoid duplicates
+                    messages[0] = {
+                        **messages[0],
+                        "content": "detailed thinking on\n" + messages[0]["content"],
+                    }
             elif "gpt-oss" in model_lower:
                 pass  # handled below in payload
+            elif "qwen" in model_lower:
+                # Qwen3/3.5: /think soft switch to force thinking mode.
+                # Append /think to last user message (per Qwen3 docs).
+                messages = list(messages)
+                injected = False
+                for i in range(len(messages) - 1, -1, -1):
+                    msg = messages[i]
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            if content.strip() and "/think" not in content:
+                                messages[i] = {**msg, "content": content + " /think"}
+                                injected = True
+                        elif isinstance(content, list):
+                            # Multimodal message: append /think to first text part
+                            new_content = list(content)
+                            for j, part in enumerate(new_content):
+                                if part.get("type") == "text" and part.get("text", "").strip() and "/think" not in part.get("text", ""):
+                                    new_content[j] = {**part, "text": part["text"] + " /think"}
+                                    injected = True
+                                    break
+                            if injected:
+                                messages[i] = {**msg, "content": new_content}
+                        break
+                if not injected:
+                    logger.warning(f"Qwen /think: could not inject into messages for {model}")
+
+        # Qwen3 thinking mode needs extra tokens for <think> block
+        effective_max_tokens = max_tokens
+        if expect_reasoning and "qwen" in model_lower:
+            effective_max_tokens = self._thinking_budget + max_tokens
 
         payload: dict = {
             "model": model,
             "messages": messages,
-            "max_tokens": max_tokens,
+            "max_tokens": effective_max_tokens,
             "temperature": temperature,
         }
 
@@ -119,7 +153,12 @@ class NvidiaProvider:
             elif "gpt-oss" in model_lower:
                 # GPT-OSS: reasoning_effort at top level
                 payload["reasoning_effort"] = "high"
-        # Qwen3.5: reasoning via native <think> tags — no API parameter needed.
+            elif "qwen" in model_lower:
+                # Qwen3/3.5: enable_thinking via chat_template_kwargs (NIM)
+                payload["extra_body"] = {
+                    "chat_template_kwargs": {"enable_thinking": True}
+                }
+        # Qwen: /think soft switch (injected above) + chat_template_kwargs (belt-and-suspenders)
         # Nemotron V1/Ultra: reasoning via system prompt (injected above).
         # parse_openai_response() extracts reasoning from all formats.
 
@@ -134,7 +173,7 @@ class NvidiaProvider:
         except httpx.HTTPError as e:
             detail = str(e)
             logger.error(f"NVIDIA request failed for {model}: {detail}")
-            raise ProviderError(model, 0, detail) from e
+            raise ProviderError(model, 0, detail, provider="NVIDIA") from e
 
         self.rate_tracker.record_request(model)
 
@@ -145,13 +184,13 @@ class NvidiaProvider:
         if resp.status_code != 200:
             detail = resp.text[:500]
             logger.error(f"NVIDIA error {resp.status_code}: {detail}")
-            raise ProviderError(model, resp.status_code, detail)
+            raise ProviderError(model, resp.status_code, detail, provider="NVIDIA")
 
         try:
             data = resp.json()
         except ValueError as e:
             logger.error(f"NVIDIA returned invalid JSON for {model}: {e}")
-            raise ProviderError(model, resp.status_code, "Invalid JSON response") from e
+            raise ProviderError(model, resp.status_code, "Invalid JSON response", provider="NVIDIA") from e
         text, images, reasoning_content = parse_openai_response(data)
 
         usage = data.get("usage")
@@ -201,7 +240,7 @@ class NvidiaProvider:
         model = model.strip()
         endpoint = _IMAGE_MODEL_ENDPOINTS.get(model)
         if not endpoint:
-            raise ProviderError(model, 400, f"Unknown NVIDIA image model: {model}")
+            raise ProviderError(model, 400, f"Unknown NVIDIA image model: {model}", provider="NVIDIA")
 
         is_sd35 = "3.5" in model
         payload = self._build_image_payload(
@@ -215,7 +254,7 @@ class NvidiaProvider:
         except httpx.HTTPError as e:
             detail = str(e)
             logger.error(f"NVIDIA image request failed for {model}: {detail}")
-            raise ProviderError(model, 0, detail) from e
+            raise ProviderError(model, 0, detail, provider="NVIDIA") from e
 
         self.rate_tracker.record_request(model)
 
@@ -226,13 +265,13 @@ class NvidiaProvider:
         if resp.status_code != 200:
             detail = resp.text[:500]
             logger.error(f"NVIDIA image error {resp.status_code}: {detail}")
-            raise ProviderError(model, resp.status_code, detail)
+            raise ProviderError(model, resp.status_code, detail, provider="NVIDIA")
 
         try:
             data = resp.json()
         except ValueError as e:
             logger.error(f"NVIDIA image returned invalid JSON for {model}: {e}")
-            raise ProviderError(model, resp.status_code, "Invalid JSON response") from e
+            raise ProviderError(model, resp.status_code, "Invalid JSON response", provider="NVIDIA") from e
 
         base64_image, finish_reason = self._parse_image_response(data, is_sd35)
 

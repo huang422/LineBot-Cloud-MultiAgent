@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 from collections import deque
 from io import BytesIO
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -19,6 +21,7 @@ from src.models.agent_request import AgentRequest, InputType
 from src.models.conversation import ConversationMessage
 from src.processors import input_processor as input_processor_module
 from src.processors import output_processor as output_processor_module
+from src.processors import tts_processor as tts_processor_module
 from src.providers.fallback_chain import (
     AllModelsRateLimitedError,
     AllProvidersFailedError,
@@ -218,6 +221,8 @@ class WebhookTriggerTests(unittest.TestCase):
 
 class ConversationRecordingTests(unittest.TestCase):
     def test_record_conversation_skips_undelivered_assistant_reply(self) -> None:
+        """record_conversation only records assistant replies (user messages
+        are handled proactively by _record_group_message in main.py)."""
         recorded: list[tuple[str, str, str]] = []
 
         class FakeConversationService:
@@ -237,7 +242,9 @@ class ConversationRecordingTests(unittest.TestCase):
                 assistant_delivered=False,
             )
 
-        self.assertEqual(recorded, [("G1", "user", "hello")])
+        # No assistant recorded because assistant_delivered=False;
+        # user messages are not recorded here (handled elsewhere).
+        self.assertEqual(recorded, [])
 
 
 class WebSearchRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -1056,9 +1063,28 @@ class OutputProcessorTests(unittest.IsolatedAsyncioTestCase):
             sent = await output_processor_module.send_response(request, response)
 
         self.assertTrue(sent)
-        line.send_audio.assert_awaited_once_with("reply", "G1", "https://example.com/audio.mp3")
+        line.send_audio.assert_awaited_once_with("reply", "G1", "https://example.com/audio.mp3", duration_ms=60000)
         line.send_text.assert_awaited_once_with("reply", "G1", "請聽這段")
         storage.schedule_cleanup.assert_called_once_with(uploaded, delay_seconds=0)
+
+
+class TtsProcessorTests(unittest.TestCase):
+    def test_mp3_duration_fallback_uses_128kbps_estimate(self) -> None:
+        original_import = __import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "mutagen.mp3":
+                raise ImportError("mutagen unavailable")
+            return original_import(name, globals, locals, fromlist, level)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sample.mp3"
+            path.write_bytes(b"x" * 32000)
+
+            with patch("builtins.__import__", side_effect=fake_import):
+                duration_ms = tts_processor_module._get_mp3_duration_ms(path)
+
+        self.assertEqual(duration_ms, 2000)
 
 
 class OrchestratorParsingTests(unittest.TestCase):

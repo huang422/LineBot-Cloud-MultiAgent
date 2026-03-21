@@ -21,6 +21,7 @@ from src.utils.rate_tracker import RateTracker
 # Services
 from src.services.line_service import get_line_service, close_line_service
 from src.services.conversation_service import get_conversation_service
+from src.models.conversation import ConversationMessage
 from src.services.message_cache_service import get_message_cache_service
 
 # Providers
@@ -443,6 +444,9 @@ async def webhook(request: Request):
     for event in events:
         should_process = should_handle(event)
 
+        # Proactively record ALL group messages for conversation context
+        _record_group_message(event)
+
         if event.get("type") == "message" and not should_process:
             task = asyncio.create_task(
                 get_message_cache_service().cache_event_message(event)
@@ -457,6 +461,62 @@ async def webhook(request: Request):
 
 
 # ── Background processing ────────────────────────────────────
+
+
+def _record_group_message(event: dict) -> None:
+    """Proactively record ALL incoming messages for conversation context.
+
+    This captures messages from users who don't trigger the bot (no !hej
+    or @mention), so the LLM has full group conversation context.
+    """
+    if event.get("type") != "message":
+        return
+
+    message = event.get("message", {})
+    msg_type = message.get("type", "")
+    source = event.get("source", {})
+    user_id = source.get("userId", "")
+    group_id = source.get("groupId") or source.get("roomId") or user_id
+
+    if not user_id or not group_id:
+        return
+
+    conv_svc = get_conversation_service()
+
+    if msg_type == "text":
+        text = message.get("text", "").strip()
+        if text:
+            conv_svc.add_message(
+                group_id,
+                ConversationMessage(
+                    role="user", content=text,
+                    user_id=user_id, message_type="text",
+                ),
+            )
+    elif msg_type == "image":
+        conv_svc.add_message(
+            group_id,
+            ConversationMessage(
+                role="user", content="[圖片]",
+                user_id=user_id, message_type="image",
+            ),
+        )
+    elif msg_type == "sticker":
+        conv_svc.add_message(
+            group_id,
+            ConversationMessage(
+                role="user", content="[貼圖]",
+                user_id=user_id, message_type="sticker",
+            ),
+        )
+    elif msg_type == "audio":
+        conv_svc.add_message(
+            group_id,
+            ConversationMessage(
+                role="user", content="[語音]",
+                user_id=user_id, message_type="audio",
+            ),
+        )
 
 async def _process_event(event: dict) -> None:
     """Process a single LINE event in the background."""

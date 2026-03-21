@@ -157,9 +157,27 @@ class WebSearchService:
         self,
         query: str,
         max_results: Optional[int] = None,
-        include_answer: bool = True,
-        search_depth: str = "basic",
+        include_answer: bool | str = True,
+        search_depth: str = "advanced",
+        topic: Optional[str] = None,
+        time_range: Optional[str] = None,
+        include_domains: Optional[list[str]] = None,
+        exclude_domains: Optional[list[str]] = None,
     ) -> WebSearchResponse:
+        """Execute a Tavily search.
+
+        Args:
+            query: Search query string.
+            max_results: 1-10, defaults to ``self.max_results``.
+            include_answer: ``True`` for basic AI answer, ``"advanced"``
+                for a more detailed LLM-generated answer (costs 2 credits).
+            search_depth: ``"basic"`` (fast, 1 credit), ``"advanced"``
+                (deeper, 2 credits).
+            topic: ``"general"`` (default), ``"news"`` or ``"finance"``.
+            time_range: ``"day"``, ``"week"``, ``"month"`` or ``"year"``.
+            include_domains: Restrict results to these domains.
+            exclude_domains: Exclude results from these domains.
+        """
         if not query or not query.strip():
             raise ValueError("Search query cannot be empty")
         if not self.is_configured:
@@ -167,17 +185,26 @@ class WebSearchService:
 
         num_results = max(1, min(10, max_results or self.max_results))
 
+        kwargs: dict = {
+            "query": query.strip(),
+            "max_results": num_results,
+            "include_answer": include_answer,
+            "search_depth": search_depth,
+        }
+        if topic:
+            kwargs["topic"] = topic
+        if time_range:
+            kwargs["time_range"] = time_range
+        if include_domains:
+            kwargs["include_domains"] = include_domains
+        if exclude_domains:
+            kwargs["exclude_domains"] = exclude_domains
+
         try:
             client = self._get_client()
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
-                None,
-                lambda: client.search(
-                    query=query.strip(),
-                    max_results=num_results,
-                    include_answer=include_answer,
-                    search_depth=search_depth,
-                )
+                None, lambda: client.search(**kwargs)
             )
 
             results = [
@@ -191,9 +218,10 @@ class WebSearchService:
             ]
 
             self._month_search_count += 1
+            depth_tag = search_depth
             logger.info(
-                f"Search complete: '{query[:30]}...', {len(results)} results, "
-                f"quota={self.quota_remaining}/{self._monthly_quota}"
+                f"Search complete: '{query[:50]}…' depth={depth_tag}, "
+                f"{len(results)} results, quota={self.quota_remaining}/{self._monthly_quota}"
             )
 
             return WebSearchResponse(

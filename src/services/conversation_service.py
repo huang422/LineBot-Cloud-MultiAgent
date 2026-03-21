@@ -41,23 +41,38 @@ class ConversationService:
         self._history[chat_id].append(msg)
 
     def get_history(self, chat_id: str) -> list[dict]:
-        """Return OpenAI-format message list for context."""
+        """Return OpenAI-format message list for context.
+
+        User messages include a short user tag (``User_XXXX:``) so the
+        LLM can distinguish speakers in group conversations.
+        """
         now = time()
         messages = self._prune_expired_messages(chat_id, now)
         if messages is None:
             return []
 
-        messages = [
-            {"role": m.role, "content": m.content}
-            for m in messages
-        ]
+        result: list[dict] = []
+        for m in messages:
+            if m.role == "user":
+                tag = f"User_{m.user_id[-4:]}:" if m.user_id else ""
+                if m.message_type == "image":
+                    content = f"{tag} [發送了圖片]" if tag else "[發送了圖片]"
+                elif m.message_type == "sticker":
+                    content = f"{tag} [發送了貼圖]" if tag else "[發送了貼圖]"
+                elif m.message_type == "audio":
+                    content = f"{tag} [發送了語音]" if tag else "[發送了語音]"
+                else:
+                    content = f"{tag} {m.content}" if tag else m.content
+                result.append({"role": "user", "content": content})
+            else:
+                result.append({"role": m.role, "content": m.content})
 
         # Periodic cleanup of all expired entries
         if now - self._last_cleanup > self._cleanup_interval:
             self.cleanup_expired()
             self._last_cleanup = now
 
-        return messages
+        return result
 
     def cleanup_expired(self) -> int:
         """Remove chat entries where all messages have expired. Returns count removed."""

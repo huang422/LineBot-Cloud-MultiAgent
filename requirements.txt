@@ -15,6 +15,7 @@ Pillow>=10.2.0
 
 # Text-to-Speech (completely free, no API key)
 edge-tts>=6.1.0
+mutagen>=1.47.0
 
 # Web Search
 tavily-python>=0.5.0

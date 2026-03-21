@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from datetime import timedelta
 from functools import partial
+from urllib.request import Request as UrlRequest, urlopen
 from uuid import uuid4
 
 from google.auth import iam
@@ -35,6 +36,7 @@ class UploadedMedia:
     public_url: str
     blob_name: str | None = None
     size_bytes: int = 0
+    duration_ms: int | None = None
 
 
 class StorageService:
@@ -96,16 +98,18 @@ class StorageService:
         email, but IAM signBlob requires the actual email address.
         """
         try:
-            import requests
-            resp = requests.get(
+            request = UrlRequest(
                 "http://metadata.google.internal/computeMetadata/v1/"
                 "instance/service-accounts/default/email",
                 headers={"Metadata-Flavor": "Google"},
-                timeout=3,
             )
-            if resp.status_code == 200 and "@" in resp.text:
-                return resp.text.strip()
-        except Exception:
+            with urlopen(request, timeout=3) as response:
+                if response.getcode() != 200:
+                    return ""
+                email = response.read().decode("utf-8").strip()
+                if "@" in email:
+                    return email
+        except (OSError, UnicodeDecodeError):
             pass
         return ""
 

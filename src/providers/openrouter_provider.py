@@ -27,11 +27,13 @@ class RateLimitError(Exception):
 class ProviderError(Exception):
     """Raised on non-rate-limit API errors."""
 
-    def __init__(self, model: str, status: int, detail: str):
+    def __init__(self, model: str, status: int, detail: str, *, provider: str = ""):
         self.model = model
         self.status = status
         self.detail = detail
-        super().__init__(f"OpenRouter error {status} for {model}: {detail}")
+        self.provider = provider
+        label = f"{provider} error" if provider else f"Provider error"
+        super().__init__(f"{label} {status} for {model}: {detail}")
 
 
 @dataclass
@@ -169,7 +171,7 @@ class OpenRouterProvider:
 
         model = model.strip()
         if not model:
-            raise ProviderError("<empty>", 400, "Model ID must not be empty")
+            raise ProviderError("<empty>", 400, "Model ID must not be empty", provider="OpenRouter")
 
         # Only attach reasoning for models known to support it
         use_reasoning = (
@@ -202,7 +204,7 @@ class OpenRouterProvider:
         except httpx.HTTPError as e:
             detail = str(e)
             logger.error(f"OpenRouter request failed for {model}: {detail}")
-            raise ProviderError(model, 0, detail) from e
+            raise ProviderError(model, 0, detail, provider="OpenRouter") from e
 
         # Update rate-limit tracking from headers
         self.rate_tracker.update_from_headers(model, dict(resp.headers))
@@ -223,13 +225,12 @@ class OpenRouterProvider:
                 )
             else:
                 logger.error(f"OpenRouter error {resp.status_code}: {detail}")
-            raise ProviderError(model, resp.status_code, detail)
-
+            raise ProviderError(model, resp.status_code, detail, provider="OpenRouter")
         try:
             data = resp.json()
         except ValueError as e:
             logger.error(f"OpenRouter returned invalid JSON for {model}: {e}")
-            raise ProviderError(model, resp.status_code, "Invalid JSON response") from e
+            raise ProviderError(model, resp.status_code, "Invalid JSON response", provider="OpenRouter") from e
         text, images, reasoning_content = parse_openai_response(data)
 
         usage = data.get("usage")

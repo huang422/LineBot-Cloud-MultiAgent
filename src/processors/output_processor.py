@@ -102,7 +102,10 @@ async def send_response(request: AgentRequest, response: AgentResponse) -> bool:
         uploaded_audio = await text_to_speech(text)
         if uploaded_audio:
             storage = get_storage_service()
-            sent = await line.send_audio(request.reply_token, to, uploaded_audio.public_url)
+            duration = uploaded_audio.duration_ms or 60000
+            sent = await line.send_audio(
+                request.reply_token, to, uploaded_audio.public_url, duration_ms=duration
+            )
             if sent:
                 storage.schedule_cleanup(uploaded_audio)
                 return True

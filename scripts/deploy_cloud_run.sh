@@ -327,8 +327,10 @@ os.close(fd)
 print(path)
 PY
 )"
+TEMP_GCS_LIFECYCLE_JSON=""
 cleanup() {
   rm -f "$TEMP_ENV_YAML"
+  rm -f "$TEMP_GCS_LIFECYCLE_JSON"
 }
 trap cleanup EXIT
 
@@ -423,6 +425,73 @@ if [[ -n "$GCS_BUCKET_NAME_VALUE" ]]; then
     --project "$PROJECT_ID" \
     --member="serviceAccount:$RUNTIME_SERVICE_ACCOUNT" \
     --role="roles/iam.serviceAccountTokenCreator" >/dev/null
+
+  echo "[step] Ensuring GCS lifecycle rule (auto-delete after 3 days)"
+  BUCKET_URL="gs://$GCS_BUCKET_NAME_VALUE"
+  CURRENT_BUCKET_JSON="$(gcloud storage buckets describe "$BUCKET_URL" \
+    --project "$PROJECT_ID" \
+    --format=json)"
+  DESIRED_LIFECYCLE_JSON="$(CURRENT_BUCKET_JSON="$CURRENT_BUCKET_JSON" python3 - <<'PY'
+from __future__ import annotations
+
+import json
+import os
+
+data = json.loads(os.environ["CURRENT_BUCKET_JSON"])
+lifecycle_config = data.get("lifecycle_config") or data.get("lifecycle") or {}
+rules = (lifecycle_config.get("rule") or [])
+target_rule = {"action": {"type": "Delete"}, "condition": {"age": 3}}
+
+def normalize(rule: dict) -> str:
+    return json.dumps(rule, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+merged_rules: list[dict] = []
+seen: set[str] = set()
+for rule in [*rules, target_rule]:
+    if not isinstance(rule, dict):
+        continue
+    marker = normalize(rule)
+    if marker in seen:
+        continue
+    seen.add(marker)
+    merged_rules.append(rule)
+
+print(json.dumps({"rule": merged_rules}, ensure_ascii=False, separators=(",", ":")))
+PY
+)"
+  TEMP_GCS_LIFECYCLE_JSON="$(mktemp "${TMPDIR:-/tmp}/linebot-gcs-lifecycle.XXXXXX.json")"
+  printf '%s' "$DESIRED_LIFECYCLE_JSON" > "$TEMP_GCS_LIFECYCLE_JSON"
+  if ! gcloud storage buckets update "$BUCKET_URL" \
+    --lifecycle-file="$TEMP_GCS_LIFECYCLE_JSON" \
+    --project "$PROJECT_ID" >/dev/null; then
+    fail "Could not set GCS lifecycle rule on $BUCKET_URL"
+  fi
+
+  VERIFIED_BUCKET_JSON="$(gcloud storage buckets describe "$BUCKET_URL" \
+    --project "$PROJECT_ID" \
+    --format=json)"
+  if ! VERIFIED_BUCKET_JSON="$VERIFIED_BUCKET_JSON" python3 - <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+data = json.loads(os.environ["VERIFIED_BUCKET_JSON"])
+lifecycle_config = data.get("lifecycle_config") or data.get("lifecycle") or {}
+rules = (lifecycle_config.get("rule") or [])
+has_target = any(
+    isinstance(rule, dict)
+    and (rule.get("action") or {}).get("type") == "Delete"
+    and (rule.get("condition") or {}).get("age") == 3
+    for rule in rules
+)
+sys.exit(0 if has_target else 1)
+PY
+  then
+    fail "GCS lifecycle verification failed: expected a 3-day Delete rule on $BUCKET_URL"
+  fi
+  echo "       GCS lifecycle rule verified: delete objects after 3 days"
 fi
 
 echo "[step] Ensuring public Cloud Run access for LINE webhook"

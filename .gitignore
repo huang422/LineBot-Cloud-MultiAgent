@@ -1,0 +1,11 @@
+.env
+.cloudrun-env.generated.*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.vscode/
+.DS_Store
+credentials.json
+/tmp/

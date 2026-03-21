@@ -1,0 +1,29 @@
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# HTTP Client (OpenRouter + LINE API)
+httpx>=0.26.0
+
+# Data Validation & Settings
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+
+# Image Processing
+Pillow>=10.2.0
+
+# Text-to-Speech (completely free, no API key)
+edge-tts>=6.1.0
+
+# Web Search
+tavily-python>=0.5.0
+
+# Chinese Simplified → Traditional conversion
+opencc-python-reimplemented>=0.1.7
+
+# GCP Cloud Storage (for audio/image temp URLs)
+google-cloud-storage>=2.14.0
+
+# Scheduler (weekly/yearly scheduled messages)
+APScheduler>=3.10.0

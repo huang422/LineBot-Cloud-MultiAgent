@@ -1,0 +1,252 @@
+# Cloud-first build/deploy pipeline for LineBot-CloudAgent.
+#
+# Preferred entrypoint:
+#   ./scripts/deploy_cloud_run.sh
+#
+# Direct use example:
+#   gcloud builds submit . \
+#     --project YOUR_PROJECT_ID \
+#     --config cloudbuild.yaml \
+#     --substitutions=_SERVICE_NAME=linebot-cloud-agent,_REGION=us-west1,_IMAGE_TAG=manual-20260321
+#
+# If you submit this config directly, ensure the Cloud Run service already has its
+# env vars configured, or upload a generated env-vars file via _ENV_VARS_FILE.
+
+substitutions:
+  _SERVICE_NAME: linebot-cloud-agent
+  _REGION: us-west1
+  _MIN_INSTANCES: "0"
+  _IMAGE_TAG: latest
+  _ENV_VARS_FILE: ""
+  _SERVICE_ACCOUNT: ""
+  _SKIP_TESTS: "false"
+  _SKIP_SMOKE: "false"
+  _KEEP_REVISION_COUNT: "1"
+  _KEEP_IMAGE_COUNT: "3"
+
+options:
+  substitutionOption: ALLOW_LOOSE
+
+steps:
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        if ! gcloud artifacts repositories describe linebot-cloud-agent \
+          --project "$PROJECT_ID" \
+          --location "${_REGION}" >/dev/null 2>&1; then
+          gcloud artifacts repositories create linebot-cloud-agent \
+            --project "$PROJECT_ID" \
+            --repository-format=docker \
+            --location "${_REGION}" \
+            --description "LineBot-CloudAgent container images"
+          echo "[ok] Created Artifact Registry repository"
+        else
+          echo "[ok] Artifact Registry repository already exists"
+        fi
+
+  - name: 'python:3.11'
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        if [[ "${_SKIP_TESTS}" == "true" ]]; then
+          echo "[skip] Unit tests and syntax checks disabled"
+          exit 0
+        fi
+
+        python -m pip install --disable-pip-version-check --no-cache-dir -r requirements-dev.txt
+        python -m pytest -q
+        python -m compileall -q main.py src tests scripts
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/linebot-cloud-agent/app:${_IMAGE_TAG}
+      - .
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/linebot-cloud-agent/app:${_IMAGE_TAG}
+
+  # ── Best-effort IAM for GCS signed URLs ───────────────────
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        # Enable IAMCredentials API (needed for signBlob on Cloud Run)
+        gcloud services enable iamcredentials.googleapis.com --project "$PROJECT_ID" >/dev/null 2>&1 || true
+
+        # Determine the service account that Cloud Run will use
+        if [[ -n "${_SERVICE_ACCOUNT}" ]]; then
+          SA_EMAIL="${_SERVICE_ACCOUNT}"
+        else
+          PROJECT_NUMBER="$$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null || true)"
+          if [[ -z "$$PROJECT_NUMBER" ]]; then
+            echo "[warn] Skipping pre-deploy IAM setup because the project number could not be resolved."
+            echo "[warn] The deploy wrapper will try to grant roles/iam.serviceAccountTokenCreator after deploy."
+            exit 0
+          fi
+          SA_EMAIL="$${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+        fi
+
+        # Grant serviceAccountTokenCreator on itself (required for signBlob)
+        if gcloud iam service-accounts add-iam-policy-binding "$$SA_EMAIL" \
+          --project "$PROJECT_ID" \
+          --member "serviceAccount:$$SA_EMAIL" \
+          --role roles/iam.serviceAccountTokenCreator \
+          --quiet >/dev/null 2>&1; then
+          echo "[ok] IAM configured for GCS signed URLs (SA: $$SA_EMAIL)"
+        else
+          echo "[warn] Could not grant roles/iam.serviceAccountTokenCreator to $$SA_EMAIL during Cloud Build."
+          echo "[warn] Deployment will continue; the local deploy wrapper should retry after Cloud Run deploy."
+        fi
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        IMAGE="${_REGION}-docker.pkg.dev/$PROJECT_ID/linebot-cloud-agent/app:${_IMAGE_TAG}"
+
+        deploy_args=(
+          run deploy "${_SERVICE_NAME}"
+          --project "$PROJECT_ID"
+          --image "$$IMAGE"
+          --region "${_REGION}"
+          --platform managed
+          --allow-unauthenticated
+          --no-cpu-throttling
+          --min-instances "${_MIN_INSTANCES}"
+          --max-instances 1
+          --timeout 300
+          --memory 512Mi
+          --cpu 1
+        )
+
+        if [[ -n "${_ENV_VARS_FILE}" ]]; then
+          deploy_args+=(--env-vars-file "${_ENV_VARS_FILE}")
+        fi
+
+        if [[ -n "${_SERVICE_ACCOUNT}" ]]; then
+          deploy_args+=(--service-account "${_SERVICE_ACCOUNT}")
+        fi
+
+        gcloud "$${deploy_args[@]}"
+
+        gcloud run services update-traffic "${_SERVICE_NAME}" \
+          --project "$PROJECT_ID" \
+          --region "${_REGION}" \
+          --to-latest >/dev/null
+
+        SERVICE_URL="$$(gcloud run services describe "${_SERVICE_NAME}" \
+          --project "$PROJECT_ID" \
+          --region "${_REGION}" \
+          --format='value(status.url)')"
+
+        if [[ -z "$$SERVICE_URL" ]]; then
+          echo "[fail] Could not determine deployed service URL" >&2
+          exit 1
+        fi
+
+        printf '%s' "$$SERVICE_URL" > /workspace/service-url.txt
+        echo "[ok] Deployed service URL: $$SERVICE_URL"
+
+  - name: 'python:3.11'
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        if [[ "${_SKIP_SMOKE}" == "true" ]]; then
+          echo "[skip] Smoke checks disabled"
+          exit 0
+        fi
+
+        python -m pip install --disable-pip-version-check --no-cache-dir -r requirements-dev.txt
+        SERVICE_URL="$$(cat /workspace/service-url.txt)"
+        smoke_args=(tests/smoke_test_cloud.py --base-url "$$SERVICE_URL" --expect-ready)
+        if [[ -n "${_ENV_VARS_FILE}" ]]; then
+          smoke_args+=(--cloud-run-env-file "${_ENV_VARS_FILE}")
+        fi
+        python "$${smoke_args[@]}"
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        KEEP_REVISION_COUNT="${_KEEP_REVISION_COUNT}"
+        KEEP_IMAGE_COUNT="${_KEEP_IMAGE_COUNT}"
+
+        if [[ ! "$$KEEP_REVISION_COUNT" =~ ^[0-9]+$ ]] || [[ "$$KEEP_REVISION_COUNT" -lt 1 ]]; then
+          echo "[fail] _KEEP_REVISION_COUNT must be >= 1" >&2
+          exit 1
+        fi
+        if [[ ! "$$KEEP_IMAGE_COUNT" =~ ^[0-9]+$ ]] || [[ "$$KEEP_IMAGE_COUNT" -lt 1 ]]; then
+          echo "[fail] _KEEP_IMAGE_COUNT must be >= 1" >&2
+          exit 1
+        fi
+
+        revision_failures=0
+        image_failures=0
+
+        echo "[step] Cleaning up old revisions (keeping $${KEEP_REVISION_COUNT})"
+        OLD_REVISIONS="$$(gcloud run revisions list \
+          --service "${_SERVICE_NAME}" \
+          --project "$PROJECT_ID" \
+          --region "${_REGION}" \
+          --sort-by='~metadata.creationTimestamp' \
+          --format='value(metadata.name)' | awk -v keep="$$KEEP_REVISION_COUNT" 'NR > keep')"
+
+        if [[ -n "$$OLD_REVISIONS" ]]; then
+          while IFS= read -r revision; do
+            [[ -z "$$revision" ]] && continue
+            if gcloud run revisions delete "$$revision" \
+              --project "$PROJECT_ID" \
+              --region "${_REGION}" \
+              --quiet >/dev/null 2>&1; then
+              echo "[ok] Deleted revision: $$revision"
+            else
+              echo "[warn] Failed to delete revision: $$revision" >&2
+              revision_failures=$$((revision_failures + 1))
+            fi
+          done <<< "$$OLD_REVISIONS"
+        else
+          echo "[ok] No old revisions to delete"
+        fi
+
+        echo "[step] Cleaning up old images (keeping $${KEEP_IMAGE_COUNT})"
+        OLD_IMAGES="$$(gcloud artifacts docker images list \
+          "${_REGION}-docker.pkg.dev/$PROJECT_ID/linebot-cloud-agent/app" \
+          --project "$PROJECT_ID" \
+          --sort-by='~UPDATE_TIME' \
+          --format='get(version)' | awk -v keep="$$KEEP_IMAGE_COUNT" 'NR > keep')"
+
+        if [[ -n "$$OLD_IMAGES" ]]; then
+          while IFS= read -r digest; do
+            [[ -z "$$digest" ]] && continue
+            if gcloud artifacts docker images delete \
+              "${_REGION}-docker.pkg.dev/$PROJECT_ID/linebot-cloud-agent/app@$${digest}" \
+              --project "$PROJECT_ID" \
+              --quiet \
+              --delete-tags >/dev/null 2>&1; then
+              echo "[ok] Deleted image digest: $$digest"
+            else
+              echo "[warn] Failed to delete image digest: $$digest" >&2
+              image_failures=$$((image_failures + 1))
+            fi
+          done <<< "$$OLD_IMAGES"
+        else
+          echo "[ok] No old images to delete"
+        fi
+
+        if (( revision_failures > 0 || image_failures > 0 )); then
+          echo "[warn] Deploy completed, but some cleanup steps need manual follow-up" >&2
+        fi
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/linebot-cloud-agent/app:${_IMAGE_TAG}

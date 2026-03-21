@@ -1,0 +1,17 @@
+.gcloudignore
+.git
+.gitignore
+.env
+.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.vscode/
+.DS_Store
+credentials.json
+/tmp/
+README.md
+DEPLOY.md
+LICENSE

@@ -26,6 +26,7 @@ class VisionAgent(BaseAgent):
             messages=messages,
             temperature=self.settings.vision_temperature,
             max_tokens=self.settings.vision_max_tokens,
+            require_reasoning_tokens=self.settings.require_reasoning_tokens,
         )
 
         return AgentResponse(

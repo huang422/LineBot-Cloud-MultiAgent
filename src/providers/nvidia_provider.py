@@ -31,9 +31,12 @@ _IMAGE_MODEL_ENDPOINTS = {
 class NvidiaProvider:
     """Async client for NVIDIA's free inference API.
 
-    Reasoning for Qwen3.5 is model-native: the model outputs ``<think>``
-    tags in its content automatically.  No special API parameter is needed.
-    ``parse_openai_response`` extracts this into ``reasoning_content``.
+    Reasoning activation is model-family-specific:
+    - Qwen3/3.5: ``/think`` soft switch + ``chat_template_kwargs`` (top-level).
+    - Nemotron 3 Nano/Super: ``chat_template_kwargs`` (top-level).
+    - Nemotron Super V1 / Ultra V1: system prompt ``"detailed thinking on"``.
+    - GPT-OSS: ``reasoning_effort`` at top level.
+    ``parse_openai_response`` extracts reasoning from all response formats.
     """
 
     BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -90,8 +93,7 @@ class NvidiaProvider:
         # --- Model-family-specific reasoning activation (per official docs) ---
         if expect_reasoning:
             if "nemotron-3-" in model_lower:
-                # Nemotron 3 Nano / Super: chat_template_kwargs
-                pass  # handled below in payload
+                pass  # message injection not needed; payload handled below
             elif "nemotron" in model_lower:
                 # Nemotron Super V1 / Ultra V1: system prompt "detailed thinking on"
                 messages = list(messages)
@@ -104,7 +106,7 @@ class NvidiaProvider:
                         "content": "detailed thinking on\n" + messages[0]["content"],
                     }
             elif "gpt-oss" in model_lower:
-                pass  # handled below in payload
+                pass  # payload handled below
             elif "qwen" in model_lower:
                 # Qwen3/3.5: /think soft switch to force thinking mode.
                 # Append /think to last user message (per Qwen3 docs).
@@ -145,22 +147,11 @@ class NvidiaProvider:
         }
 
         if expect_reasoning:
-            if "nemotron-3-" in model_lower:
-                # Nemotron 3 Nano/Super: enable_thinking via chat_template_kwargs
-                payload["extra_body"] = {
-                    "chat_template_kwargs": {"enable_thinking": True}
-                }
-            elif "gpt-oss" in model_lower:
-                # GPT-OSS: reasoning_effort at top level
+            if "gpt-oss" in model_lower:
                 payload["reasoning_effort"] = "high"
-            elif "qwen" in model_lower:
-                # Qwen3/3.5: enable_thinking via chat_template_kwargs (NIM)
-                payload["extra_body"] = {
-                    "chat_template_kwargs": {"enable_thinking": True}
-                }
-        # Qwen: /think soft switch (injected above) + chat_template_kwargs (belt-and-suspenders)
-        # Nemotron V1/Ultra: reasoning via system prompt (injected above).
-        # parse_openai_response() extracts reasoning from all formats.
+            elif "nemotron-3-" in model_lower or "qwen" in model_lower:
+                payload["chat_template_kwargs"] = {"enable_thinking": True}
+            # Nemotron V1/Ultra: reasoning via system prompt (injected above).
 
         logger.info(
             f"NVIDIA request → {model} "
@@ -195,6 +186,10 @@ class NvidiaProvider:
 
         usage = data.get("usage")
         reasoning_tokens = (usage or {}).get("reasoning_tokens", 0)
+        if not reasoning_tokens:
+            reasoning_tokens = (
+                (usage or {}).get("completion_tokens_details") or {}
+            ).get("reasoning_tokens", 0)
         if require_reasoning_tokens and expect_reasoning and reasoning_tokens <= 0 and not reasoning_content:
             logger.warning(
                 f"NVIDIA response from {model} has no reasoning tokens and no reasoning content; "

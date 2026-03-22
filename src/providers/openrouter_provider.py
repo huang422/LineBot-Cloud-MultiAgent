@@ -234,7 +234,12 @@ class OpenRouterProvider:
         text, images, reasoning_content = parse_openai_response(data)
 
         usage = data.get("usage")
+        # reasoning_tokens may be top-level or nested under completion_tokens_details
         reasoning_tokens = (usage or {}).get("reasoning_tokens", 0)
+        if not reasoning_tokens:
+            reasoning_tokens = (
+                (usage or {}).get("completion_tokens_details") or {}
+            ).get("reasoning_tokens", 0)
         if require_reasoning_tokens and use_reasoning and reasoning_tokens <= 0 and not reasoning_content:
             logger.warning(
                 f"OpenRouter response from {model} has no reasoning tokens and no reasoning content; "

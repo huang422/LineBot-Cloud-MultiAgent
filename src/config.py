@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_reasoning_enabled: bool = True
     openrouter_reasoning_effort: str = "high"
-    openrouter_reasoning_exclude: bool = True
+    openrouter_reasoning_exclude: bool = False
     require_reasoning_models: bool = True
     require_reasoning_tokens: bool = True
 

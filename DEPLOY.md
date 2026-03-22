@@ -333,3 +333,49 @@ gcloud logging read \
 - 你手動建立的其他 GCP 資源
 
 這些不屬於 `deploy_cloud_run.sh` 的清理範圍。
+
+---
+
+## Endpoints
+
+| Endpoint | Method | 用途 |
+| --- | --- | --- |
+| `/health` | `GET` | Readiness、provider 狀態、配額、agent 呼叫計數 |
+| `/webhook` | `POST` | LINE webhook（HMAC-SHA256 驗簽） |
+
+---
+
+## 成本控制
+
+| 資源 | 控制方式 |
+| --- | --- |
+| LLM 呼叫 | 每個模型的 RPM/RPD 追蹤，429 時自動 fallback |
+| LINE push | `LINE_PUSH_MONTHLY_LIMIT` 控制月度 push 上限 |
+| 網路搜尋 | `WEB_SEARCH_MONTHLY_QUOTA` 控制月度配額 |
+| GCS 媒體 | Signed URL 48 小時過期，app 2 天後清理，部署腳本驗證 3 天 lifecycle 保底 |
+| 使用者請求 | 每人滑動視窗 rate limit |
+| Cloud Run | `max-instances=1`，`min-instances` 自動判斷（一般 `0`，有排程時 `1`） |
+
+---
+
+## 運行注意事項
+
+- `/health` 可能回 `200` 但 `ready_for_webhook=false`，要看 payload 不能只看 HTTP status。
+- 語音和圖片生成需要 `GCS_BUCKET_NAME`，沒設定時文字回覆仍正常。
+- 排程訊息需要同時設定 `SCHEDULED_MESSAGES_ENABLED=true`、`LINE_PUSH_FALLBACK_ENABLED=true`、`SCHEDULED_GROUP_ID`、以及至少一個排程 job。
+- Prompts 從 `prompts/*.md` 載入，調整路由或語氣不需要改 Python 程式碼。
+
+---
+
+## 直接 Cloud Build 提交
+
+如果不想用 wrapper 腳本，可以直接提交 Cloud Build：
+
+```bash
+gcloud builds submit . \
+  --project YOUR_PROJECT_ID \
+  --config cloudbuild.yaml \
+  --substitutions=_SERVICE_NAME=linebot-cloud-agent,_REGION=us-west1,_IMAGE_TAG=manual-$(date -u +%Y%m%d%H%M%S)
+```
+
+這種方式適用於 Cloud Run service 已有環境變數設定，或你另外提供 env-vars 檔案（透過 `_ENV_VARS_FILE`）的情境。

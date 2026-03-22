@@ -12,6 +12,22 @@
 
 LineBot-CloudAgent receives LINE webhook events, routes them through a smart orchestrator, and dispatches them to specialized chat, vision, web-search, image-generation, and voice workflows while staying inside free-tier-friendly guardrails.
 
+> **From local GPU to cloud-native** — This project is the next-generation successor to [LineBot-VLM-GroupAgent](https://github.com/huang422/LineBot-VLM-GroupAgent), which ran a single Ollama model on a local NVIDIA GPU. LineBot-CloudAgent has been redesigned from scratch for zero-hardware, cloud-only deployment.
+>
+> | | [LineBot-VLM-GroupAgent](https://github.com/huang422/LineBot-VLM-GroupAgent) (v1) | LineBot-CloudAgent (v2) |
+> | --- | --- | --- |
+> | Deployment | Local server + Cloudflare Tunnel | GCP Cloud Run (serverless) |
+> | Hardware | NVIDIA GPU + 32 GB RAM required | No GPU, no local hardware |
+> | LLM Provider | Ollama (single local model) | NVIDIA + OpenRouter (multi-provider fallback) |
+> | Architecture | Single model, serial queue | Multi-agent orchestrator with parallel dispatch |
+> | Vision Model | Qwen3.5 9B/35B (local) | Qwen3.5 397B VLM (NVIDIA API) |
+> | Image Generation | Not supported | NVIDIA Stable Diffusion 3 (two-stage pipeline) |
+> | Voice Reply | Not supported | edge-tts + GCS signed URL |
+> | Reasoning | Ollama thinking mode (may OOM) | Provider-native thinking with token budget control |
+> | Resilience | Single point of failure | Auto-fallback across providers and models |
+> | Cost | Electricity + hardware | Free-tier APIs + pay-per-use Cloud Run |
+> | Deploy Command | Manual setup | One-command `./scripts/deploy_cloud_run.sh` |
+
 ---
 
 ## Why this project stands out
@@ -104,161 +120,135 @@ LineBot-CloudAgent/
 
 ---
 
-## Cloud deployment
-
-### 1. Prepare configuration
+## Quick start
 
 ```bash
+# 1. Copy and fill in your credentials
 cp .env.example .env
-```
 
-Minimum required values:
-
-- `LINE_CHANNEL_SECRET`
-- `LINE_CHANNEL_ACCESS_TOKEN`
-- `OPENROUTER_API_KEY`
-- `GCP_PROJECT_ID`
-
-Recommended deploy values:
-
-- `CLOUD_RUN_SERVICE_NAME=linebot-cloud-agent`
-- `CLOUD_RUN_REGION=us-west1`
-- `CLOUD_RUN_MIN_INSTANCES=` (leave blank for auto: `1` when scheduled jobs are configured, otherwise `0`)
-- `DEPLOY_KEEP_REVISIONS=1`
-- `DEPLOY_KEEP_IMAGES=3`
-- `DEPLOY_ENABLE_APIS=true`
-
-Common runtime optional values:
-
-- `NVIDIA_API_KEY` (required for image generation; recommended for chat/vision quality)
-- `TAVILY_API_KEY`
-- `GCS_BUCKET_NAME`
-- `GCS_SIGNED_URL_EXPIRY_HOURS` (default: `48`)
-- `GCS_MEDIA_CLEANUP_DELAY_SECONDS` (default: `172800`, i.e. 2 days)
-- `LINE_PUSH_MONTHLY_LIMIT`
-- `SCHEDULED_MESSAGES_ENABLED`
-- `SCHEDULED_GROUP_ID`
-- `SCHEDULED_WEEKLY_MESSAGES`
-- `SCHEDULED_YEARLY_MESSAGES`
-
-If `SCHEDULED_MESSAGES_ENABLED=true`, keep `LINE_PUSH_FALLBACK_ENABLED=true`, set `SCHEDULED_GROUP_ID`, and configure at least one entry in `SCHEDULED_WEEKLY_MESSAGES` or `SCHEDULED_YEARLY_MESSAGES`. Set `LINE_PUSH_MONTHLY_LIMIT=0` for uncapped scheduled pushes, or use a value greater than `0` if you want a monthly direct-push cap.
-
-### 2. One-time GCP setup
-
-```bash
+# 2. First-time GCP login
 gcloud auth login
 gcloud config set project YOUR_PROJECT_ID
-gcloud services enable \
-  cloudbuild.googleapis.com \
-  run.googleapis.com \
-  artifactregistry.googleapis.com \
-  iamcredentials.googleapis.com \
-  cloudresourcemanager.googleapis.com
-```
 
-If you want Cloud Run to access other GCP services through a dedicated runtime identity, set `CLOUD_RUN_SERVICE_ACCOUNT` in `.env` or pass `--service-account` during deployment.
-
-### 3. Deploy
-
-```bash
+# 3. Deploy (one command does everything)
 ./scripts/deploy_cloud_run.sh
+
+# 4. Set your LINE webhook URL to:
+#    https://YOUR_CLOUD_RUN_URL/webhook
 ```
 
-The script reads `GCP_PROJECT_ID`, `CLOUD_RUN_SERVICE_NAME`, and `CLOUD_RUN_REGION` from `.env`. You can still override them with CLI flags when needed.
+Minimum `.env` values: `LINE_CHANNEL_SECRET`, `LINE_CHANNEL_ACCESS_TOKEN`, `OPENROUTER_API_KEY`, `GCP_PROJECT_ID`
 
-What the wrapper does:
+Redeploy after code changes — same command: `./scripts/deploy_cloud_run.sh`
 
-1. Reads `.env` and validates the required keys.
-2. Ensures the required GCP APIs are enabled.
-3. Generates a temporary Cloud Run env-vars file.
-4. Submits `cloudbuild.yaml` to Cloud Build.
-5. Runs `pytest` and `compileall` in Cloud Build before deployment.
-6. Builds and pushes a uniquely tagged container image.
-7. Deploys to the same Cloud Run service and routes 100% traffic to the latest revision.
-8. If `GCS_BUCKET_NAME` is configured, the deploy flow ensures the runtime service account has `roles/iam.serviceAccountTokenCreator` on itself so voice/image signed URLs work on Cloud Run, and it verifies a 3-day bucket lifecycle delete rule as a safety net.
-9. Runs smoke checks against `/health` and `/webhook`.
-10. Keeps the newest 1 revision by default and the newest 3 image digests by default.
-
-### 4. Set the LINE webhook URL
-
-```text
-https://YOUR_CLOUD_RUN_URL/webhook
-```
+For detailed deployment options, GCS/scheduler setup, log monitoring, and troubleshooting, see **[DEPLOY.md](DEPLOY.md)**.
 
 ---
 
-## Redeploy after code changes
+## Configuration reference
 
-Use the same command again:
+All settings are loaded from `.env`. See [.env.example](.env.example) for a ready-to-copy template.
 
-```bash
-./scripts/deploy_cloud_run.sh
-```
+### Required
 
-Because deployment settings live in `.env`, the same zero-argument command works for both first deploys and later redeploys after code changes.
-
-If you need a one-off override, you can still pass flags such as `--project-id`, `--region`, or `--service-account`.
-
-### What gets replaced or cleaned
-
-- The same Cloud Run **service** is updated on every deploy.
-- The included pipeline routes **100% traffic** to the newest ready revision.
-- Old **container images** are trimmed by policy; the script keeps the latest 3 digests by default.
-- Old **revisions** are trimmed by policy; the script keeps the latest ready deployment footprint small by default.
-
-### What is not removed automatically
-
-- Cloud Build history
-- Cloud Logging entries
-- Any manual resources you created outside the included deployment flow
-
-If you deploy manually through the Cloud Console or plain `gcloud run deploy`, Cloud Run will keep revision history until you delete it yourself or the platform lifecycle removes older revisions.
-
----
-
-## Direct Cloud Build submission
-
-If you do not want to use the wrapper script, you can submit Cloud Build directly:
-
-```bash
-gcloud builds submit . \
-  --project YOUR_PROJECT_ID \
-  --config cloudbuild.yaml \
-  --substitutions=_SERVICE_NAME=linebot-cloud-agent,_REGION=us-west1,_IMAGE_TAG=manual-$(date -u +%Y%m%d%H%M%S)
-```
-
-Use this mode only when the target Cloud Run service already has its environment variables configured, or when you provide a generated env-vars file through `_ENV_VARS_FILE`.
-
----
-
-## Endpoints
-
-| Endpoint | Method | Purpose |
-| --- | --- | --- |
-| `/health` | `GET` | Readiness, provider availability, quotas, and agent call counters |
-| `/webhook` | `POST` | LINE webhook receiver with HMAC-SHA256 validation |
-
----
-
-## Cost guardrails
-
-| Resource | Control mechanism |
+| Variable | Description |
 | --- | --- |
-| LLM calls | Per-model RPM/RPD tracking and automatic fallback on `429` |
-| LINE push | Monthly push counter controlled by `LINE_PUSH_MONTHLY_LIMIT` |
-| Web search | Monthly quota counter controlled by `WEB_SEARCH_MONTHLY_QUOTA` |
-| GCS media | Signed URLs expire after 48 hours, app cleanup runs after 2 days by default, and deploy verifies a 3-day bucket lifecycle safety net |
-| User requests | Per-user sliding-window rate limit |
-| Cloud Run | `max-instances=1`, `min-instances` auto-derived (`0` normally, `1` for in-process scheduled jobs unless overridden) |
+| `LINE_CHANNEL_SECRET` | LINE Messaging API channel secret |
+| `LINE_CHANNEL_ACCESS_TOKEN` | LINE Messaging API access token |
+| `OPENROUTER_API_KEY` | [OpenRouter](https://openrouter.ai/keys) API key (free tier available) |
+| `GCP_PROJECT_ID` | GCP project ID for Cloud Run deployment |
 
----
+### Recommended
 
-## Operational notes
+| Variable | Default | Description |
+| --- | --- | --- |
+| `NVIDIA_API_KEY` | — | [NVIDIA](https://build.nvidia.com) API key; enables Qwen3.5 397B + image generation |
+| `NVIDIA_MODEL` | `qwen/qwen3.5-397b-a17b` | NVIDIA primary model |
+| `TAVILY_API_KEY` | — | [Tavily](https://tavily.com) key for web search + URL extraction |
+| `GCS_BUCKET_NAME` | — | GCS bucket for voice/image delivery (text replies work without it) |
 
-- `/health` can return `200` even when `ready_for_webhook=false`; check the payload, not only the HTTP status.
-- Voice and generated-image delivery require `GCS_BUCKET_NAME`. Without it, text replies still work. With the defaults, signed URLs expire after 48 hours, app cleanup waits 2 days, and the deploy flow verifies a 3-day bucket lifecycle fallback.
-- Scheduled messages require `SCHEDULED_MESSAGES_ENABLED=true`, `LINE_PUSH_FALLBACK_ENABLED=true`, a `SCHEDULED_GROUP_ID`, and at least one configured scheduled job.
-- Prompts are loaded from `prompts/*.md`, so you can change routing or tone without editing Python source.
+### Reasoning / Thinking
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `OPENROUTER_REASONING_ENABLED` | `true` | Enable reasoning for OpenRouter models |
+| `OPENROUTER_REASONING_EFFORT` | `high` | Reasoning effort: `xhigh` / `high` / `medium` / `low` / `minimal` / `none` |
+| `OPENROUTER_REASONING_EXCLUDE` | `false` | Exclude reasoning from response (free models may ignore this) |
+| `NVIDIA_THINKING_ENABLED` | `true` | Enable thinking for NVIDIA models |
+| `NVIDIA_THINKING_BUDGET` | `4096` | Extra tokens reserved for model thinking |
+| `REQUIRE_REASONING_MODELS` | `true` | Only route to reasoning-capable models |
+| `REQUIRE_REASONING_TOKENS` | `true` | Warn when a reasoning model returns no reasoning content |
+
+### Model routing
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ORCHESTRATOR_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | Primary orchestrator model (OpenRouter) |
+| `ORCHESTRATOR_FALLBACK_MODEL` | `qwen/qwen3.5-397b-a17b` | Orchestrator fallback (NVIDIA) |
+| `AGENT_FALLBACK_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | Shared fallback for text agents |
+| `VISION_FALLBACK_MODEL` | `google/gemma-3-27b-it:free` | Vision agent fallback |
+
+### Per-agent tuning
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CHAT_TEMPERATURE` / `CHAT_MAX_TOKENS` | `0.7` / `2048` | Chat agent |
+| `VISION_TEMPERATURE` / `VISION_MAX_TOKENS` | `0.5` / `1024` | Vision agent |
+| `WEB_SEARCH_TEMPERATURE` / `WEB_SEARCH_MAX_TOKENS` | `0.3` / `3072` | Web search agent |
+| `IMAGE_GEN_TEMPERATURE` / `IMAGE_GEN_MAX_TOKENS` | `0.7` / `1024` | Image gen prompt refinement |
+
+### Image generation (Stage 2)
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `IMAGE_GEN_PRIMARY_MODEL` | `stabilityai/stable-diffusion-3-medium` | Primary NVIDIA image model |
+| `IMAGE_GEN_FALLBACK_MODEL` | — | Fallback image model |
+| `IMAGE_GEN_STEPS` | `50` | Diffusion steps |
+| `IMAGE_GEN_CFG_SCALE` | `5` | Classifier-free guidance scale |
+
+### Cost controls
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LINE_PUSH_FALLBACK_ENABLED` | `true` | Allow push fallback when reply fails |
+| `LINE_PUSH_MONTHLY_LIMIT` | `0` | Monthly push cap (`0` = unlimited) |
+| `WEB_SEARCH_MONTHLY_QUOTA` | `1000` | Tavily monthly search quota |
+| `GCS_SIGNED_URL_EXPIRY_HOURS` | `48` | Signed URL expiry |
+| `GCS_MEDIA_CLEANUP_DELAY_SECONDS` | `172800` | App-level media cleanup delay (2 days) |
+| `RATE_LIMIT_MAX_REQUESTS` | `30` | Per-user request limit |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit sliding window |
+
+### Bot & conversation
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `BOT_NAME` | `Assistant` | Bot display name in prompts |
+| `LINE_BOT_USER_ID` | — | Bot's LINE userId for precise @mention detection |
+| `MAX_CONVERSATION_HISTORY` | `10` | Messages kept per conversation |
+| `CONVERSATION_TTL_SECONDS` | `3600` | Conversation expiry (1 hour) |
+| `TTS_ENABLED` | `true` | Enable voice replies |
+| `TTS_VOICE` | `zh-TW-HsiaoChenNeural` | [edge-tts](https://github.com/rany2/edge-tts) voice |
+
+### Scheduled messages
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SCHEDULED_MESSAGES_ENABLED` | `false` | Enable scheduled message delivery |
+| `SCHEDULED_GROUP_ID` | — | Target LINE group ID |
+| `SCHEDULED_WEEKLY_MESSAGES` | `[]` | Weekly jobs (JSON array) |
+| `SCHEDULED_YEARLY_MESSAGES` | `[]` | Yearly jobs (JSON array) |
+
+### Deployment
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CLOUD_RUN_SERVICE_NAME` | `linebot-cloud-agent` | Cloud Run service name |
+| `CLOUD_RUN_REGION` | `us-west1` | Cloud Run region |
+| `CLOUD_RUN_MIN_INSTANCES` | auto | `1` if scheduler active, otherwise `0` |
+| `CLOUD_RUN_SERVICE_ACCOUNT` | — | Runtime service account |
+| `DEPLOY_KEEP_REVISIONS` | `1` | Revisions to keep after deploy |
+| `DEPLOY_KEEP_IMAGES` | `3` | Container images to keep |
+| `DEPLOY_ENABLE_APIS` | `true` | Auto-enable required GCP APIs |
 
 ---
 

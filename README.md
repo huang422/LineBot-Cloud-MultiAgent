@@ -12,32 +12,37 @@
 
 LineBot-CloudAgent receives LINE webhook events, routes them through a smart orchestrator, and dispatches them to specialized chat, vision, web-search, image-generation, and voice workflows while staying inside free-tier-friendly guardrails.
 
-> **From local GPU to cloud-native** — This project is the next-generation successor to [LineBot-VLM-GroupAgent](https://github.com/huang422/LineBot-VLM-GroupAgent), which ran a single Ollama model on a local NVIDIA GPU. LineBot-CloudAgent has been redesigned from scratch for zero-hardware, cloud-only deployment.
->
-> | | [LineBot-VLM-GroupAgent](https://github.com/huang422/LineBot-VLM-GroupAgent) (v1) | LineBot-CloudAgent (v2) |
-> | --- | --- | --- |
-> | Deployment | Local server + Cloudflare Tunnel | GCP Cloud Run (serverless) |
-> | Hardware | NVIDIA GPU + 32 GB RAM required | No GPU, no local hardware |
-> | LLM Provider | Ollama (single local model) | NVIDIA + OpenRouter (multi-provider fallback) |
-> | Architecture | Single model, serial queue | Multi-agent orchestrator with parallel dispatch |
-> | Vision Model | Qwen3.5 9B/35B (local) | Qwen3.5 397B VLM (NVIDIA API) |
-> | Image Generation | Not supported | NVIDIA Stable Diffusion 3 (two-stage pipeline) |
-> | Voice Reply | Not supported | edge-tts + GCS signed URL |
-> | Reasoning | Ollama thinking mode (may OOM) | Provider-native thinking with token budget control |
-> | Resilience | Single point of failure | Auto-fallback across providers and models |
-> | Cost | Electricity + hardware | Free-tier APIs + pay-per-use Cloud Run |
-> | Deploy Command | Manual setup | One-command `./scripts/deploy_cloud_run.sh` |
-
 ---
 
-## Why this project stands out
+## Key Features
 
-- **Multi-agent orchestration** — Fast regex rules handle obvious requests without an LLM call; harder cases fall back to model-based routing.
-- **Task-specific model routing** — The orchestrator defaults to OpenRouter first with an NVIDIA fallback, while text and vision agents keep NVIDIA Qwen3.5 as the primary model when available.
-- **Multi-modal I/O** — Text, quoted context, images, generated images, and voice replies all move through the same webhook pipeline.
-- **Cloud-only deploy path** — The included deploy wrapper submits Cloud Build; you do not need a local Docker build step.
-- **Repeatable redeploys** — The pipeline updates the same Cloud Run service, routes 100% traffic to the latest revision, runs smoke checks, prunes old revisions on a best-effort basis, and keeps the latest 3 container images.
-- **Config-first behavior** — Prompts live in `prompts/*.md`; runtime behavior lives in `.env` rather than hard-coded constants.
+### Multi-Agent Orchestration
+
+Fast regex rules handle obvious requests without an LLM call; harder cases fall back to model-based routing. The orchestrator dispatches to four specialist agents — `chat`, `vision`, `web_search`, and `image_gen` — each with its own model configuration and system prompt.
+
+### Multi-Modal Input & Output
+
+Text, images, voice, and quoted context all flow through the same webhook pipeline. Users can send photos for vision analysis, request image generation, receive voice replies, and quote earlier messages — the bot handles every combination seamlessly.
+
+### Intelligent Provider Fallback
+
+Every agent call goes through a rate-limit-aware fallback chain. Exhausted models are skipped before sending a request, so a `429` moves to the next provider without waiting for a failed full response cycle. Text agents try NVIDIA Qwen3.5 → OpenRouter Nemotron → `openrouter/free`; vision tries NVIDIA → Gemma 3.
+
+### Two-Stage Image Generation
+
+User requests are first refined into optimized English prompts by the text LLM, then passed to NVIDIA Stable Diffusion 3. The result is uploaded to GCS and delivered as a LINE image message.
+
+### Voice Replies
+
+`edge-tts` synthesizes speech at zero cost. Audio is uploaded to GCS with signed URLs and sent as a LINE audio message. Voice and language are configurable.
+
+### Cloud-Only, One-Command Deploy
+
+`./scripts/deploy_cloud_run.sh` handles everything — API enablement, Cloud Build submission, smoke checks, revision routing, and old image/revision pruning. No local Docker build step required.
+
+### Config-First Behavior
+
+System prompts live in `prompts/*.md`; all runtime behavior lives in `.env`. Models, temperatures, token limits, rate limits, quotas, and scheduling are all reconfigurable without touching code.
 
 ---
 
@@ -56,6 +61,26 @@ LineBot-CloudAgent receives LINE webhook events, routes them through a smart orc
 | Simplified-to-traditional conversion | All LLM output is normalized through OpenCC before being sent back to LINE |
 | Prompt-injection blocking | Regex-based screening rejects common jailbreak patterns before dispatch |
 | Health dashboard | `/health` exposes readiness, provider status, quotas, and agent call counters |
+
+---
+
+## From local GPU to cloud-native
+
+This project is the next-generation successor to [LineBot-VLM-GroupAgent](https://github.com/huang422/LineBot-VLM-GroupAgent), which ran a single Ollama model on a local NVIDIA GPU. LineBot-CloudAgent has been redesigned from scratch for zero-hardware, cloud-only deployment.
+
+| | [LineBot-VLM-GroupAgent](https://github.com/huang422/LineBot-VLM-GroupAgent) (v1) | LineBot-CloudAgent (v2) |
+| --- | --- | --- |
+| Deployment | Local server + Cloudflare Tunnel | GCP Cloud Run (serverless) |
+| Hardware | NVIDIA GPU + 32 GB RAM required | No GPU, no local hardware |
+| LLM Provider | Ollama (single local model) | NVIDIA + OpenRouter (multi-provider fallback) |
+| Architecture | Single model, serial queue | Multi-agent orchestrator with parallel dispatch |
+| Vision Model | Qwen3.5 9B/35B (local) | Qwen3.5 397B VLM (NVIDIA API) |
+| Image Generation | Not supported | NVIDIA Stable Diffusion 3 (two-stage pipeline) |
+| Voice Reply | Not supported | edge-tts + GCS signed URL |
+| Reasoning | Ollama thinking mode (may OOM) | Provider-native thinking with token budget control |
+| Resilience | Single point of failure | Auto-fallback across providers and models |
+| Cost | Electricity + hardware | Free-tier APIs + pay-per-use Cloud Run |
+| Deploy Command | Manual setup | One-command `./scripts/deploy_cloud_run.sh` |
 
 ---
 
@@ -163,7 +188,7 @@ All settings are loaded from `.env`. See [.env.example](.env.example) for a read
 | Variable | Default | Description |
 | --- | --- | --- |
 | `NVIDIA_API_KEY` | — | [NVIDIA](https://build.nvidia.com) API key; enables Qwen3.5 397B + image generation |
-| `NVIDIA_MODEL` | `qwen/qwen3.5-397b-a17b` | NVIDIA primary model |
+| `NVIDIA_MODEL` | `qwen/qwen3.5-122b-a10b` | NVIDIA primary model |
 | `TAVILY_API_KEY` | — | [Tavily](https://tavily.com) key for web search + URL extraction |
 | `GCS_BUCKET_NAME` | — | GCS bucket for voice/image delivery (text replies work without it) |
 
@@ -184,7 +209,7 @@ All settings are loaded from `.env`. See [.env.example](.env.example) for a read
 | Variable | Default | Description |
 | --- | --- | --- |
 | `ORCHESTRATOR_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | Primary orchestrator model (OpenRouter) |
-| `ORCHESTRATOR_FALLBACK_MODEL` | `qwen/qwen3.5-397b-a17b` | Orchestrator fallback (NVIDIA) |
+| `ORCHESTRATOR_FALLBACK_MODEL` | `qwen/qwen3.5-122b-a10b` | Orchestrator fallback (NVIDIA) |
 | `AGENT_FALLBACK_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | Shared fallback for text agents |
 | `VISION_FALLBACK_MODEL` | `google/gemma-3-27b-it:free` | Vision agent fallback |
 

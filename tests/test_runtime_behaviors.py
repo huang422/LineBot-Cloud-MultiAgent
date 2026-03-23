@@ -156,14 +156,14 @@ class NvidiaProviderTests(unittest.IsolatedAsyncioTestCase):
             def json(self):
                 return {
                     "choices": [{"message": {"content": "ok"}}],
-                    "model": "qwen/qwen3.5-397b-a17b",
+                    "model": "qwen/qwen3.5-122b-a10b",
                     "usage": {"reasoning_tokens": 0},
                 }
 
         provider._client = SimpleNamespace(post=AsyncMock(return_value=FakeResponse()))
 
         response = await provider.generate(
-            "qwen/qwen3.5-397b-a17b",
+            "qwen/qwen3.5-122b-a10b",
             [{"role": "user", "content": "hello"}],
             require_reasoning_tokens=True,
         )
@@ -634,7 +634,7 @@ class MainTargetBuilderTests(unittest.TestCase):
         settings = Settings(
             _env_file=None,
             agent_fallback_model="nvidia/nemotron-3-super-120b-a12b:free",
-            nvidia_model="qwen/qwen3.5-397b-a17b",
+            nvidia_model="qwen/qwen3.5-122b-a10b",
         )
         openrouter = object()
         nvidia = object()
@@ -644,7 +644,7 @@ class MainTargetBuilderTests(unittest.TestCase):
         self.assertEqual(
             targets,
             [
-                (nvidia, "qwen/qwen3.5-397b-a17b"),
+                (nvidia, "qwen/qwen3.5-122b-a10b"),
                 (openrouter, "nvidia/nemotron-3-super-120b-a12b:free"),
             ],
         )
@@ -652,7 +652,7 @@ class MainTargetBuilderTests(unittest.TestCase):
     def test_vision_targets_keep_only_reasoning_capable_target_when_available(self) -> None:
         settings = Settings(
             _env_file=None,
-            nvidia_model="qwen/qwen3.5-397b-a17b",
+            nvidia_model="qwen/qwen3.5-122b-a10b",
             vision_fallback_model="google/gemma-3-27b-it:free",
         )
         openrouter = object()
@@ -663,7 +663,7 @@ class MainTargetBuilderTests(unittest.TestCase):
         self.assertEqual(
             targets,
             [
-                (nvidia, "qwen/qwen3.5-397b-a17b"),
+                (nvidia, "qwen/qwen3.5-122b-a10b"),
             ],
         )
 

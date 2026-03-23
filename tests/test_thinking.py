@@ -92,7 +92,7 @@ async def run_nvidia_thinking():
 
     import httpx
 
-    model = os.getenv("NVIDIA_MODEL", "qwen/qwen3.5-397b-a17b")
+    model = os.getenv("NVIDIA_MODEL", "qwen/qwen3.5-122b-a10b")
     print(f"\n{'='*60}")
     print(f"[NVIDIA] Testing thinking with {model}")
     print(f"  (fixed: chat_template_kwargs as top-level param)")
@@ -167,7 +167,7 @@ async def run_nvidia_provider_class():
     from src.utils.rate_tracker import RateTracker
     from src.providers.nvidia_provider import NvidiaProvider
 
-    model = os.getenv("NVIDIA_MODEL", "qwen/qwen3.5-397b-a17b")
+    model = os.getenv("NVIDIA_MODEL", "qwen/qwen3.5-122b-a10b")
     provider = NvidiaProvider(
         api_key,
         RateTracker(),

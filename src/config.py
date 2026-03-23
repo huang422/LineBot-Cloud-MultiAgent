@@ -75,13 +75,13 @@ class Settings(BaseSettings):
 
     # ── NVIDIA API ────────────────────────────────────────────
     nvidia_api_key: str = ""
-    nvidia_model: str = "qwen/qwen3.5-397b-a17b"
+    nvidia_model: str = "qwen/qwen3.5-122b-a10b"
     nvidia_thinking_enabled: bool = True
     nvidia_thinking_budget: int = 4096
 
     # ── Orchestrator (routing / task dispatch) ────────────────
     orchestrator_model: str = "nvidia/nemotron-3-super-120b-a12b:free"
-    orchestrator_fallback_model: str = "qwen/qwen3.5-397b-a17b"
+    orchestrator_fallback_model: str = "qwen/qwen3.5-122b-a10b"
     orchestrator_temperature: float = 0.0
     orchestrator_max_tokens: int = 200
 

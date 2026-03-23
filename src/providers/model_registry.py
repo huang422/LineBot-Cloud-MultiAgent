@@ -34,7 +34,7 @@ def _register(*models: ModelInfo) -> None:
 
 _register(
     # --- NVIDIA hosted models ---
-    ModelInfo("qwen/qwen3.5-397b-a17b", "Qwen3.5 397B VLM", "397B MoE (17B active)", 262_144, vision=True, reasoning=True),
+    ModelInfo("qwen/qwen3.5-122b-a10b", "Qwen3.5 122B", "122B MoE (10B active)", 262_144, vision=True, reasoning=True),
 
     # --- Largest text models (OpenRouter free) ---
     ModelInfo("qwen/qwen3-coder:free", "Qwen3 Coder 480B", "480B", 262_144, tool_calling=True),

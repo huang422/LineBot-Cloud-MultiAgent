@@ -57,7 +57,7 @@ class NvidiaProvider:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        self._client = httpx.AsyncClient(timeout=180, headers=self._headers)
+        self._client = httpx.AsyncClient(timeout=300, headers=self._headers)
 
     async def close(self) -> None:
         await self._client.aclose()

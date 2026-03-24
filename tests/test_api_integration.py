@@ -190,7 +190,7 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             main_module, "_process_event", AsyncMock()
         ) as process_event, patch.object(
             main_module, "_record_group_message"
-        ):
+        ) as record_group_message:
             response = client.post(
                 "/webhook",
                 content=body,
@@ -200,6 +200,7 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         cache_service.cache_event_message.assert_called_once_with(event)
         process_event.assert_not_called()
+        record_group_message.assert_called_once_with(event)
 
     def test_webhook_schedules_background_processing_for_triggered_events(self) -> None:
         event = {
@@ -219,7 +220,7 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             main_module, "_process_event", AsyncMock()
         ) as process_event, patch.object(
             main_module, "_record_group_message"
-        ):
+        ) as record_group_message:
             response = client.post(
                 "/webhook",
                 content=body,
@@ -229,6 +230,7 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         process_event.assert_called_once_with(event)
         cache_service.cache_event_message.assert_not_called()
+        record_group_message.assert_not_called()
 
 
 class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -255,6 +257,7 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             output_format="text",
             task_description="整理使用者需求後回覆",
             reasoning="一般文字任務",
+            disable_thinking=False,
         )
         response = AgentResponse(
             text="這是整理後的回覆",
@@ -282,7 +285,9 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             main_module, "send_response", AsyncMock(return_value=True)
         ) as send_response, patch.object(
             main_module, "record_conversation"
-        ) as record_conversation:
+        ) as record_conversation, patch.object(
+            main_module, "_record_group_message"
+        ) as record_group_message:
             await main_module._process_event(event)
 
         line_service.send_loading_animation.assert_awaited_once_with("G1")
@@ -296,6 +301,8 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "這是整理後的回覆",
             assistant_delivered=True,
         )
+        record_group_message.assert_called_once_with(event)
         self.assertEqual(request.text, "幫我整理重點")
         self.assertEqual(request.target_agent, "chat")
         self.assertEqual(request.output_format, "text")
+        self.assertFalse(request.disable_thinking)

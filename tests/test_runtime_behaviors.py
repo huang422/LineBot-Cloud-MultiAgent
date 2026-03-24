@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from collections import deque
 from io import BytesIO
@@ -14,6 +15,7 @@ from src.agents import web_search_agent as web_search_agent_module
 from src.agents.chat_agent import ChatAgent
 from src.agents.image_gen_agent import ImageGenAgent
 from src.agents.orchestrator import Orchestrator
+from src.agents.vision_agent import VisionAgent
 from src.agents.web_search_agent import WebSearchAgent
 from src.config import Settings
 from src.handlers import webhook_handler
@@ -27,7 +29,13 @@ from src.providers.fallback_chain import (
     AllProvidersFailedError,
     FallbackChain,
 )
-from src.providers.openrouter_provider import OpenRouterProvider, ProviderError, ProviderResponse, RateLimitError
+from src.providers.openrouter_provider import (
+    OpenRouterProvider,
+    ProviderError,
+    ProviderResponse,
+    RateLimitError,
+    parse_openai_response,
+)
 from src.services import conversation_service as conversation_service_module
 from src.services import image_service as image_service_module
 from src.services import message_cache_service as message_cache_service_module
@@ -40,6 +48,27 @@ from PIL import Image
 
 
 class OpenRouterProviderTests(unittest.IsolatedAsyncioTestCase):
+    def test_parse_openai_response_concatenates_multipart_text(self) -> None:
+        text, images, reasoning = parse_openai_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": "第一段"},
+                                {"type": "text", "text": "第二段"},
+                                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(text, "第一段第二段")
+        self.assertEqual(images, ["https://example.com/image.png"])
+        self.assertIsNone(reasoning)
+
     async def test_generate_includes_reasoning_for_text_requests(self) -> None:
         provider = OpenRouterProvider(
             "test-key",
@@ -217,6 +246,29 @@ class WebhookTriggerTests(unittest.TestCase):
 
         with patch.object(webhook_handler, "get_settings", return_value=settings):
             self.assertTrue(webhook_handler.should_handle(event))
+
+    def test_group_message_ignores_other_bot_mentions(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            bot_name="小助手",
+            line_bot_user_id="U_BOT",
+        )
+        event = {
+            "type": "message",
+            "source": {"type": "group"},
+            "message": {
+                "type": "text",
+                "text": "@別的機器人 你好",
+                "mention": {
+                    "mentionees": [
+                        {"type": "bot", "text": "@別的機器人", "userId": "U_OTHER_BOT"},
+                    ]
+                },
+            },
+        }
+
+        with patch.object(webhook_handler, "get_settings", return_value=settings):
+            self.assertFalse(webhook_handler.should_handle(event))
 
 
 class ConversationRecordingTests(unittest.TestCase):
@@ -434,6 +486,127 @@ class AgentPromptContextTests(unittest.TestCase):
         self.assertIn("調度指定輸出形式：voice", messages[0]["content"])
 
 
+class AgentTimeoutPropagationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_agent_passes_thinking_timeout_to_fallback_chain(self) -> None:
+        fallback = SimpleNamespace(
+            generate=AsyncMock(return_value=ProviderResponse(text="ok", model="model-1"))
+        )
+        agent = ChatAgent(
+            Settings(_env_file=None, thinking_timeout_seconds=12),
+            fallback,
+            targets=[],
+        )
+
+        await agent.process(AgentRequest(text="你好"))
+
+        self.assertEqual(fallback.generate.await_args.kwargs["thinking_timeout"], 12)
+
+    async def test_vision_agent_passes_thinking_timeout_to_fallback_chain(self) -> None:
+        fallback = SimpleNamespace(
+            generate=AsyncMock(return_value=ProviderResponse(text="ok", model="model-1"))
+        )
+        agent = VisionAgent(
+            Settings(_env_file=None, thinking_timeout_seconds=18),
+            fallback,
+            targets=[],
+        )
+
+        await agent.process(
+            AgentRequest(
+                text="這張圖是什麼？",
+                image_base64="data:image/jpeg;base64,abc",
+            )
+        )
+
+        self.assertEqual(fallback.generate.await_args.kwargs["thinking_timeout"], 18)
+
+    async def test_web_search_agent_passes_thinking_timeout_to_fallback_chain(self) -> None:
+        fallback = SimpleNamespace(
+            generate=AsyncMock(return_value=ProviderResponse(text="ok", model="model-1"))
+        )
+        agent = WebSearchAgent(
+            Settings(_env_file=None, thinking_timeout_seconds=24),
+            fallback,
+            targets=[],
+        )
+        fake_service = SimpleNamespace(
+            is_configured=True,
+            is_quota_available=True,
+            search=AsyncMock(
+                return_value=SimpleNamespace(
+                    has_results=True,
+                    answer="ok",
+                    to_context_text=lambda: "search context",
+                )
+            ),
+        )
+
+        with patch.object(
+            web_search_agent_module,
+            "get_web_search_service",
+            return_value=fake_service,
+        ):
+            await agent.process(AgentRequest(text="今天新聞"))
+
+        self.assertEqual(fallback.generate.await_args.kwargs["thinking_timeout"], 24)
+
+    async def test_orchestrator_passes_thinking_timeout_to_fallback_chain(self) -> None:
+        fallback = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=ProviderResponse(
+                    text='{"agent":"chat","output_format":"text","task_description":"回答問題","reasoning":"test"}',
+                    model="model-1",
+                )
+            )
+        )
+        orchestrator = Orchestrator(
+            Settings(_env_file=None, thinking_timeout_seconds=9),
+            fallback,
+            targets=[],
+        )
+
+        await orchestrator._llm_classify(AgentRequest(text="幫我處理一下"))
+
+        self.assertEqual(fallback.generate.await_args.kwargs["thinking_timeout"], 9)
+
+
+class ImageGenPromptRefinementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_image_gen_refinement_uses_configured_settings_and_timeout(self) -> None:
+        fallback = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=ProviderResponse(
+                    text="a detailed prompt",
+                    model="qwen/test",
+                )
+            )
+        )
+        nvidia = SimpleNamespace(
+            generate_image=AsyncMock(
+                return_value=ProviderResponse(
+                    images=["data:image/jpeg;base64,abc"],
+                    model="stabilityai/stable-diffusion-3-medium",
+                )
+            )
+        )
+        agent = ImageGenAgent(
+            Settings(
+                _env_file=None,
+                image_gen_temperature=0.33,
+                image_gen_max_tokens=456,
+                thinking_timeout_seconds=21,
+            ),
+            fallback,
+            targets=[],
+            nvidia_provider=nvidia,
+        )
+
+        await agent.process(AgentRequest(text="幫我畫一隻柴犬"))
+
+        self.assertEqual(fallback.generate.await_args.kwargs["temperature"], 0.33)
+        self.assertEqual(fallback.generate.await_args.kwargs["max_tokens"], 456)
+        self.assertEqual(fallback.generate.await_args.kwargs["thinking_timeout"], 21)
+
+
 class ImageGenMessageTests(unittest.TestCase):
     def test_image_gen_uses_nvidia_provider(self) -> None:
         agent = ImageGenAgent(
@@ -610,6 +783,51 @@ class FallbackChainTests(unittest.IsolatedAsyncioTestCase):
                 messages=[{"role": "user", "content": "hello"}],
             )
 
+    async def test_fallback_chain_retries_without_thinking_after_timeout(self) -> None:
+        class SlowThinkingProvider:
+            def __init__(self) -> None:
+                self.disable_thinking_calls: list[bool] = []
+
+            async def generate(self, model: str, messages: list[dict], **kwargs):
+                self.disable_thinking_calls.append(kwargs.get("disable_thinking", False))
+                if kwargs.get("disable_thinking"):
+                    return ProviderResponse(text="ok", model=model)
+                await asyncio.sleep(0.05)
+                return ProviderResponse(text="slow", model=model)
+
+        provider = SlowThinkingProvider()
+        chain = FallbackChain(RateTracker())
+
+        response = await chain.generate(
+            targets=[(provider, "model-1")],
+            messages=[{"role": "user", "content": "hello"}],
+            thinking_timeout=0.01,
+        )
+
+        self.assertEqual(response.text, "ok")
+        self.assertEqual(provider.disable_thinking_calls, [False, True])
+
+    async def test_fallback_chain_skips_timeout_when_thinking_is_already_disabled(self) -> None:
+        class NonThinkingProvider:
+            async def generate(self, model: str, messages: list[dict], **kwargs):
+                await asyncio.sleep(0.02)
+                return ProviderResponse(
+                    text="ok",
+                    model=model,
+                    usage={"disable_thinking": kwargs.get("disable_thinking")},
+                )
+
+        chain = FallbackChain(RateTracker())
+        response = await chain.generate(
+            targets=[(NonThinkingProvider(), "model-1")],
+            messages=[{"role": "user", "content": "hello"}],
+            thinking_timeout=0.001,
+            disable_thinking=True,
+        )
+
+        self.assertEqual(response.text, "ok")
+        self.assertEqual(response.usage, {"disable_thinking": True})
+
 
 class RateLimitServiceTests(unittest.TestCase):
     def test_rate_limit_sliding_window_is_explicit(self) -> None:
@@ -759,6 +977,20 @@ class HealthStatusTests(unittest.TestCase):
         self.assertTrue(ready)
         self.assertEqual(warnings, [])
 
+    def test_health_status_is_degraded_without_openrouter_even_if_nvidia_exists(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            line_channel_secret="secret",
+            line_channel_access_token="token",
+            nvidia_api_key="nv-key",
+        )
+
+        status, ready, warnings = main_module._get_health_status(settings)
+
+        self.assertEqual(status, "degraded")
+        self.assertFalse(ready)
+        self.assertIn("OPENROUTER_API_KEY not set", warnings)
+
     def test_health_status_warns_when_scheduler_is_disabled_by_push_setting(self) -> None:
         settings = Settings(
             _env_file=None,
@@ -800,6 +1032,24 @@ class CleanedTextTests(unittest.TestCase):
         self.assertEqual(request.text, "")
         self.assertEqual(request.input_type.value, "image")
 
+    def test_apply_cleaned_text_preserves_quote_only_image_url_requests(self) -> None:
+        request = AgentRequest(
+            text="!hej",
+            quoted_image_url="https://example.com/quoted.png",
+        )
+        event = {
+            "message": {
+                "type": "text",
+                "text": "!hej",
+            }
+        }
+
+        with patch.object(main_module, "extract_text", return_value=""):
+            main_module._apply_cleaned_text(request, event)
+
+        self.assertEqual(request.text, "")
+        self.assertEqual(request.input_type.value, "image")
+
 
 class RequestBlockMessageTests(unittest.TestCase):
     def test_request_block_message_distinguishes_empty_and_rate_limit(self) -> None:
@@ -814,6 +1064,14 @@ class RequestBlockMessageTests(unittest.TestCase):
             main_module._get_request_block_message(limited_request),
             "⚠️ 請求太頻繁，請稍後再試。",
         )
+
+    def test_request_block_message_allows_quote_only_image_url(self) -> None:
+        request = AgentRequest(
+            quoted_image_url="https://example.com/quoted.png",
+            input_type=InputType.IMAGE,
+        )
+
+        self.assertIsNone(main_module._get_request_block_message(request))
 
 
 class OrchestratorFastRuleTests(unittest.TestCase):
@@ -919,7 +1177,47 @@ class OrchestratorFastRuleTests(unittest.TestCase):
             AgentRequest(text="今天心情不好")
         )
 
+        # "今天心情不好" (6 chars) is NOT a simple greeting — should go to LLM
+        # to allow correct output_format classification (e.g., voice)
         self.assertIsNone(decision)
+
+    def test_simple_image_description_disables_thinking(self) -> None:
+        orchestrator = Orchestrator(
+            Settings(_env_file=None),
+            SimpleNamespace(),
+            targets=[],
+        )
+
+        decision = orchestrator._apply_fast_rules(
+            AgentRequest(
+                text="這張圖是什麼",
+                image_base64="data:image/jpeg;base64,abc",
+                input_type=InputType.IMAGE_TEXT,
+            )
+        )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.agent, "vision")
+        self.assertTrue(decision.disable_thinking)
+
+    def test_complex_image_question_keeps_thinking_enabled(self) -> None:
+        orchestrator = Orchestrator(
+            Settings(_env_file=None),
+            SimpleNamespace(),
+            targets=[],
+        )
+
+        decision = orchestrator._apply_fast_rules(
+            AgentRequest(
+                text="這裡錯在哪",
+                image_base64="data:image/jpeg;base64,abc",
+                input_type=InputType.IMAGE_TEXT,
+            )
+        )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.agent, "vision")
+        self.assertFalse(decision.disable_thinking)
 
 
 class ConversationHistoryExpiryTests(unittest.TestCase):
@@ -1119,6 +1417,21 @@ class OrchestratorParsingTests(unittest.TestCase):
         self.assertEqual(decision.agent, "chat")
         self.assertEqual(decision.output_format, "text")
         self.assertEqual(decision.task_description, "回答翻譯需求")
+
+    def test_parse_llm_response_inverts_needs_thinking_into_disable_thinking(self) -> None:
+        orchestrator = Orchestrator(
+            Settings(_env_file=None),
+            SimpleNamespace(),
+            targets=[],
+        )
+
+        decision = orchestrator._parse_llm_response(
+            '{"agent":"chat","output_format":"text","needs_thinking":false,"task_description":"簡短回答","reasoning":"簡單問題"}',
+            "你好",
+        )
+
+        self.assertEqual(decision.agent, "chat")
+        self.assertTrue(decision.disable_thinking)
 
 
 class ImageGenErrorHandlingTests(unittest.IsolatedAsyncioTestCase):

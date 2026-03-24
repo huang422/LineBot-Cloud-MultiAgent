@@ -29,6 +29,7 @@ class RouterDecision:
     output_format: str  # text | voice | image
     task_description: str = ""
     reasoning: str = ""
+    disable_thinking: bool = False  # True = skip reasoning for simple queries
 
 
 # Keywords that suggest the user wants an image generated
@@ -122,6 +123,53 @@ _URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 _VALID_AGENTS = {"chat", "vision", "web_search", "image_gen"}
 _VALID_OUTPUTS = {"text", "voice", "image"}
 
+# Simple queries that don't need thinking — greetings, short chitchat, trivial requests
+_SIMPLE_QUERY_PATTERNS = re.compile(
+    r"^("
+    # Greetings / farewells
+    r"(嗨|哈囉|你好|早安|午安|晚安|安安|掰掰|拜拜|再見|晚安|謝謝|感謝|好的|OK|ok|收到|了解|bye|hello|hi|hey|thanks|thank you|good morning|good night|gn|gm)"
+    # Very short messages (≤5 chars) that are likely chitchat
+    r"|.{1,5}"
+    r")$",
+    re.IGNORECASE,
+)
+
+# Complex queries that benefit from reasoning/thinking
+_COMPLEX_QUERY_PATTERNS = re.compile(
+    r"("
+    # Analysis / comparison / evaluation
+    r"分析|比較|評估|解釋|為什麼|原因|差異|優缺點|利弊|怎麼辦"
+    r"|analyze|compare|evaluate|explain|why|difference|pros.?cons"
+    # Multi-step / planning / strategy
+    r"|步驟|規劃|計畫|策略|方案|建議.*怎麼|如何.*實現|如何.*設計"
+    r"|plan|strategy|how.*implement|how.*design|step.?by.?step"
+    # Code / technical reasoning
+    r"|程式|代碼|code|debug|bug|error|重構|refactor|演算法|algorithm"
+    r"|寫.*程式|寫.*code|fix.*bug|implement"
+    # Troubleshooting / fault analysis
+    r"|錯誤|錯在哪|哪裡錯|怎麼修|如何修|排查|故障|異常|當掉|崩潰|無法"
+    r"|error|traceback|exception|stack trace|troubleshoot|diagnos"
+    # Creative writing with substance
+    r"|寫.*文章|寫.*故事|寫.*報告|寫.*企劃|寫.*提案|寫.*信|essay|report|proposal"
+    # Math / logic
+    r"|計算|算.*等於|數學|公式|證明|推導|邏輯|math|calcul|prove|formula"
+    # Translation of substantial content (not single words)
+    r"|翻譯.*段|翻譯.*篇|翻譯.*文|translate.*paragraph|translate.*article"
+    r")",
+    re.IGNORECASE,
+)
+
+# Short image questions that are usually just asking for a direct description
+_SIMPLE_IMAGE_QUERY_PATTERNS = re.compile(
+    r"("
+    r"這是什麼|這張(?:圖|圖片|照片|截圖)是什麼|請描述(?:一下)?|描述(?:一下)?"
+    r"|圖裡有什麼|圖片裡有什麼|照片裡有什麼"
+    r"|what(?:'s| is) this|what is in (?:the )?(?:image|picture|photo)"
+    r"|describe (?:the )?(?:image|picture|photo)"
+    r")",
+    re.IGNORECASE,
+)
+
 
 def _iter_json_candidates(text: str):
     seen: set[str] = set()
@@ -168,6 +216,42 @@ def _iter_json_candidates(text: str):
                     break
 
 
+def _should_disable_thinking(text: str, *, has_image: bool = False) -> bool:
+    """Heuristic: return True for simple queries that don't need reasoning.
+
+    Logic:
+    - If text matches complex patterns → thinking ON (return False)
+    - For image requests with text, default to thinking ON unless the user is
+      only asking for a plain description
+    - If text matches simple patterns (greetings, very short) → thinking OFF (return True)
+    - If text is medium length (≤15 chars) with no complex signals → thinking OFF
+    - Otherwise → thinking ON (default to reasoning)
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True  # Empty → no thinking needed
+
+    # Complex signals always get thinking
+    if _COMPLEX_QUERY_PATTERNS.search(stripped):
+        return False
+
+    if has_image:
+        if _SIMPLE_IMAGE_QUERY_PATTERNS.search(stripped):
+            return True
+        return False
+
+    # Simple greetings / very short messages
+    if _SIMPLE_QUERY_PATTERNS.match(stripped):
+        return True
+
+    # Short messages without complex signals
+    if len(stripped) <= 15:
+        return True
+
+    # Default: use thinking for longer / ambiguous messages
+    return False
+
+
 def _needs_web_search(text: str) -> bool:
     return bool(
         _WEB_SEARCH_TOPIC_KEYWORDS.search(text)
@@ -212,7 +296,8 @@ class Orchestrator(BaseAgent):
         if decision:
             logger.info(
                 f"[{request.request_id}] Orchestrator fast-rule → "
-                f"agent={decision.agent}, output={decision.output_format}"
+                f"agent={decision.agent}, output={decision.output_format}, "
+                f"thinking={'off' if decision.disable_thinking else 'on'}"
             )
             return decision
 
@@ -220,7 +305,8 @@ class Orchestrator(BaseAgent):
         decision = await self._llm_classify(request)
         logger.info(
             f"[{request.request_id}] Orchestrator LLM → "
-            f"agent={decision.agent}, output={decision.output_format}"
+            f"agent={decision.agent}, output={decision.output_format}, "
+            f"thinking={'off' if decision.disable_thinking else 'on'}"
         )
         return decision
 
@@ -229,30 +315,31 @@ class Orchestrator(BaseAgent):
     def _apply_fast_rules(self, request: AgentRequest) -> RouterDecision | None:
         has_image = request.input_type in (InputType.IMAGE, InputType.IMAGE_TEXT)
         text = request.text.strip()
+        no_think = _should_disable_thinking(text, has_image=has_image)
 
         wants_image_gen = (
             _IMAGE_GEN_KEYWORDS.search(text)
             and not _IMAGE_GEN_NEGATIVES.search(text)
         )
 
-        # Image with generation keywords
+        # Image with generation keywords — prompt refinement doesn't need deep thinking
         if has_image and wants_image_gen:
-            return RouterDecision("image_gen", "image", text, "image + gen keywords")
+            return RouterDecision("image_gen", "image", text, "image + gen keywords", disable_thinking=True)
 
         # Image with no text or analysis text → vision
         if has_image and not text:
-            return RouterDecision("vision", "text", "描述圖片內容", "image without text")
+            return RouterDecision("vision", "text", "描述圖片內容", "image without text", disable_thinking=no_think)
 
         if has_image:
-            return RouterDecision("vision", "text", text, "image with question")
+            return RouterDecision("vision", "text", text, "image with question", disable_thinking=no_think)
 
         # Text-only rules
         if wants_image_gen:
-            return RouterDecision("image_gen", "image", text, "draw/generate keywords")
+            return RouterDecision("image_gen", "image", text, "draw/generate keywords", disable_thinking=True)
 
         if _URL_PATTERN.search(text):
             output = "voice" if _prefers_voice_output(text) else "text"
-            return RouterDecision("web_search", output, text, "URL detected")
+            return RouterDecision("web_search", output, text, "URL detected", disable_thinking=no_think)
 
         if _needs_web_search(text):
             output = "voice" if _prefers_voice_output(text) else "text"
@@ -261,15 +348,21 @@ class Orchestrator(BaseAgent):
                 output,
                 text,
                 "time-sensitive or externally verifiable query",
+                disable_thinking=no_think,
             )
 
         if _prefers_voice_output(text):
-            return RouterDecision("chat", "voice", text, "voice output keywords")
+            return RouterDecision("chat", "voice", text, "voice output keywords", disable_thinking=no_think)
 
         if _prefers_text_output(text):
-            return RouterDecision("chat", "text", text, "text output keywords")
+            return RouterDecision("chat", "text", text, "text output keywords", disable_thinking=no_think)
 
-        # No fast rule matched — need LLM
+        # Only catch obvious greetings/chitchat; let everything else go to LLM
+        # so it can correctly route to voice or other output formats.
+        if _SIMPLE_QUERY_PATTERNS.match(text):
+            return RouterDecision("chat", "text", text, "simple greeting/chitchat", disable_thinking=True)
+
+        # No fast rule matched — need LLM to decide
         return None
 
     # ── LLM classification ───────────────────────────────────
@@ -285,6 +378,7 @@ class Orchestrator(BaseAgent):
                 temperature=self.settings.orchestrator_temperature,
                 max_tokens=self.settings.orchestrator_max_tokens,
                 require_reasoning_tokens=self.settings.require_reasoning_tokens,
+                thinking_timeout=self.settings.thinking_timeout_seconds,
             )
 
             return self._parse_llm_response(resp.text or "", request.text)
@@ -315,11 +409,17 @@ class Orchestrator(BaseAgent):
                 elif output == "image" and agent != "image_gen":
                     output = "text"
 
+                # needs_thinking: LLM decides; default True for safety
+                needs_thinking = data.get("needs_thinking", True)
+                if isinstance(needs_thinking, str):
+                    needs_thinking = needs_thinking.lower() not in ("false", "no", "0")
+
                 return RouterDecision(
                     agent=agent,
                     output_format=output,
                     task_description=data.get("task_description") or user_text,
                     reasoning=data.get("reasoning", ""),
+                    disable_thinking=not needs_thinking,
                 )
             except json.JSONDecodeError:
                 continue

@@ -1,6 +1,6 @@
 """Vision Agent — analyses images and answers questions about visual content.
 
-Uses Qwen3.5 397B VLM (NVIDIA) as primary, with OpenRouter fallback.
+Uses Qwen3.5 122B VLM (NVIDIA) as primary, with OpenRouter fallback.
 Qwen3.5 natively supports image input (vision-language model).
 """
 
@@ -27,6 +27,8 @@ class VisionAgent(BaseAgent):
             temperature=self.settings.vision_temperature,
             max_tokens=self.settings.vision_max_tokens,
             require_reasoning_tokens=self.settings.require_reasoning_tokens,
+            thinking_timeout=self.settings.thinking_timeout_seconds,
+            disable_thinking=request.disable_thinking,
         )
 
         return AgentResponse(

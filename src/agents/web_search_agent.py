@@ -69,6 +69,8 @@ class WebSearchAgent(BaseAgent):
             temperature=self.settings.web_search_temperature,
             max_tokens=self.settings.web_search_max_tokens,
             require_reasoning_tokens=self.settings.require_reasoning_tokens,
+            thinking_timeout=self.settings.thinking_timeout_seconds,
+            disable_thinking=request.disable_thinking,
         )
 
         return AgentResponse(

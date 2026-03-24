@@ -71,6 +71,7 @@ class NvidiaProvider:
         max_tokens: int = 2048,
         modalities: list[str] | None = None,
         require_reasoning_tokens: bool = False,
+        disable_thinking: bool = False,
     ) -> ProviderResponse:
         """Call NVIDIA chat completions API and return a unified response.
 
@@ -87,8 +88,34 @@ class NvidiaProvider:
         if not model:
             raise ProviderError("<empty>", 400, "Model ID must not be empty", provider="NVIDIA")
 
-        expect_reasoning = self._thinking_enabled and _supports_reasoning(model)
+        expect_reasoning = self._thinking_enabled and _supports_reasoning(model) and not disable_thinking
+        if disable_thinking and self._thinking_enabled:
+            logger.info(f"NVIDIA: thinking OFF for {model} (disable_thinking=True)")
+        elif expect_reasoning:
+            logger.info(f"NVIDIA: thinking ON for {model}")
         model_lower = model.lower()
+
+        # --- Explicit thinking deactivation ---
+        if disable_thinking and self._thinking_enabled and "qwen" in model_lower:
+            # Qwen3/3.5: inject /no_think soft switch to explicitly suppress thinking
+            messages = list(messages)
+            for i in range(len(messages) - 1, -1, -1):
+                msg = messages[i]
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        # Remove any leftover /think and append /no_think
+                        cleaned = content.replace(" /think", "").replace("/think", "")
+                        messages[i] = {**msg, "content": cleaned + " /no_think"}
+                    elif isinstance(content, list):
+                        new_content = list(content)
+                        for j, part in enumerate(new_content):
+                            if part.get("type") == "text" and part.get("text", "").strip():
+                                cleaned = part["text"].replace(" /think", "").replace("/think", "")
+                                new_content[j] = {**part, "text": cleaned + " /no_think"}
+                                break
+                        messages[i] = {**msg, "content": new_content}
+                    break
 
         # --- Model-family-specific reasoning activation (per official docs) ---
         if expect_reasoning:
@@ -152,6 +179,11 @@ class NvidiaProvider:
             elif "nemotron-3-" in model_lower or "qwen" in model_lower:
                 payload["chat_template_kwargs"] = {"enable_thinking": True}
             # Nemotron V1/Ultra: reasoning via system prompt (injected above).
+        elif disable_thinking and self._thinking_enabled:
+            # Explicitly disable thinking to prevent the model from
+            # entering thinking mode by default.
+            if "nemotron-3-" in model_lower or "qwen" in model_lower:
+                payload["chat_template_kwargs"] = {"enable_thinking": False}
 
         logger.info(
             f"NVIDIA request → {model} "

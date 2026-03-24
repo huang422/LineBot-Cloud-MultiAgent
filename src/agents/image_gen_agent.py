@@ -149,9 +149,11 @@ class ImageGenAgent(BaseAgent):
             resp = await self.fallback_chain.generate(
                 targets=self.targets,
                 messages=messages,
-                temperature=0.5,
-                max_tokens=300,
+                temperature=self.settings.image_gen_temperature,
+                max_tokens=self.settings.image_gen_max_tokens,
                 require_reasoning_tokens=self.settings.require_reasoning_tokens,
+                thinking_timeout=self.settings.thinking_timeout_seconds,
+                disable_thinking=request.disable_thinking,
             )
             return resp.text or request.text or "A beautiful creative image"
         except (AllModelsRateLimitedError, AllProvidersFailedError) as e:

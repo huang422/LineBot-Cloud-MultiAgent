@@ -36,8 +36,6 @@ def _is_line_bot_mentioned(event: dict, settings) -> bool:
             return True
         if bot_user_id and mentionee.get("userId") == bot_user_id:
             return True
-        if mentionee.get("type") == "bot":
-            return True
         mention_text = mentionee.get("text", "").strip()
         if bot_name and mention_text in {bot_name, f"@{bot_name}"}:
             return True
@@ -133,9 +131,8 @@ def record_conversation(
 ) -> None:
     """Record the bot's assistant response in conversation history.
 
-    User messages are already recorded proactively by
-    ``_record_group_message`` in ``main.py`` for all incoming events,
-    so we only add the assistant reply here.
+    User messages are recorded separately by ``main.py`` once each event has
+    been handled, so we only add the assistant reply here.
     """
     if assistant_delivered and response_text:
         conv_svc = get_conversation_service()

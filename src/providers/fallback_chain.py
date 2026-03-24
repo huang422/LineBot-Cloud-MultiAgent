@@ -3,10 +3,16 @@
 Tries (provider, model) targets in order; on 429 or unavailability,
 falls through to the next target.  Supports mixed providers (NVIDIA +
 OpenRouter) in a single chain.
+
+When *thinking_timeout* is set, the first attempt uses thinking/reasoning
+mode.  If it doesn't complete within the timeout, the chain retries every
+target with ``disable_thinking=True`` so models answer without the
+(potentially slow) reasoning step.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Protocol
 
 from src.providers.openrouter_provider import (
@@ -30,6 +36,7 @@ class LLMProvider(Protocol):
         max_tokens: int = 2048,
         modalities: list[str] | None = None,
         require_reasoning_tokens: bool = False,
+        disable_thinking: bool = False,
     ) -> ProviderResponse: ...
 
 
@@ -60,6 +67,8 @@ class FallbackChain:
         self,
         targets: list[Target],
         messages: list[dict],
+        *,
+        thinking_timeout: float | None = None,
         **kwargs,
     ) -> ProviderResponse:
         """Try targets in order, falling back on rate limits or errors.
@@ -67,6 +76,9 @@ class FallbackChain:
         Args:
             targets: Ordered list of (provider, model_id) to try
             messages: OpenAI-format messages
+            thinking_timeout: If set, abort the thinking-mode attempt after
+                this many seconds and retry the entire chain with thinking
+                disabled.
             **kwargs: Forwarded to provider.generate()
 
         Returns:
@@ -76,6 +88,34 @@ class FallbackChain:
             AllModelsRateLimitedError: Every target is unavailable due to rate limiting
             AllProvidersFailedError: Targets failed for other provider/service reasons
         """
+        should_timeout = (
+            thinking_timeout is not None
+            and thinking_timeout > 0
+            and not kwargs.get("disable_thinking", False)
+        )
+        if should_timeout:
+            try:
+                return await asyncio.wait_for(
+                    self._run_chain(targets, messages, **kwargs),
+                    timeout=thinking_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Thinking mode timed out after {thinking_timeout}s — "
+                    "retrying with thinking disabled"
+                )
+                retry_kwargs = {**kwargs, "disable_thinking": True}
+                return await self._run_chain(targets, messages, **retry_kwargs)
+
+        return await self._run_chain(targets, messages, **kwargs)
+
+    async def _run_chain(
+        self,
+        targets: list[Target],
+        messages: list[dict],
+        **kwargs,
+    ) -> ProviderResponse:
+        """Core chain logic: try each target in order."""
         if not targets:
             raise AllProvidersFailedError("No fallback targets configured")
 

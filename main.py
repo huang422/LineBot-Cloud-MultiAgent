@@ -314,6 +314,7 @@ def _get_health_status(settings) -> tuple[str, bool, list[str]]:
     warnings: list[str] = []
     line_ready = bool(settings.line_channel_secret and settings.line_channel_access_token)
     openrouter_ready = bool(settings.openrouter_api_key)
+    nvidia_ready = bool(settings.nvidia_api_key)
 
     if not line_ready:
         warnings.append("LINE channel credentials are incomplete")
@@ -340,10 +341,18 @@ def _track_background_task(task: asyncio.Task) -> None:
 def _apply_cleaned_text(request, event: dict) -> None:
     if request.text or event.get("message", {}).get("type") == "text":
         request.text = extract_text(event)
-        if request.image_base64:
+        if _request_has_image_context(request):
             request.input_type = InputType.IMAGE_TEXT if request.text else InputType.IMAGE
         else:
             request.input_type = InputType.TEXT
+
+
+def _request_has_image_context(request) -> bool:
+    return bool(
+        request.image_base64
+        or request.quoted_image_base64
+        or request.quoted_image_url
+    )
 
 
 def _log_background_task_exception(task: asyncio.Task) -> None:
@@ -362,7 +371,7 @@ def _log_background_task_exception(task: asyncio.Task) -> None:
 def _get_request_block_message(request) -> str | None:
     if request.rate_limited:
         return "⚠️ 請求太頻繁，請稍後再試。"
-    if not request.text and not request.image_base64:
+    if not request.text and not _request_has_image_context(request):
         return "請附上想問的內容，或直接引用訊息／圖片再提問。"
     return None
 
@@ -444,10 +453,8 @@ async def webhook(request: Request):
     for event in events:
         should_process = should_handle(event)
 
-        # Proactively record ALL group messages for conversation context
-        _record_group_message(event)
-
         if event.get("type") == "message" and not should_process:
+            _record_group_message(event)
             task = asyncio.create_task(
                 get_message_cache_service().cache_event_message(event)
             )
@@ -555,10 +562,12 @@ async def _process_event(event: dict) -> None:
         request.output_format = decision.output_format
         request.task_description = decision.task_description
         request.routing_reasoning = decision.reasoning
+        request.disable_thinking = decision.disable_thinking
 
         logger.info(
             f"[{request.request_id}] → {decision.agent} "
-            f"(output={decision.output_format})"
+            f"(output={decision.output_format}, "
+            f"thinking={'off' if decision.disable_thinking else 'on'})"
         )
 
         # Dispatch to agent
@@ -598,6 +607,10 @@ async def _process_event(event: dict) -> None:
     except Exception as e:
         logger.error(f"Event processing error: {e}", exc_info=True)
         await _send_error_message(reply_token, chat_id, "❌ 處理請求時發生錯誤，請稍後再試。")
+    finally:
+        # Record handled messages after processing so the current turn is not
+        # duplicated in the prompt history passed to the agent.
+        _record_group_message(event)
 
 
 async def _send_error_message(reply_token: str, chat_id: str, text: str) -> None:

@@ -8,7 +8,6 @@ REGION=""
 MIN_INSTANCE_COUNT=""
 ENV_FILE="$ROOT_DIR/.env"
 IMAGE_TAG=""
-SERVICE_ACCOUNT=""
 SKIP_TESTS="false"
 SKIP_SMOKE="false"
 KEEP_REVISION_COUNT=""
@@ -35,8 +34,6 @@ Deploy settings supported in .env:
   GCP_PROJECT_ID
   CLOUD_RUN_SERVICE_NAME
   CLOUD_RUN_REGION
-  CLOUD_RUN_MIN_INSTANCES
-  CLOUD_RUN_SERVICE_ACCOUNT
   DEPLOY_KEEP_REVISIONS
   DEPLOY_KEEP_IMAGES
   DEPLOY_ENABLE_APIS
@@ -45,10 +42,8 @@ Options:
   --project-id ID            Override GCP project ID
   --service-name NAME        Override Cloud Run service name
   --region REGION            Override Cloud Run region
-  --min-instances N          Override Cloud Run min instances (default: auto)
   --env-file PATH            Env file to deploy (default: .env)
   --image-tag TAG            Override Docker image tag (default: <git-sha>-<utc-timestamp>)
-  --service-account EMAIL    Override runtime service account
   --keep-revisions N         Override how many revisions to keep (default from .env or 1)
   --keep-images N            Override how many image digests to keep (default from .env or 3)
   --skip-tests               Skip Cloud Build unit tests and compile checks
@@ -142,20 +137,12 @@ while [[ $# -gt 0 ]]; do
       REGION="$2"
       shift 2
       ;;
-    --min-instances)
-      MIN_INSTANCE_COUNT="$2"
-      shift 2
-      ;;
     --env-file)
       ENV_FILE="$2"
       shift 2
       ;;
     --image-tag)
       IMAGE_TAG="$2"
-      shift 2
-      ;;
-    --service-account)
-      SERVICE_ACCOUNT="$2"
       shift 2
       ;;
     --keep-revisions)
@@ -215,12 +202,6 @@ if [[ -z "$SERVICE_NAME" ]]; then
 fi
 if [[ -z "$REGION" ]]; then
   REGION="$(read_env_key CLOUD_RUN_REGION)"
-fi
-if [[ -z "$SERVICE_ACCOUNT" ]]; then
-  SERVICE_ACCOUNT="$(read_env_key CLOUD_RUN_SERVICE_ACCOUNT)"
-fi
-if [[ -z "$MIN_INSTANCE_COUNT" ]]; then
-  MIN_INSTANCE_COUNT="$(read_env_key CLOUD_RUN_MIN_INSTANCES)"
 fi
 if [[ -z "$KEEP_REVISION_COUNT" ]]; then
   KEEP_REVISION_COUNT="$(read_env_key DEPLOY_KEEP_REVISIONS)"
@@ -301,7 +282,7 @@ if [[ -z "$MIN_INSTANCE_COUNT" ]]; then
     MIN_INSTANCE_COUNT="0"
   fi
 fi
-validate_non_negative_int "$MIN_INSTANCE_COUNT" "CLOUD_RUN_MIN_INSTANCES / --min-instances"
+validate_non_negative_int "$MIN_INSTANCE_COUNT" "auto-calculated Cloud Run min instances"
 
 gcloud config set project "$PROJECT_ID" >/dev/null
 
@@ -380,10 +361,6 @@ substitutions=(
   "_KEEP_REVISION_COUNT=$KEEP_REVISION_COUNT"
   "_KEEP_IMAGE_COUNT=$KEEP_IMAGE_COUNT"
 )
-
-if [[ -n "$SERVICE_ACCOUNT" ]]; then
-  substitutions+=("_SERVICE_ACCOUNT=$SERVICE_ACCOUNT")
-fi
 
 SUBSTITUTIONS="$(IFS=,; echo "${substitutions[*]}")"
 

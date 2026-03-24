@@ -78,6 +78,7 @@ class Settings(BaseSettings):
     nvidia_model: str = "qwen/qwen3.5-122b-a10b"
     nvidia_thinking_enabled: bool = True
     nvidia_thinking_budget: int = 4096
+    thinking_timeout_seconds: int = 120  # 0 disables the timeout retry behavior
 
     # ── Orchestrator (routing / task dispatch) ────────────────
     orchestrator_model: str = "nvidia/nemotron-3-super-120b-a12b:free"
@@ -193,6 +194,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "line_push_monthly_limit",
+        "thinking_timeout_seconds",
         "web_search_monthly_quota",
     )
     @classmethod

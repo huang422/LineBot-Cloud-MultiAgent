@@ -43,3 +43,4 @@ class AgentRequest:
     output_format: str = "text"  # text | voice | image
     task_description: str = ""
     routing_reasoning: str = ""
+    disable_thinking: bool = False  # True = skip reasoning for simple queries

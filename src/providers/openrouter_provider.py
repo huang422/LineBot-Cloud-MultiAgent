@@ -77,15 +77,22 @@ def parse_openai_response(data: dict) -> tuple[str | None, list[str] | None, str
     if isinstance(message.get("content"), str):
         text = message["content"]
     elif isinstance(message.get("content"), list):
+        text_parts: list[str] = []
         for part in message["content"]:
+            if not isinstance(part, dict):
+                continue
             if part.get("type") == "text":
-                text = part.get("text", "")
+                part_text = part.get("text")
+                if isinstance(part_text, str):
+                    text_parts.append(part_text)
             elif part.get("type") == "image_url":
                 if images is None:
                     images = []
                 images.append(part["image_url"]["url"])
             elif part.get("type") == "thinking" and isinstance(part.get("thinking"), str):
                 reasoning_content = reasoning_content or part["thinking"].strip()
+        if text_parts:
+            text = "".join(text_parts)
 
     # Some image models return images in a separate field
     if message.get("images"):
@@ -157,6 +164,7 @@ class OpenRouterProvider:
         max_tokens: int = 2048,
         modalities: list[str] | None = None,
         require_reasoning_tokens: bool = False,
+        disable_thinking: bool = False,
     ) -> ProviderResponse:
         """Call OpenRouter and return a unified response.
 
@@ -179,7 +187,12 @@ class OpenRouterProvider:
             and self._reasoning_config
             and not modalities
             and _supports_reasoning(model)
+            and not disable_thinking
         )
+        if disable_thinking and self._reasoning_enabled:
+            logger.info(f"OpenRouter: thinking OFF for {model} (disable_thinking=True)")
+        elif use_reasoning:
+            logger.info(f"OpenRouter: thinking ON for {model}")
 
         payload: dict = {
             "model": model,

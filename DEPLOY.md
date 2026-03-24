@@ -52,7 +52,6 @@ cp .env.example .env
 
 - `CLOUD_RUN_SERVICE_NAME`
 - `CLOUD_RUN_REGION`
-- `CLOUD_RUN_MIN_INSTANCES`
 - `DEPLOY_KEEP_REVISIONS`
 - `DEPLOY_KEEP_IMAGES`
 - `DEPLOY_ENABLE_APIS`
@@ -72,10 +71,10 @@ cp .env.example .env
 - 設成 `0` = 排程 direct push 不設上限
 - 設成 `>0` = 幫 direct push 加每月上限
 
-`CLOUD_RUN_MIN_INSTANCES` 留空時，部署腳本會自動判斷：
+部署腳本會自動處理這兩件事：
 
-- 有啟用排程且有設定 job 時，預設用 `1`
-- 其他情況預設用 `0`
+- `min instances`：只有啟用排程且有實際 job 時才設為 `1`，其他情況 `0`
+- runtime service account：沿用目前 Cloud Run 設定；第一次部署則使用預設 service account
 
 ---
 
@@ -95,15 +94,6 @@ cp .env.example .env
   --service-name linebot-cloud-agent \
   --region us-west1
 ```
-
-如果你要指定 Cloud Run runtime service account：
-
-```bash
-./scripts/deploy_cloud_run.sh \
-  --service-account YOUR_SERVICE_ACCOUNT_EMAIL
-```
-
----
 
 ## 修改程式後再次部署
 
@@ -264,6 +254,11 @@ gcloud artifacts docker images list \
 gcloud beta run services logs tail "$SERVICE_NAME" \
   --project "$PROJECT_ID" \
   --region "$REGION"
+
+gcloud beta run services logs tail linebot-cloud-agent \
+  --project terabanana \
+  --region us-west1
+
 ```
 
 如果這台機器沒有 `beta` 的 tail 指令，就改用下面這個**輪詢式監看**（實測可用）：
@@ -351,7 +346,7 @@ gcloud logging read \
 | --- | --- |
 | LLM 呼叫 | 每個模型的 RPM/RPD 追蹤，429 時自動 fallback |
 | LINE push | `LINE_PUSH_MONTHLY_LIMIT` 控制月度 push 上限 |
-| 網路搜尋 | `WEB_SEARCH_MONTHLY_QUOTA` 控制月度配額 |
+| 網路搜尋 | `WEB_SEARCH_MONTHLY_QUOTA` 控制 app 內每個 instance 的月度搜尋配額計數 |
 | GCS 媒體 | Signed URL 48 小時過期，app 2 天後清理，部署腳本驗證 3 天 lifecycle 保底 |
 | 使用者請求 | 每人滑動視窗 rate limit |
 | Cloud Run | `max-instances=1`，`min-instances` 自動判斷（一般 `0`，有排程時 `1`） |

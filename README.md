@@ -20,6 +20,10 @@ LineBot-Cloud-MultiAgent receives LINE webhook events, routes them through a sma
 
 Fast regex rules handle obvious requests without an LLM call; harder cases fall back to model-based routing. The orchestrator dispatches to four specialist agents — `chat`, `vision`, `web_search`, and `image_gen` — each with its own model configuration and system prompt.
 
+### Adaptive Thinking Control
+
+The orchestrator does more than choose an agent: it also decides whether the downstream model should use provider-native reasoning / thinking mode for that specific request. Simple greetings, short acknowledgements, straightforward fact lookups, plain image descriptions, and image-generation requests usually skip deep thinking for lower latency. Analysis, planning, coding/debugging, math, long-form writing, and harder screenshot or document questions keep thinking enabled for better answer quality. If a thinking attempt runs too long, the fallback chain retries once with thinking disabled.
+
 ### Multi-Modal Input & Output
 
 Text, images, voice, and quoted context all flow through the same webhook pipeline. Users can send photos for vision analysis, request image generation, receive voice replies, and quote earlier messages — the bot handles every combination seamlessly.
@@ -51,6 +55,7 @@ System prompts live in `prompts/*.md`; all runtime behavior lives in `.env`. Mod
 | Feature | How it works |
 | --- | --- |
 | Chat | General conversation, coding help, translation, and creative replies via the fallback chain |
+| Adaptive thinking control | The orchestrator decides per request whether to enable deep reasoning so simple queries return faster while complex tasks keep thinking on |
 | Vision | Accepts images, screenshots, and photos for analysis |
 | Web search | Tavily search results are injected into the prompt before synthesis |
 | Webpage reading | If the user posts a URL, Tavily Extract fetches the page body and injects the webpage content into the prompt before synthesis |
@@ -90,7 +95,7 @@ This project is the next-generation successor to [LineBot-VLM-GroupAgent](https:
 2. The API returns `200 OK` immediately, then continues processing in background tasks.
 3. Input processing downloads image payloads, sanitizes text, and recovers quoted context.
 4. Rate limiting and conversation history enrichment happen before routing.
-5. The orchestrator chooses `chat`, `vision`, `web_search`, or `image_gen`.
+5. The orchestrator chooses `chat`, `vision`, `web_search`, or `image_gen`, and also decides whether the request needs deep thinking.
 6. The selected agent runs through the fallback chain and returns a normalized response.
 7. The output processor sends text, voice, or image messages back to LINE.
 
@@ -191,6 +196,7 @@ All settings are loaded from `.env`. See [.env.example](.env.example) for a read
 | `NVIDIA_MODEL` | `qwen/qwen3.5-122b-a10b` | NVIDIA primary model |
 | `TAVILY_API_KEY` | — | [Tavily](https://tavily.com) key for web search + URL extraction |
 | `GCS_BUCKET_NAME` | — | GCS bucket for voice/image delivery (text replies work without it) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | — | Optional local-only GCP SDK credential JSON path; leave empty on Cloud Run |
 
 ### Reasoning / Thinking
 
@@ -201,8 +207,11 @@ All settings are loaded from `.env`. See [.env.example](.env.example) for a read
 | `OPENROUTER_REASONING_EXCLUDE` | `false` | Exclude reasoning from response (free models may ignore this) |
 | `NVIDIA_THINKING_ENABLED` | `true` | Enable thinking for NVIDIA models |
 | `NVIDIA_THINKING_BUDGET` | `4096` | Extra tokens reserved for model thinking |
+| `THINKING_TIMEOUT_SECONDS` | `120` | Abort a reasoning attempt after N seconds and retry once with thinking disabled; set `0` to disable |
 | `REQUIRE_REASONING_MODELS` | `true` | Only route to reasoning-capable models |
 | `REQUIRE_REASONING_TOKENS` | `true` | Warn when a reasoning model returns no reasoning content |
+
+These flags control provider-side reasoning support, but the actual on/off decision is made per request by the orchestrator. In practice, simple chat, short confirmations, direct lookups, simple image descriptions, and image generation normally run with thinking disabled, while complex analysis, planning, coding/debugging, math, long-form writing, and harder image or screenshot diagnosis keep thinking enabled.
 
 ### Model routing
 
@@ -210,6 +219,8 @@ All settings are loaded from `.env`. See [.env.example](.env.example) for a read
 | --- | --- | --- |
 | `ORCHESTRATOR_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | Primary orchestrator model (OpenRouter) |
 | `ORCHESTRATOR_FALLBACK_MODEL` | `qwen/qwen3.5-122b-a10b` | Orchestrator fallback (NVIDIA) |
+| `ORCHESTRATOR_TEMPERATURE` | `0` | Sampling temperature for LLM-based routing |
+| `ORCHESTRATOR_MAX_TOKENS` | `200` | Max tokens for orchestrator JSON routing output |
 | `AGENT_FALLBACK_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | Shared fallback for text agents |
 | `VISION_FALLBACK_MODEL` | `google/gemma-3-27b-it:free` | Vision agent fallback |
 
@@ -237,7 +248,7 @@ All settings are loaded from `.env`. See [.env.example](.env.example) for a read
 | --- | --- | --- |
 | `LINE_PUSH_FALLBACK_ENABLED` | `true` | Allow push fallback when reply fails |
 | `LINE_PUSH_MONTHLY_LIMIT` | `0` | Monthly push cap (`0` = unlimited) |
-| `WEB_SEARCH_MONTHLY_QUOTA` | `1000` | Tavily monthly search quota |
+| `WEB_SEARCH_MONTHLY_QUOTA` | `1000` | App-level per-instance web search quota counter |
 | `GCS_SIGNED_URL_EXPIRY_HOURS` | `48` | Signed URL expiry |
 | `GCS_MEDIA_CLEANUP_DELAY_SECONDS` | `172800` | App-level media cleanup delay (2 days) |
 | `RATE_LIMIT_MAX_REQUESTS` | `30` | Per-user request limit |
@@ -269,8 +280,6 @@ All settings are loaded from `.env`. See [.env.example](.env.example) for a read
 | --- | --- | --- |
 | `CLOUD_RUN_SERVICE_NAME` | `linebot-cloud-agent` | Cloud Run service name |
 | `CLOUD_RUN_REGION` | `us-west1` | Cloud Run region |
-| `CLOUD_RUN_MIN_INSTANCES` | auto | `1` if scheduler active, otherwise `0` |
-| `CLOUD_RUN_SERVICE_ACCOUNT` | — | Runtime service account |
 | `DEPLOY_KEEP_REVISIONS` | `1` | Revisions to keep after deploy |
 | `DEPLOY_KEEP_IMAGES` | `3` | Container images to keep |
 | `DEPLOY_ENABLE_APIS` | `true` | Auto-enable required GCP APIs |

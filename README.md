@@ -1,16 +1,16 @@
-# LineBot-CloudAgent
+# LineBot-Cloud-MultiAgent
 
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Cloud Run](https://img.shields.io/badge/Cloud%20Run-GCP-4285F4?logo=googlecloud&logoColor=white)](https://cloud.google.com/run)
 [![LINE](https://img.shields.io/badge/LINE-Messaging%20API-00C300?logo=line&logoColor=white)](https://developers.line.biz/)
-[![NVIDIA](https://img.shields.io/badge/NVIDIA-Qwen3.5%20397B-76B900?logo=nvidia&logoColor=white)](https://build.nvidia.com/)
-[![OpenRouter](https://img.shields.io/badge/OpenRouter-Free%20Tier-6366F1)](https://openrouter.ai/)
+[![NVIDIA](https://img.shields.io/badge/NVIDIA-Qwen3.5%20122B-76B900?logo=nvidia&logoColor=white)](https://build.nvidia.com/)
+[![OpenRouter](https://img.shields.io/badge/OpenRouter-Nemotron%20120B-6366F1)](https://openrouter.ai/)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://www.buymeacoffee.com/huang422)
 
 **A cloud-first, multi-agent LINE bot for GCP Cloud Run.**
 
-LineBot-CloudAgent receives LINE webhook events, routes them through a smart orchestrator, and dispatches them to specialized chat, vision, web-search, image-generation, and voice workflows while staying inside free-tier-friendly guardrails.
+LineBot-Cloud-MultiAgent receives LINE webhook events, routes them through a smart orchestrator, and dispatches them to specialized chat, vision, web-search, image-generation, and voice workflows while staying inside free-tier-friendly guardrails.
 
 ---
 
@@ -66,15 +66,15 @@ System prompts live in `prompts/*.md`; all runtime behavior lives in `.env`. Mod
 
 ## From local GPU to cloud-native
 
-This project is the next-generation successor to [LineBot-VLM-GroupAgent](https://github.com/huang422/LineBot-VLM-GroupAgent), which ran a single Ollama model on a local NVIDIA GPU. LineBot-CloudAgent has been redesigned from scratch for zero-hardware, cloud-only deployment.
+This project is the next-generation successor to [LineBot-VLM-GroupAgent](https://github.com/huang422/LineBot-VLM-GroupAgent), which ran a single Ollama model on a local NVIDIA GPU. LineBot-Cloud-MultiAgent has been redesigned from scratch for zero-hardware, cloud-only deployment.
 
-| | [LineBot-VLM-GroupAgent](https://github.com/huang422/LineBot-VLM-GroupAgent) (v1) | LineBot-CloudAgent (v2) |
+| | [LineBot-VLM-GroupAgent](https://github.com/huang422/LineBot-VLM-GroupAgent) (v1) | LineBot-Cloud-MultiAgent (v2) |
 | --- | --- | --- |
 | Deployment | Local server + Cloudflare Tunnel | GCP Cloud Run (serverless) |
 | Hardware | NVIDIA GPU + 32 GB RAM required | No GPU, no local hardware |
 | LLM Provider | Ollama (single local model) | NVIDIA + OpenRouter (multi-provider fallback) |
 | Architecture | Single model, serial queue | Multi-agent orchestrator with parallel dispatch |
-| Vision Model | Qwen3.5 9B/35B (local) | Qwen3.5 397B VLM (NVIDIA API) |
+| Vision Model | Qwen3.5 9B/35B (local) | Qwen3.5 122B VLM (NVIDIA API) |
 | Image Generation | Not supported | NVIDIA Stable Diffusion 3 (two-stage pipeline) |
 | Voice Reply | Not supported | edge-tts + GCS signed URL |
 | Reasoning | Ollama thinking mode (may OOM) | Provider-native thinking with token budget control |
@@ -111,7 +111,7 @@ The rate tracker skips exhausted models before sending a request, so a `429` can
 | Runtime | GCP Cloud Run |
 | Framework | FastAPI + Uvicorn |
 | Text reasoning LLM | OpenRouter `nvidia/nemotron-3-super-120b-a12b:free` |
-| Vision LLM | NVIDIA Qwen3.5 397B |
+| Vision LLM | NVIDIA Qwen3.5 122B |
 | Fallback LLMs | Trinity / Gemma / `openrouter/free` (task-dependent) |
 | Image generation | NVIDIA Stable Diffusion 3 (`stabilityai/stable-diffusion-3-medium`) |
 | Web search | Tavily |
@@ -127,7 +127,7 @@ The rate tracker skips exhausted models before sending a request, so a `429` can
 ## Repository layout
 
 ```text
-LineBot-CloudAgent/
+LineBot-Cloud-MultiAgent/
 ├── main.py
 ├── Dockerfile
 ├── cloudbuild.yaml
@@ -187,7 +187,7 @@ All settings are loaded from `.env`. See [.env.example](.env.example) for a read
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `NVIDIA_API_KEY` | — | [NVIDIA](https://build.nvidia.com) API key; enables Qwen3.5 397B + image generation |
+| `NVIDIA_API_KEY` | — | [NVIDIA](https://build.nvidia.com) API key; enables Qwen3.5 122B + image generation |
 | `NVIDIA_MODEL` | `qwen/qwen3.5-122b-a10b` | NVIDIA primary model |
 | `TAVILY_API_KEY` | — | [Tavily](https://tavily.com) key for web search + URL extraction |
 | `GCS_BUCKET_NAME` | — | GCS bucket for voice/image delivery (text replies work without it) |
@@ -219,7 +219,7 @@ All settings are loaded from `.env`. See [.env.example](.env.example) for a read
 | --- | --- | --- |
 | `CHAT_TEMPERATURE` / `CHAT_MAX_TOKENS` | `0.7` / `2048` | Chat agent |
 | `VISION_TEMPERATURE` / `VISION_MAX_TOKENS` | `0.5` / `1024` | Vision agent |
-| `WEB_SEARCH_TEMPERATURE` / `WEB_SEARCH_MAX_TOKENS` | `0.3` / `3072` | Web search agent |
+| `WEB_SEARCH_TEMPERATURE` / `WEB_SEARCH_MAX_TOKENS` | `0.2` / `3072` | Web search agent |
 | `IMAGE_GEN_TEMPERATURE` / `IMAGE_GEN_MAX_TOKENS` | `0.7` / `1024` | Image gen prompt refinement |
 
 ### Image generation (Stage 2)

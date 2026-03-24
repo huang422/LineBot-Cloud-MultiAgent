@@ -96,7 +96,7 @@ class Settings(BaseSettings):
     vision_temperature: float = 0.5
     vision_max_tokens: int = 1024
 
-    web_search_temperature: float = 0.3
+    web_search_temperature: float = 0.2
     web_search_max_tokens: int = 3072
 
     image_gen_temperature: float = 0.7

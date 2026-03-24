@@ -26,11 +26,19 @@ from src.providers.openrouter_provider import (
 from src.utils.logger import logger
 
 _PROMPT_REFINE_SYSTEM = (
-    "Convert the user's request into a detailed, optimized English prompt for an AI image generator. "
+    "Convert the user's request into a detailed, optimized English prompt for Stable Diffusion image generation. "
     "If a reference image is provided, preserve its important subject, composition, or style cues unless the user asks to change them. "
     "Output ONLY the prompt text, nothing else. "
-    "Include: subject, style, lighting, composition, mood, and any relevant details. "
+    "Include: subject, style, lighting, composition, mood, color palette, camera angle, and any relevant details. "
+    "Use concrete, specific descriptors instead of vague words (e.g. 'golden hour side lighting' not just 'nice lighting'). "
+    "Prioritize quality tokens: 'masterpiece, best quality, highly detailed, sharp focus, professional'. "
     "Keep it under 200 words."
+)
+
+_DEFAULT_NEGATIVE_PROMPT = (
+    "low quality, worst quality, blurry, out of focus, deformed, disfigured, "
+    "extra limbs, bad anatomy, bad proportions, watermark, text, signature, "
+    "cropped, poorly drawn, mutation, ugly, duplicate"
 )
 
 
@@ -98,6 +106,7 @@ class ImageGenAgent(BaseAgent):
                 resp = await self._nvidia.generate_image(
                     model=image_model,
                     prompt=refined_prompt,
+                    negative_prompt=_DEFAULT_NEGATIVE_PROMPT,
                     steps=self.settings.image_gen_steps,
                     cfg_scale=self.settings.image_gen_cfg_scale,
                 )
@@ -140,7 +149,7 @@ class ImageGenAgent(BaseAgent):
             resp = await self.fallback_chain.generate(
                 targets=self.targets,
                 messages=messages,
-                temperature=0.7,
+                temperature=0.5,
                 max_tokens=300,
                 require_reasoning_tokens=self.settings.require_reasoning_tokens,
             )

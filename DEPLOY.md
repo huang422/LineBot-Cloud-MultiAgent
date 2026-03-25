@@ -335,7 +335,7 @@ gcloud logging read \
 
 | Endpoint | Method | 用途 |
 | --- | --- | --- |
-| `/health` | `GET` | Readiness、provider 狀態、配額、agent 呼叫計數 |
+| `/health` | `GET` | Readiness、provider 狀態、成本控制狀態、agent 呼叫計數 |
 | `/webhook` | `POST` | LINE webhook（HMAC-SHA256 驗簽） |
 
 ---
@@ -346,7 +346,7 @@ gcloud logging read \
 | --- | --- |
 | LLM 呼叫 | 每個模型的 RPM/RPD 追蹤，429 時自動 fallback |
 | LINE push | `LINE_PUSH_MONTHLY_LIMIT` 控制月度 push 上限 |
-| 網路搜尋 | `WEB_SEARCH_MONTHLY_QUOTA` 控制 app 內每個 instance 的月度搜尋配額計數 |
+| 網路搜尋 | 不做 app 內配額限制；實際額度以 Tavily free plan / API 回應為準（`WEB_SEARCH_MONTHLY_QUOTA` 僅保留相容舊設定） |
 | GCS 媒體 | Signed URL 48 小時過期，app 2 天後清理，部署腳本驗證 3 天 lifecycle 保底 |
 | 使用者請求 | 每人滑動視窗 rate limit |
 | Cloud Run | `max-instances=1`，`min-instances` 自動判斷（一般 `0`，有排程時 `1`） |
@@ -357,6 +357,10 @@ gcloud logging read \
 
 - `/health` 可能回 `200` 但 `ready_for_webhook=false`，要看 payload 不能只看 HTTP status。
 - 語音和圖片生成需要 `GCS_BUCKET_NAME`，沒設定時文字回覆仍正常。
+- 目前只支援**語音輸出**，不支援把使用者傳來的音訊自動轉文字。
+- 對話歷史、引用訊息快取、LINE push 計數與模型 rate state 都是 **in-memory / per-instance**；重部署後會重置，多 instance 之間也不共享。
+- 網路搜尋目前不做 app 內配額限制；真正可用額度以 Tavily free plan / API 回應為準。
+- Tavily 搜尋查詢會自動帶入目前日期時間，幫助「今天 / 最近 / 現在 / 最新」這類相對時間詞對齊到當下時點。
 - 排程訊息需要同時設定 `SCHEDULED_MESSAGES_ENABLED=true`、`LINE_PUSH_FALLBACK_ENABLED=true`、`SCHEDULED_GROUP_ID`、以及至少一個排程 job。
 - Prompts 從 `prompts/*.md` 載入，調整路由或語氣不需要改 Python 程式碼。
 

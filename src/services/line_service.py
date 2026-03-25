@@ -92,6 +92,19 @@ class LineService:
             return await self._push(to, [msg])
         return False
 
+    async def send_messages(
+        self, reply_token: str, to: str, messages: list[dict]
+    ) -> bool:
+        """Send multiple messages (up to 5) in one reply/push. Used for image+text combos."""
+        messages = messages[:5]  # LINE API limit
+        if reply_token:
+            success = await self._reply(reply_token, messages)
+            if success:
+                return True
+        if to:
+            return await self._push(to, messages)
+        return False
+
     async def send_audio(
         self, reply_token: str, to: str, audio_url: str, duration_ms: int = 60000
     ) -> bool:

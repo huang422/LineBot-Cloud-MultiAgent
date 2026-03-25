@@ -48,16 +48,32 @@ class NvidiaProvider:
         *,
         thinking_enabled: bool = False,
         thinking_budget: int = 4096,
+        thinking_model: str = "",
     ) -> None:
         self.api_key = api_key
         self.rate_tracker = rate_tracker
         self._thinking_enabled = thinking_enabled
         self._thinking_budget = thinking_budget
+        self._thinking_model = thinking_model.strip()
         self._headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
         self._client = httpx.AsyncClient(timeout=300, headers=self._headers)
+
+    def resolve_model(self, model: str, *, disable_thinking: bool = False) -> str:
+        from src.providers.model_registry import supports_reasoning as _supports_reasoning
+
+        model = model.strip()
+        if (
+            self._thinking_enabled
+            and not disable_thinking
+            and self._thinking_model
+            and model != self._thinking_model
+            and _supports_reasoning(model)
+        ):
+            return self._thinking_model
+        return model
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -84,11 +100,16 @@ class NvidiaProvider:
         """
         from src.providers.model_registry import supports_reasoning as _supports_reasoning
 
-        model = model.strip()
-        if not model:
+        requested_model = model.strip()
+        if not requested_model:
             raise ProviderError("<empty>", 400, "Model ID must not be empty", provider="NVIDIA")
 
+        model = self.resolve_model(requested_model, disable_thinking=disable_thinking)
         expect_reasoning = self._thinking_enabled and _supports_reasoning(model) and not disable_thinking
+
+        if expect_reasoning and model != requested_model:
+            logger.info(f"NVIDIA: swapping {requested_model} → {model} for thinking mode")
+
         if disable_thinking and self._thinking_enabled:
             logger.info(f"NVIDIA: thinking OFF for {model} (disable_thinking=True)")
         elif expect_reasoning:

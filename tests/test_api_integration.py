@@ -65,10 +65,12 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
         self.fake_web_search = SimpleNamespace(
             get_quota_stats=lambda: {
                 "configured": False,
-                "used": 0,
-                "quota": 0,
-                "remaining": 0,
-                "scope": "per-instance",
+                "used": None,
+                "quota": None,
+                "remaining": None,
+                "scope": "provider-side",
+                "enforced": False,
+                "configured_app_quota": 1000,
             }
         )
 

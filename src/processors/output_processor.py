@@ -46,37 +46,41 @@ async def send_response(request: AgentRequest, response: AgentResponse) -> bool:
                 default_text="圖片生成完成，但格式無法辨識。",
             )
 
-        # If it's already a URL, send directly
-        if isinstance(response.image_base64, str) and response.image_base64.startswith("http"):
-            sent = await line.send_image(request.reply_token, to, response.image_base64)
-            if sent:
-                return True
+        # Resolve image URL (direct URL or upload base64 to GCS)
+        image_url: str | None = None
+        uploaded_image = None
+
+        if response.image_base64.startswith("http"):
+            image_url = response.image_base64
+        else:
+            storage = get_storage_service()
+            uploaded_image = await storage.upload_base64_image(response.image_base64)
+            if uploaded_image:
+                image_url = uploaded_image.public_url
+
+        if not image_url:
+            if uploaded_image:
+                storage.schedule_cleanup(uploaded_image, delay_seconds=0)
             return await _send_text_fallback(
-                line,
-                request,
-                to,
-                response.text,
+                line, request, to, response.text,
                 default_text="圖片生成完成，但暫時無法傳送。",
             )
 
-        # Upload base64 image to GCS to get a public URL
-        storage = get_storage_service()
-        uploaded_image = await storage.upload_base64_image(response.image_base64)
-        if uploaded_image:
-            sent = await line.send_image(request.reply_token, to, uploaded_image.public_url)
-            if sent:
+        # Build messages: image + optional text description (LINE allows up to 5 messages)
+        sent = await _send_image_with_text(
+            line, request, to, image_url, response.text
+        )
+        if sent:
+            if uploaded_image:
                 storage.schedule_cleanup(uploaded_image)
-                return True
+            return True
 
+        if uploaded_image:
             storage.schedule_cleanup(uploaded_image, delay_seconds=0)
-            logger.warning("Image delivery failed, falling back to text output")
+        logger.warning("Image delivery failed, falling back to text output")
 
-        # Fallback: send text description if available
         return await _send_text_fallback(
-            line,
-            request,
-            to,
-            response.text,
+            line, request, to, response.text,
             default_text="圖片生成完成，但暫時無法傳送。",
         )
 
@@ -133,6 +137,31 @@ def _convert_s2t(text: str) -> str:
         return text
     except Exception:
         return text
+
+
+async def _send_image_with_text(
+    line,
+    request: AgentRequest,
+    to: str,
+    image_url: str,
+    text: str | None,
+) -> bool:
+    """Send image + text description together as multiple LINE messages."""
+    image_msg = {
+        "type": "image",
+        "originalContentUrl": image_url,
+        "previewImageUrl": image_url,
+    }
+    messages = [image_msg]
+
+    # Append text description if available and meaningful
+    if text and text.strip() and text.strip() != "已根據你的需求生成圖片。":
+        converted = _convert_s2t(text)
+        if len(converted) > 5000:
+            converted = converted[:4997] + "..."
+        messages.append({"type": "text", "text": converted})
+
+    return await line.send_messages(request.reply_token, to, messages)
 
 
 async def _send_text_fallback(

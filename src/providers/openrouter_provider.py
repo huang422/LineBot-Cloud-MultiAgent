@@ -133,10 +133,12 @@ class OpenRouterProvider:
         reasoning_enabled: bool = False,
         reasoning_effort: str = "high",
         reasoning_exclude: bool = True,
+        thinking_budget: int = 4096,
     ) -> None:
         self.api_key = api_key.strip()
         self.rate_tracker = rate_tracker
         self._reasoning_enabled = reasoning_enabled
+        self._thinking_budget = thinking_budget
         self._reasoning_config = None
         if reasoning_enabled:
             self._reasoning_config = {
@@ -194,10 +196,16 @@ class OpenRouterProvider:
         elif use_reasoning:
             logger.info(f"OpenRouter: thinking ON for {model}")
 
+        # Reasoning tokens count against max_tokens on OpenRouter,
+        # so add the thinking budget to ensure actual output has room.
+        effective_max_tokens = max_tokens
+        if use_reasoning:
+            effective_max_tokens = self._thinking_budget + max_tokens
+
         payload: dict = {
             "model": model,
             "messages": messages,
-            "max_tokens": max_tokens,
+            "max_tokens": effective_max_tokens,
             "temperature": temperature,
         }
         if modalities:

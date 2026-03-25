@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import deque
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 import tempfile
@@ -11,6 +12,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 import main as main_module
+from src.agents import orchestrator as orchestrator_module
 from src.agents import web_search_agent as web_search_agent_module
 from src.agents.chat_agent import ChatAgent
 from src.agents.image_gen_agent import ImageGenAgent
@@ -76,6 +78,7 @@ class OpenRouterProviderTests(unittest.IsolatedAsyncioTestCase):
             reasoning_enabled=True,
             reasoning_effort="high",
             reasoning_exclude=True,
+            thinking_budget=1024,
         )
 
         class FakeResponse:
@@ -102,6 +105,7 @@ class OpenRouterProviderTests(unittest.IsolatedAsyncioTestCase):
             fake_post.await_args.kwargs["json"]["reasoning"],
             {"enabled": True, "effort": "high", "exclude": True},
         )
+        self.assertEqual(fake_post.await_args.kwargs["json"]["max_tokens"], 3072)
 
     async def test_generate_skips_reasoning_for_image_requests(self) -> None:
         provider = OpenRouterProvider(
@@ -185,19 +189,52 @@ class NvidiaProviderTests(unittest.IsolatedAsyncioTestCase):
             def json(self):
                 return {
                     "choices": [{"message": {"content": "ok"}}],
-                    "model": "qwen/qwen3.5-122b-a10b",
+                    "model": "qwen/qwen3.5-397b-a17b",
                     "usage": {"reasoning_tokens": 0},
                 }
 
         provider._client = SimpleNamespace(post=AsyncMock(return_value=FakeResponse()))
 
         response = await provider.generate(
-            "qwen/qwen3.5-122b-a10b",
+            "qwen/qwen3.5-397b-a17b",
             [{"role": "user", "content": "hello"}],
             require_reasoning_tokens=True,
         )
 
         self.assertEqual(response.text, "ok")
+
+    async def test_fallback_chain_skips_rate_limited_dedicated_thinking_model(self) -> None:
+        from src.providers.nvidia_provider import NvidiaProvider
+
+        tracker = RateTracker()
+        provider = NvidiaProvider(
+            "test-key",
+            tracker,
+            thinking_enabled=True,
+            thinking_budget=1024,
+            thinking_model="qwen/qwen3.5-122b-a10b",
+        )
+        provider._client = SimpleNamespace(post=AsyncMock())
+        tracker.record_limit_hit("qwen/qwen3.5-122b-a10b", 60)
+
+        backup = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=ProviderResponse(text="backup", model="model-2")
+            )
+        )
+        chain = FallbackChain(tracker)
+
+        response = await chain.generate(
+            targets=[
+                (provider, "qwen/qwen3.5-397b-a17b"),
+                (backup, "model-2"),
+            ],
+            messages=[{"role": "user", "content": "請幫我分析這個問題"}],
+        )
+
+        self.assertEqual(response.text, "backup")
+        provider._client.post.assert_not_awaited()
+        backup.generate.assert_awaited_once()
 
 
 class WebhookTriggerTests(unittest.TestCase):
@@ -319,6 +356,41 @@ class WebSearchRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("搜尋服務暫時不可用", response.text or "")
         self.assertEqual(response.agent_name, "web_search")
 
+    async def test_web_search_agent_does_not_block_on_app_quota_flag(self) -> None:
+        fallback = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=ProviderResponse(
+                    text="整理好的搜尋結果",
+                    model="nvidia/test",
+                )
+            )
+        )
+        agent = WebSearchAgent(Settings(_env_file=None), fallback, targets=[])
+        request = AgentRequest(text="今天新聞", output_format="text")
+
+        fake_service = SimpleNamespace(
+            is_configured=True,
+            is_quota_available=False,
+            search=AsyncMock(
+                return_value=SimpleNamespace(
+                    has_results=True,
+                    answer="ok",
+                    to_context_text=lambda: "search context",
+                )
+            ),
+        )
+
+        with patch.object(
+            web_search_agent_module,
+            "get_web_search_service",
+            return_value=fake_service,
+        ):
+            response = await agent.process(request)
+
+        self.assertEqual(response.text, "整理好的搜尋結果")
+        fake_service.search.assert_awaited()
+        fallback.generate.assert_awaited_once()
+
     async def test_web_search_agent_extracts_webpage_content_from_urls(self) -> None:
         fallback = SimpleNamespace(
             generate=AsyncMock(
@@ -365,8 +437,79 @@ class WebSearchRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("從使用者指定網址擷取的網頁內容", messages[-2]["content"])
         self.assertIn("這是網頁正文內容", messages[-2]["content"])
 
+    async def test_web_search_agent_prefixes_current_datetime_in_search_query(self) -> None:
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 3, 25, 14, 30, tzinfo=tz)
+
+        fallback = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=ProviderResponse(
+                    text="整理好的搜尋結果",
+                    model="nvidia/test",
+                )
+            )
+        )
+        agent = WebSearchAgent(Settings(_env_file=None), fallback, targets=[])
+        request = AgentRequest(text="今天新聞", output_format="text")
+
+        fake_service = SimpleNamespace(
+            is_configured=True,
+            is_quota_available=True,
+            search=AsyncMock(
+                return_value=SimpleNamespace(
+                    has_results=True,
+                    answer="ok",
+                    to_context_text=lambda: "search context",
+                )
+            ),
+        )
+
+        with patch.object(
+            web_search_agent_module,
+            "get_web_search_service",
+            return_value=fake_service,
+        ), patch.object(
+            web_search_agent_module,
+            "datetime",
+            FixedDateTime,
+        ):
+            response = await agent.process(request)
+
+        self.assertEqual(response.text, "整理好的搜尋結果")
+        self.assertEqual(
+            fake_service.search.await_args.args[0],
+            "2026-03-25 14:30 UTC+8 今天新聞",
+        )
+        self.assertEqual(fake_service.search.await_args.kwargs["time_range"], "week")
+        fallback.generate.assert_awaited_once()
+
 
 class WebSearchServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_app_quota_stats_are_informational_only(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            tavily_api_key="tavily-key",
+            web_search_monthly_quota=1000,
+        )
+
+        with patch.object(
+            web_search_service_module,
+            "get_settings",
+            return_value=settings,
+        ):
+            service = web_search_service_module.WebSearchService()
+
+        stats = service.get_quota_stats()
+
+        self.assertTrue(service.is_quota_available)
+        self.assertFalse(stats["enforced"])
+        self.assertEqual(stats["configured_app_quota"], 1000)
+        self.assertIsNone(stats["used"])
+        self.assertIsNone(stats["quota"])
+        self.assertIsNone(stats["remaining"])
+
     async def test_extract_parses_raw_content_and_failed_urls(self) -> None:
         settings = Settings(_env_file=None, tavily_api_key="tavily-key")
 
@@ -568,6 +711,7 @@ class AgentTimeoutPropagationTests(unittest.IsolatedAsyncioTestCase):
         await orchestrator._llm_classify(AgentRequest(text="幫我處理一下"))
 
         self.assertEqual(fallback.generate.await_args.kwargs["thinking_timeout"], 9)
+        self.assertEqual(fallback.generate.await_args.kwargs["max_tokens"], 384)
 
 
 class ImageGenPromptRefinementTests(unittest.IsolatedAsyncioTestCase):
@@ -602,9 +746,14 @@ class ImageGenPromptRefinementTests(unittest.IsolatedAsyncioTestCase):
 
         await agent.process(AgentRequest(text="幫我畫一隻柴犬"))
 
-        self.assertEqual(fallback.generate.await_args.kwargs["temperature"], 0.33)
-        self.assertEqual(fallback.generate.await_args.kwargs["max_tokens"], 456)
-        self.assertEqual(fallback.generate.await_args.kwargs["thinking_timeout"], 21)
+        refine_kwargs = next(
+            call.kwargs
+            for call in fallback.generate.await_args_list
+            if call.kwargs.get("thinking_timeout") == 21
+        )
+        self.assertEqual(refine_kwargs["temperature"], 0.33)
+        self.assertEqual(refine_kwargs["max_tokens"], 456)
+        self.assertEqual(refine_kwargs["thinking_timeout"], 21)
 
 
 class ImageGenMessageTests(unittest.TestCase):
@@ -852,7 +1001,7 @@ class MainTargetBuilderTests(unittest.TestCase):
         settings = Settings(
             _env_file=None,
             agent_fallback_model="nvidia/nemotron-3-super-120b-a12b:free",
-            nvidia_model="qwen/qwen3.5-122b-a10b",
+            nvidia_model="qwen/qwen3.5-397b-a17b",
         )
         openrouter = object()
         nvidia = object()
@@ -862,7 +1011,7 @@ class MainTargetBuilderTests(unittest.TestCase):
         self.assertEqual(
             targets,
             [
-                (nvidia, "qwen/qwen3.5-122b-a10b"),
+                (nvidia, "qwen/qwen3.5-397b-a17b"),
                 (openrouter, "nvidia/nemotron-3-super-120b-a12b:free"),
             ],
         )
@@ -870,7 +1019,7 @@ class MainTargetBuilderTests(unittest.TestCase):
     def test_vision_targets_keep_only_reasoning_capable_target_when_available(self) -> None:
         settings = Settings(
             _env_file=None,
-            nvidia_model="qwen/qwen3.5-122b-a10b",
+            nvidia_model="qwen/qwen3.5-397b-a17b",
             vision_fallback_model="google/gemma-3-27b-it:free",
         )
         openrouter = object()
@@ -881,7 +1030,7 @@ class MainTargetBuilderTests(unittest.TestCase):
         self.assertEqual(
             targets,
             [
-                (nvidia, "qwen/qwen3.5-122b-a10b"),
+                (nvidia, "qwen/qwen3.5-397b-a17b"),
             ],
         )
 
@@ -896,6 +1045,50 @@ class MainTargetBuilderTests(unittest.TestCase):
         targets = main_module._build_vision_agent_targets(settings, openrouter, None)
 
         self.assertEqual(targets, [(openrouter, "google/gemma-3-27b-it:free")])
+
+
+class LifespanInitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lifespan_passes_openrouter_thinking_budget_to_provider(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            line_channel_secret="secret",
+            line_channel_access_token="token",
+            openrouter_api_key="key",
+            openrouter_thinking_budget=1536,
+            require_reasoning_models=False,
+        )
+        fake_openrouter = SimpleNamespace(close=AsyncMock())
+
+        with patch.object(main_module, "get_settings", return_value=settings), patch.object(
+            main_module, "setup_logger"
+        ), patch.object(
+            main_module, "OpenRouterProvider", return_value=fake_openrouter
+        ) as openrouter_cls, patch.object(
+            main_module, "FallbackChain", return_value=object()
+        ), patch.object(
+            main_module, "Orchestrator", return_value=object()
+        ), patch.object(
+            main_module, "ChatAgent", return_value=object()
+        ), patch(
+            "src.agents.vision_agent.VisionAgent", return_value=object()
+        ), patch(
+            "src.agents.web_search_agent.WebSearchAgent", return_value=object()
+        ), patch(
+            "src.agents.image_gen_agent.ImageGenAgent", return_value=object()
+        ), patch.object(
+            main_module, "get_line_service", return_value=object()
+        ), patch.object(
+            main_module, "close_line_service", new=AsyncMock()
+        ), patch(
+            "src.services.scheduler_service.close_scheduler_service"
+        ), patch(
+            "src.services.web_search_service.close_web_search_service",
+            new=AsyncMock(),
+        ):
+            async with main_module.lifespan(main_module.app):
+                pass
+
+        self.assertEqual(openrouter_cls.call_args.kwargs["thinking_budget"], 1536)
 
 
 class SchedulerRegistrationTests(unittest.TestCase):
@@ -1181,6 +1374,28 @@ class OrchestratorFastRuleTests(unittest.TestCase):
         # to allow correct output_format classification (e.g., voice)
         self.assertIsNone(decision)
 
+    def test_general_why_question_stays_non_thinking(self) -> None:
+        self.assertTrue(
+            orchestrator_module._should_disable_thinking("為什麼今天會下雨")
+        )
+
+    def test_general_comparison_stays_non_thinking(self) -> None:
+        self.assertTrue(
+            orchestrator_module._should_disable_thinking("比較 iPhone 16 和 S24 的差異")
+        )
+
+    def test_explicit_step_by_step_debugging_enables_thinking(self) -> None:
+        self.assertFalse(
+            orchestrator_module._should_disable_thinking(
+                "請一步一步分析這段 traceback 並提出修復方案"
+            )
+        )
+
+    def test_simple_code_request_stays_non_thinking(self) -> None:
+        self.assertTrue(
+            orchestrator_module._should_disable_thinking("幫我寫一段 Python code")
+        )
+
     def test_simple_image_description_disables_thinking(self) -> None:
         orchestrator = Orchestrator(
             Settings(_env_file=None),
@@ -1191,6 +1406,25 @@ class OrchestratorFastRuleTests(unittest.TestCase):
         decision = orchestrator._apply_fast_rules(
             AgentRequest(
                 text="這張圖是什麼",
+                image_base64="data:image/jpeg;base64,abc",
+                input_type=InputType.IMAGE_TEXT,
+            )
+        )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.agent, "vision")
+        self.assertTrue(decision.disable_thinking)
+
+    def test_detailed_but_literal_image_question_stays_non_thinking(self) -> None:
+        orchestrator = Orchestrator(
+            Settings(_env_file=None),
+            SimpleNamespace(),
+            targets=[],
+        )
+
+        decision = orchestrator._apply_fast_rules(
+            AgentRequest(
+                text="請幫我看看這張照片裡的人穿什麼、手上拿什麼、背景在哪裡",
                 image_base64="data:image/jpeg;base64,abc",
                 input_type=InputType.IMAGE_TEXT,
             )
@@ -1308,7 +1542,7 @@ class OutputProcessorTests(unittest.IsolatedAsyncioTestCase):
             output_format="image",
         )
         line = SimpleNamespace(
-            send_image=AsyncMock(return_value=True),
+            send_messages=AsyncMock(return_value=True),
             send_text=AsyncMock(return_value=False),
         )
         uploaded = UploadedMedia(
@@ -1329,7 +1563,19 @@ class OutputProcessorTests(unittest.IsolatedAsyncioTestCase):
             sent = await output_processor_module.send_response(request, response)
 
         self.assertTrue(sent)
-        line.send_image.assert_awaited_once_with("reply", "G1", "https://example.com/image.png")
+        line.send_messages.assert_awaited_once_with(
+            "reply",
+            "G1",
+            [
+                {
+                    "type": "image",
+                    "originalContentUrl": "https://example.com/image.png",
+                    "previewImageUrl": "https://example.com/image.png",
+                },
+                {"type": "text", "text": "圖片好了"},
+            ],
+        )
+        line.send_text.assert_not_called()
         storage.schedule_cleanup.assert_called_once_with(uploaded)
 
     async def test_send_response_falls_back_to_text_and_cleans_up_failed_audio(self) -> None:
@@ -1417,6 +1663,7 @@ class OrchestratorParsingTests(unittest.TestCase):
         self.assertEqual(decision.agent, "chat")
         self.assertEqual(decision.output_format, "text")
         self.assertEqual(decision.task_description, "回答翻譯需求")
+        self.assertTrue(decision.disable_thinking)
 
     def test_parse_llm_response_inverts_needs_thinking_into_disable_thinking(self) -> None:
         orchestrator = Orchestrator(
@@ -1431,6 +1678,34 @@ class OrchestratorParsingTests(unittest.TestCase):
         )
 
         self.assertEqual(decision.agent, "chat")
+        self.assertTrue(decision.disable_thinking)
+
+    def test_parse_llm_response_defaults_to_non_thinking_when_field_missing(self) -> None:
+        orchestrator = Orchestrator(
+            Settings(_env_file=None),
+            SimpleNamespace(),
+            targets=[],
+        )
+
+        decision = orchestrator._parse_llm_response(
+            '{"agent":"chat","output_format":"text","task_description":"回答翻譯需求","reasoning":"一般文字任務"}',
+            "幫我翻譯這句",
+        )
+
+        self.assertEqual(decision.agent, "chat")
+        self.assertTrue(decision.disable_thinking)
+
+    def test_parse_llm_response_unparseable_falls_back_to_non_thinking_chat(self) -> None:
+        orchestrator = Orchestrator(
+            Settings(_env_file=None),
+            SimpleNamespace(),
+            targets=[],
+        )
+
+        decision = orchestrator._parse_llm_response("not json", "幫我翻譯這句")
+
+        self.assertEqual(decision.agent, "chat")
+        self.assertEqual(decision.output_format, "text")
         self.assertTrue(decision.disable_thinking)
 
 

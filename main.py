@@ -170,6 +170,7 @@ async def lifespan(app: FastAPI):
         reasoning_enabled=settings.openrouter_reasoning_enabled,
         reasoning_effort=settings.openrouter_reasoning_effort,
         reasoning_exclude=settings.openrouter_reasoning_exclude,
+        thinking_budget=settings.openrouter_thinking_budget,
     )
     fallback_chain = FallbackChain(rate_tracker)
 
@@ -179,6 +180,7 @@ async def lifespan(app: FastAPI):
             rate_tracker,
             thinking_enabled=settings.nvidia_thinking_enabled,
             thinking_budget=settings.nvidia_thinking_budget,
+            thinking_model=settings.nvidia_thinking_model,
         )
         logger.info(
             f"NvidiaProvider initialized "

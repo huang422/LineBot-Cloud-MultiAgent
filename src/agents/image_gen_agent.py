@@ -1,12 +1,14 @@
 """Image Generation Agent — two-stage pipeline.
 
-Stage 1: Qwen3.5 (NVIDIA) refines the user's request into an optimised
-         English image generation prompt.
+Stage 1: Qwen3.5 397B (NVIDIA) refines the user's request into an optimised
+         English image generation prompt (non-thinking mode).
 Stage 2: NVIDIA Stable Diffusion generates the actual image
          (SD3 Medium primary → SD3.5 Large fallback).
 """
 
 from __future__ import annotations
+
+import asyncio
 
 from src.agents.base_agent import BaseAgent
 from src.config import Settings
@@ -57,13 +59,8 @@ class ImageGenAgent(BaseAgent):
 
     async def process(self, request: AgentRequest) -> AgentResponse:
         self.call_count += 1
-        logger.info(f"[{request.request_id}] ImageGenAgent processing (two-stage)")
+        logger.info(f"[{request.request_id}] ImageGenAgent processing")
 
-        # ── Stage 1: Refine prompt via text-agent reasoning chain ──
-        refined_prompt = await self._refine_prompt(request)
-        logger.info(f"[{request.request_id}] Stage 1 refined prompt: {refined_prompt[:100]}...")
-
-        # ── Stage 2: Generate image via NVIDIA SD (primary → fallback) ──
         if not self._nvidia:
             return AgentResponse(
                 text="圖片生成服務未設定（需要 NVIDIA API Key）。",
@@ -72,6 +69,15 @@ class ImageGenAgent(BaseAgent):
                 output_format="image",
             )
 
+        # ── Stage 1: Refine prompt + generate description in parallel ──
+        # (description only depends on user's original text, not the refined prompt)
+        refine_task = asyncio.create_task(self._refine_prompt(request))
+        desc_task = asyncio.create_task(self._generate_description(request))
+        refined_prompt, description = await asyncio.gather(refine_task, desc_task)
+
+        logger.info(f"[{request.request_id}] Stage 1 refined prompt: {refined_prompt[:100]}...")
+
+        # ── Stage 2: Generate image via NVIDIA SD (primary → fallback) ──
         image_models = [self.settings.image_gen_primary_model]
         fallback = self.settings.image_gen_fallback_model.strip()
         if fallback and fallback != self.settings.image_gen_primary_model:
@@ -81,8 +87,10 @@ class ImageGenAgent(BaseAgent):
             request, refined_prompt, image_models
         )
 
-        if image_data and not text:
-            text = "已根據你的需求生成圖片。"
+        if image_data:
+            text = description or text or "已根據你的需求生成圖片。"
+        elif not text:
+            text = "圖片生成暫時失敗，請稍後再試。"
 
         return AgentResponse(
             text=text,
@@ -159,6 +167,30 @@ class ImageGenAgent(BaseAgent):
         except (AllModelsRateLimitedError, AllProvidersFailedError) as e:
             logger.warning(f"Prompt refinement failed, using raw text: {e}")
             return request.text or "A beautiful creative image"
+
+    async def _generate_description(self, request: AgentRequest) -> str | None:
+        """Generate a short user-friendly description to accompany the image."""
+        system = (
+            "你是圖片生成助手。根據使用者的原始請求，用繁體中文寫一段簡短說明（1-2句），"
+            "描述你為他生成了什麼樣的圖片。語氣自然友善，不要提到技術細節或 prompt。"
+        )
+        user_text = request.text.strip() or "生成一張圖片"
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text},
+        ]
+        try:
+            resp = await self.fallback_chain.generate(
+                targets=self.targets,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=150,
+                disable_thinking=True,
+            )
+            return resp.text.strip() if resp.text else None
+        except Exception as e:
+            logger.warning(f"Description generation failed: {e}")
+            return None
 
     def _build_refine_system_prompt(self) -> str:
         return "\n\n".join(

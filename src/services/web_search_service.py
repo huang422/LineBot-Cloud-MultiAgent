@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Optional
 
 from src.config import get_settings
@@ -98,13 +97,13 @@ class WebSearchService:
         self.api_key = api_key or settings.tavily_api_key
         self.max_results = max(1, min(10, max_results))
         self._client = None
-
-        self._monthly_quota = settings.web_search_monthly_quota
-        self._month_search_count = 0
-        self._current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        self._configured_monthly_quota = settings.web_search_monthly_quota
 
         if self.api_key:
-            logger.info(f"WebSearchService initialized, quota={self._monthly_quota}")
+            logger.info(
+                "WebSearchService initialized "
+                f"(app quota disabled, configured_quota={self._configured_monthly_quota})"
+            )
         else:
             logger.warning("WebSearchService: TAVILY_API_KEY not configured")
 
@@ -113,33 +112,23 @@ class WebSearchService:
         return bool(self.api_key)
 
     @property
-    def quota_remaining(self) -> int:
-        self._check_and_reset_month()
-        return max(0, self._monthly_quota - self._month_search_count)
+    def quota_remaining(self) -> int | None:
+        return None
 
     @property
     def is_quota_available(self) -> bool:
-        return self.quota_remaining > 0
+        return self.is_configured
 
     def get_quota_stats(self) -> dict:
-        self._check_and_reset_month()
         return {
-            "month": self._current_month,
-            "used": self._month_search_count,
-            "quota": self._monthly_quota,
-            "remaining": self.quota_remaining,
-            "scope": "per-instance",
+            "configured": self.is_configured,
+            "used": None,
+            "quota": None,
+            "remaining": None,
+            "scope": "provider-side",
+            "enforced": False,
+            "configured_app_quota": self._configured_monthly_quota,
         }
-
-    def _check_and_reset_month(self) -> None:
-        current_month = datetime.now(timezone.utc).strftime("%Y-%m")
-        if current_month != self._current_month:
-            logger.info(
-                f"Monthly quota reset: {self._current_month} -> {current_month}, "
-                f"used {self._month_search_count}/{self._monthly_quota}"
-            )
-            self._current_month = current_month
-            self._month_search_count = 0
 
     def _get_client(self):
         if self._client is None and self.api_key:
@@ -217,11 +206,10 @@ class WebSearchService:
                 for item in response.get("results", [])
             ]
 
-            self._month_search_count += 1
             depth_tag = search_depth
             logger.info(
                 f"Search complete: '{query[:50]}…' depth={depth_tag}, "
-                f"{len(results)} results, quota={self.quota_remaining}/{self._monthly_quota}"
+                f"{len(results)} results"
             )
 
             return WebSearchResponse(
@@ -270,10 +258,8 @@ class WebSearchService:
                 if item.get("url")
             ]
 
-            self._month_search_count += 1
             logger.info(
-                f"Extract complete: success={len(results)}, failed={len(failed_urls)}, "
-                f"quota={self.quota_remaining}/{self._monthly_quota}"
+                f"Extract complete: success={len(results)}, failed={len(failed_urls)}"
             )
 
             return ExtractResponse(results=results, failed_urls=failed_urls)

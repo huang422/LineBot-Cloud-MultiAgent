@@ -1,7 +1,7 @@
 """Vision Agent — analyses images and answers questions about visual content.
 
-Uses Qwen3.5 122B VLM (NVIDIA) as primary, with OpenRouter fallback.
-Qwen3.5 natively supports image input (vision-language model).
+Uses Qwen3.5 397B VLM (NVIDIA) as primary (thinking mode swaps to 122B),
+with OpenRouter fallback. Qwen3.5 natively supports image input.
 """
 
 from __future__ import annotations

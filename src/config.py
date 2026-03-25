@@ -70,21 +70,23 @@ class Settings(BaseSettings):
     openrouter_reasoning_enabled: bool = True
     openrouter_reasoning_effort: str = "high"
     openrouter_reasoning_exclude: bool = False
+    openrouter_thinking_budget: int = 4096
     require_reasoning_models: bool = True
     require_reasoning_tokens: bool = True
 
     # ── NVIDIA API ────────────────────────────────────────────
     nvidia_api_key: str = ""
-    nvidia_model: str = "qwen/qwen3.5-122b-a10b"
+    nvidia_model: str = "qwen/qwen3.5-397b-a17b"
+    nvidia_thinking_model: str = "qwen/qwen3.5-122b-a10b"
     nvidia_thinking_enabled: bool = True
     nvidia_thinking_budget: int = 4096
-    thinking_timeout_seconds: int = 120  # 0 disables the timeout retry behavior
+    thinking_timeout_seconds: int = 150  # 0 disables the timeout retry behavior
 
     # ── Orchestrator (routing / task dispatch) ────────────────
     orchestrator_model: str = "nvidia/nemotron-3-super-120b-a12b:free"
     orchestrator_fallback_model: str = "qwen/qwen3.5-122b-a10b"
     orchestrator_temperature: float = 0.0
-    orchestrator_max_tokens: int = 200
+    orchestrator_max_tokens: int = 384
 
     # ── Text agents / Vision fallback ─────────────────────────
     agent_fallback_model: str = "nvidia/nemotron-3-super-120b-a12b:free"
@@ -157,6 +159,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "nvidia_model",
+        "nvidia_thinking_model",
         "orchestrator_model",
         "orchestrator_fallback_model",
         "agent_fallback_model",
@@ -178,6 +181,7 @@ class Settings(BaseSettings):
         "image_gen_max_tokens",
         "image_gen_steps",
         "image_gen_cfg_scale",
+        "openrouter_thinking_budget",
         "nvidia_thinking_budget",
         "max_conversation_history",
         "conversation_ttl_seconds",

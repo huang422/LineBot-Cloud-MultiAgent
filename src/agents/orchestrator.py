@@ -32,21 +32,22 @@ class RouterDecision:
     disable_thinking: bool = False  # True = skip reasoning for simple queries
 
 
-# Keywords that suggest the user wants an image generated
+# Keywords that suggest the user wants an image generated.
 _IMAGE_GEN_KEYWORDS = re.compile(
     r"("
-    # Chinese: explicit generation verbs
-    r"(?:幫我|請|幫忙|可以)?(?:畫|繪製|繪|生成|產生|做|創建|製作|設計|重畫|改畫|重新畫|重新繪|再畫)"
-    r"(?:一[張幅個]|[張幅個]|出)?(?:圖|圖片|畫|照片|海報|插畫|壁紙|頭像|logo|LOGO|貼圖|漫畫)?"
-    # Chinese: "I want a picture of..." — allow optional 的/.../的 between quantity and noun
-    r"|(?:我想要|我要|給我|來)(?:一[張幅個]|[張幅個]).{0,6}(?:圖|圖片|畫|照片|海報|插畫|壁紙|頭像|貼圖|漫畫)"
-    # Chinese: "generate/create image" compound
-    r"|生成圖|產生圖|生成一|產生一|做一張|做張"
-    # English
+    # ── A: 生成動詞 + 圖片名詞（中間不限距離）──
+    r"(?:幫我|請|幫忙|可以)?(?:繪製|生成|產生|創建|製作|設計|重新繪製).*?(?:圖|圖片|照片|海報|插畫|壁紙|頭像|logo|LOGO|貼圖|漫畫)"
+    # ── B: 「畫」系列 ──
+    r"|(?:幫我|請|幫忙|可以)?(?:重新畫|重新繪|重畫|改畫|再畫)"
+    r"|(?:幫我|請|幫忙)畫"
+    r"|畫(?:一[張幅個隻條匹朵]|[張幅個]|出)"
+    # ── C: 「我想要/我要/給我/來 + 量詞 + 圖片名詞」──
+    r"|(?:我想要|我要|給我|來)(?:一[張幅個]|[張幅個]).*?(?:圖|圖片|畫|照片|海報|插畫|壁紙|頭像|貼圖|漫畫)"
+    # ── D: English ──
     r"|(?:please\s+)?(?:draw|paint|sketch|illustrate|generate|create|make|design|produce)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+)?(?:image|picture|photo|illustration|poster|wallpaper|avatar|logo|icon|art|drawing|painting)"
     r"|generate\s+(?:a\s+|an\s+)?image"
     r"|create\s+(?:a\s+|an\s+)?(?:image|picture)"
-    r"|draw\s+(?:a\s+|an\s+|me\s+)?"
+    r"|draw\s+(?:me\s+)?(?:a\s+|an\s+)"
     r")",
     re.IGNORECASE,
 )
@@ -59,9 +60,11 @@ _IMAGE_GEN_NEGATIVES = re.compile(
     # Asking about drawing concepts, not requesting generation
     r"|(?:怎麼|如何|什麼是|怎樣)(?:畫|繪|生成|畫圖|繪圖)"
     # Drawing tools/techniques, not generation requests
-    r"|(?:畫|繪|生成)(?:軟體|工具|app|技巧|方法|步驟)"
+    r"|(?:畫|繪|生成)(?:軟體|工具|app|技巧|方法|步驟|式)"
     # "圖表" (chart), "地圖" (map) analysis
     r"|看(?:這[張個])?圖|分析(?:這[張個])?圖|圖(?:表|中|裡|上|內)"
+    # Non-image usages of generation verbs
+    r"|(?:製作|設計|創建|產生)(?:方法|理念|模式|帳號|錯誤|問題|人)"
     r")",
     re.IGNORECASE,
 )
@@ -134,27 +137,35 @@ _SIMPLE_QUERY_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-# Complex queries that benefit from reasoning/thinking
+# Explicitly complex text queries that benefit from reasoning/thinking.
 _COMPLEX_QUERY_PATTERNS = re.compile(
     r"("
-    # Analysis / comparison / evaluation
-    r"分析|比較|評估|解釋|為什麼|原因|差異|優缺點|利弊|怎麼辦"
-    r"|analyze|compare|evaluate|explain|why|difference|pros.?cons"
+    # Explicit deep-analysis wording
+    r"(?:詳細|深入|仔細|一步一步|逐步).*(?:分析|比較|評估|解釋|推理|拆解)"
     # Multi-step / planning / strategy
-    r"|步驟|規劃|計畫|策略|方案|建議.*怎麼|如何.*實現|如何.*設計"
-    r"|plan|strategy|how.*implement|how.*design|step.?by.?step"
+    r"|(?:多步驟|一步一步|逐步).*(?:規劃|計畫|策略|方案|實作|設計)"
     # Code / technical reasoning
-    r"|程式|代碼|code|debug|bug|error|重構|refactor|演算法|algorithm"
-    r"|寫.*程式|寫.*code|fix.*bug|implement"
-    # Troubleshooting / fault analysis
-    r"|錯誤|錯在哪|哪裡錯|怎麼修|如何修|排查|故障|異常|當掉|崩潰|無法"
-    r"|error|traceback|exception|stack trace|troubleshoot|diagnos"
-    # Creative writing with substance
-    r"|寫.*文章|寫.*故事|寫.*報告|寫.*企劃|寫.*提案|寫.*信|essay|report|proposal"
+    r"|(?:debug|troubleshoot|traceback|stack trace|exception|refactor)"
+    r"|(?:程式|代碼|code).*(?:怎麼修|如何修|錯在哪|哪裡錯|排查|重構)"
+    r"|(?:怎麼修|如何修|錯在哪|哪裡錯|排查).*(?:程式|代碼|code)"
     # Math / logic
-    r"|計算|算.*等於|數學|公式|證明|推導|邏輯|math|calcul|prove|formula"
-    # Translation of substantial content (not single words)
-    r"|翻譯.*段|翻譯.*篇|翻譯.*文|translate.*paragraph|translate.*article"
+    r"|(?:證明|推導|逐步計算|邏輯推理|數學證明)"
+    r"|(?:prove|derive|logic puzzle|mathematical proof)"
+    # Creative writing / long translation
+    r"|(?:寫|撰寫).*(?:完整|長篇).*(?:文章|故事|報告|企劃|提案|信)"
+    r"|翻譯.*(?:整段|整篇|全文|長文)"
+    r"|translate.*(?:paragraph|article|full text|long passage)"
+    r")",
+    re.IGNORECASE,
+)
+
+# Image questions that still warrant thinking, even though image input usually stays non-thinking.
+_COMPLEX_IMAGE_QUERY_PATTERNS = re.compile(
+    r"("
+    r"(?:錯在哪|哪裡錯|怎麼修|如何修|排查|故障|異常|崩潰)"
+    r"|(?:traceback|stack trace|exception|troubleshoot|debug|diagnos)"
+    r"|(?:合約|契約|財報|報表|文件|技術文件|錯誤截圖|日誌|log|console).*(?:分析|風險|問題|重點|排查|解釋)"
+    r"|(?:contract|report|document|screenshot|log).*(?:analy[sz]e|risk|issue|problem|debug)"
     r")",
     re.IGNORECASE,
 )
@@ -217,39 +228,33 @@ def _iter_json_candidates(text: str):
 
 
 def _should_disable_thinking(text: str, *, has_image: bool = False) -> bool:
-    """Heuristic: return True for simple queries that don't need reasoning.
+    """Heuristic: return True for queries that don't need reasoning.
+
+    Default is non-thinking (return True). Thinking is only enabled for
+    queries that explicitly match complex patterns requiring deep reasoning.
 
     Logic:
     - If text matches complex patterns → thinking ON (return False)
-    - For image requests with text, default to thinking ON unless the user is
-      only asking for a plain description
-    - If text matches simple patterns (greetings, very short) → thinking OFF (return True)
-    - If text is medium length (≤15 chars) with no complex signals → thinking OFF
-    - Otherwise → thinking ON (default to reasoning)
+    - For image requests, only complex image analysis gets thinking
+    - Everything else → thinking OFF (return True)
     """
     stripped = text.strip()
     if not stripped:
         return True  # Empty → no thinking needed
 
-    # Complex signals always get thinking
+    # Complex signals get thinking
     if _COMPLEX_QUERY_PATTERNS.search(stripped):
         return False
 
     if has_image:
         if _SIMPLE_IMAGE_QUERY_PATTERNS.search(stripped):
             return True
-        return False
-
-    # Simple greetings / very short messages
-    if _SIMPLE_QUERY_PATTERNS.match(stripped):
+        if _COMPLEX_IMAGE_QUERY_PATTERNS.search(stripped):
+            return False
         return True
 
-    # Short messages without complex signals
-    if len(stripped) <= 15:
-        return True
-
-    # Default: use thinking for longer / ambiguous messages
-    return False
+    # Default: no thinking — only complex patterns above trigger thinking
+    return True
 
 
 def _needs_web_search(text: str) -> bool:
@@ -384,7 +389,13 @@ class Orchestrator(BaseAgent):
             return self._parse_llm_response(resp.text or "", request.text)
         except Exception as e:
             logger.error(f"Orchestrator LLM classification failed: {e}")
-            return RouterDecision("chat", "text", request.text, "fallback on error")
+            return RouterDecision(
+                "chat",
+                "text",
+                request.text,
+                "fallback on error",
+                disable_thinking=True,
+            )
 
     def _parse_llm_response(self, text: str, user_text: str) -> RouterDecision:
         """Parse the JSON response from the orchestrator LLM."""
@@ -409,8 +420,8 @@ class Orchestrator(BaseAgent):
                 elif output == "image" and agent != "image_gen":
                     output = "text"
 
-                # needs_thinking: LLM decides; default True for safety
-                needs_thinking = data.get("needs_thinking", True)
+                # Default to non-thinking unless the classifier explicitly asks for it.
+                needs_thinking = data.get("needs_thinking", False)
                 if isinstance(needs_thinking, str):
                     needs_thinking = needs_thinking.lower() not in ("false", "no", "0")
 
@@ -425,4 +436,10 @@ class Orchestrator(BaseAgent):
                 continue
 
         logger.warning(f"Orchestrator LLM returned unparseable response: {text[:200]}")
-        return RouterDecision("chat", "text", user_text, "could not parse LLM response")
+        return RouterDecision(
+            "chat",
+            "text",
+            user_text,
+            "could not parse LLM response",
+            disable_thinking=True,
+        )

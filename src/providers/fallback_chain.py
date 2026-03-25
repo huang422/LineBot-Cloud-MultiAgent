@@ -44,6 +44,15 @@ class LLMProvider(Protocol):
 Target = tuple[LLMProvider, str]
 
 
+def _rate_limit_model(provider: LLMProvider, model: str, *, disable_thinking: bool) -> str:
+    resolver = getattr(provider, "resolve_model", None)
+    if callable(resolver):
+        resolved = resolver(model, disable_thinking=disable_thinking)
+        if isinstance(resolved, str) and resolved.strip():
+            return resolved.strip()
+    return model
+
+
 class AllModelsRateLimitedError(Exception):
     """Raised when every target in the chain is exhausted."""
 
@@ -122,10 +131,16 @@ class FallbackChain:
         last_error: Exception | None = None
         attempted = 0
         saw_provider_error = False
+        disable_thinking = kwargs.get("disable_thinking", False)
 
         for provider, model in targets:
-            if not self.rate_tracker.is_available(model):
-                logger.info(f"Skipping {model} (rate limited)")
+            rate_limit_model = _rate_limit_model(
+                provider,
+                model,
+                disable_thinking=disable_thinking,
+            )
+            if not self.rate_tracker.is_available(rate_limit_model):
+                logger.info(f"Skipping {rate_limit_model} (rate limited)")
                 continue
 
             try:
@@ -137,7 +152,9 @@ class FallbackChain:
                     self.fallback_count += 1
                 return result
             except RateLimitError as e:
-                logger.warning(f"Fallback: {model} rate limited, trying next")
+                logger.warning(
+                    f"Fallback: {getattr(e, 'model', rate_limit_model)} rate limited, trying next"
+                )
                 last_error = e
                 continue
             except ProviderError as e:

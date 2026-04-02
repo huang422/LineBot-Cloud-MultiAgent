@@ -437,12 +437,57 @@ class WebSearchRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("從使用者指定網址擷取的網頁內容", messages[-2]["content"])
         self.assertIn("這是網頁正文內容", messages[-2]["content"])
 
-    async def test_web_search_agent_prefixes_current_datetime_in_search_query(self) -> None:
-        class FixedDateTime(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                return cls(2026, 3, 25, 14, 30, tzinfo=tz)
+    async def test_web_search_agent_uses_answer_only_url_search_fallback(self) -> None:
+        fallback = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=ProviderResponse(
+                    text="根據網址搜尋整理如下",
+                    model="nvidia/test",
+                )
+            )
+        )
+        agent = WebSearchAgent(Settings(_env_file=None), fallback, targets=[])
+        request = AgentRequest(text="https://example.com/post", output_format="text")
 
+        fake_service = SimpleNamespace(
+            is_configured=True,
+            is_quota_available=True,
+            extract=AsyncMock(
+                return_value=web_search_service_module.ExtractResponse(
+                    results=[],
+                    failed_urls=["https://example.com/post"],
+                )
+            ),
+            search=AsyncMock(
+                return_value=web_search_service_module.WebSearchResponse(
+                    query="https://example.com/post",
+                    results=[],
+                    answer="summary from search fallback",
+                )
+            ),
+        )
+
+        with patch.object(
+            web_search_agent_module,
+            "get_web_search_service",
+            return_value=fake_service,
+        ):
+            response = await agent.process(request)
+
+        self.assertEqual(response.text, "根據網址搜尋整理如下")
+        fake_service.extract.assert_awaited_once_with(["https://example.com/post"])
+        fake_service.search.assert_awaited_once_with(
+            "https://example.com/post",
+            max_results=3,
+            search_depth="advanced",
+        )
+
+        generate_call = fallback.generate.await_args
+        messages = generate_call.kwargs["messages"]
+        self.assertEqual(messages[-1]["content"], "請閱讀我提供的網址內容，整理重點後回覆。")
+        self.assertIn("AI Summary: summary from search fallback", messages[-2]["content"])
+
+    async def test_web_search_agent_uses_granular_time_range_without_prefixing_datetime(self) -> None:
         fallback = SimpleNamespace(
             generate=AsyncMock(
                 return_value=ProviderResponse(
@@ -470,19 +515,86 @@ class WebSearchRuntimeTests(unittest.IsolatedAsyncioTestCase):
             web_search_agent_module,
             "get_web_search_service",
             return_value=fake_service,
-        ), patch.object(
-            web_search_agent_module,
-            "datetime",
-            FixedDateTime,
         ):
             response = await agent.process(request)
 
         self.assertEqual(response.text, "整理好的搜尋結果")
-        self.assertEqual(
-            fake_service.search.await_args.args[0],
-            "2026-03-25 14:30 UTC+8 今天新聞",
+        self.assertEqual(fake_service.search.await_args.args[0], "今天新聞")
+        self.assertEqual(fake_service.search.await_args.kwargs["time_range"], "day")
+        self.assertNotIn("include_raw_content", fake_service.search.await_args.kwargs)
+        self.assertIsNone(fake_service.search.await_args.kwargs["country"])
+        fallback.generate.assert_awaited_once()
+
+    async def test_web_search_agent_targets_taiwan_queries_with_country_code(self) -> None:
+        fallback = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=ProviderResponse(
+                    text="整理好的搜尋結果",
+                    model="nvidia/test",
+                )
+            )
         )
-        self.assertEqual(fake_service.search.await_args.kwargs["time_range"], "week")
+        agent = WebSearchAgent(Settings(_env_file=None), fallback, targets=[])
+        request = AgentRequest(text="台北今天新聞", output_format="text")
+
+        fake_service = SimpleNamespace(
+            is_configured=True,
+            is_quota_available=True,
+            search=AsyncMock(
+                return_value=SimpleNamespace(
+                    has_results=True,
+                    answer="ok",
+                    to_context_text=lambda: "search context",
+                )
+            ),
+        )
+
+        with patch.object(
+            web_search_agent_module,
+            "get_web_search_service",
+            return_value=fake_service,
+        ):
+            response = await agent.process(request)
+
+        self.assertEqual(response.text, "整理好的搜尋結果")
+        self.assertEqual(fake_service.search.await_args.args[0], "台北今天新聞")
+        self.assertEqual(fake_service.search.await_args.kwargs["time_range"], "day")
+        self.assertEqual(fake_service.search.await_args.kwargs["country"], "taiwan")
+        fallback.generate.assert_awaited_once()
+
+    async def test_web_search_agent_treats_yesterday_as_day_range(self) -> None:
+        fallback = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=ProviderResponse(
+                    text="整理好的搜尋結果",
+                    model="nvidia/test",
+                )
+            )
+        )
+        agent = WebSearchAgent(Settings(_env_file=None), fallback, targets=[])
+        request = AgentRequest(text="昨天新聞", output_format="text")
+
+        fake_service = SimpleNamespace(
+            is_configured=True,
+            is_quota_available=True,
+            search=AsyncMock(
+                return_value=SimpleNamespace(
+                    has_results=True,
+                    answer="ok",
+                    to_context_text=lambda: "search context",
+                )
+            ),
+        )
+
+        with patch.object(
+            web_search_agent_module,
+            "get_web_search_service",
+            return_value=fake_service,
+        ):
+            response = await agent.process(request)
+
+        self.assertEqual(response.text, "整理好的搜尋結果")
+        self.assertEqual(fake_service.search.await_args.kwargs["time_range"], "day")
         fallback.generate.assert_awaited_once()
 
 
@@ -509,6 +621,15 @@ class WebSearchServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(stats["used"])
         self.assertIsNone(stats["quota"])
         self.assertIsNone(stats["remaining"])
+
+    async def test_context_text_keeps_answer_even_without_results(self) -> None:
+        response = web_search_service_module.WebSearchResponse(
+            query="today news",
+            results=[],
+            answer="summary only",
+        )
+
+        self.assertEqual(response.to_context_text(), "AI Summary: summary only")
 
     async def test_extract_parses_raw_content_and_failed_urls(self) -> None:
         settings = Settings(_env_file=None, tavily_api_key="tavily-key")
@@ -551,6 +672,98 @@ class WebSearchServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.results[0].url, "https://example.com/article")
         self.assertEqual(response.results[0].content, "full page content")
         self.assertEqual(response.failed_urls, ["https://example.com/broken"])
+
+    async def test_search_passes_raw_content_and_country_and_prefers_high_scores(self) -> None:
+        settings = Settings(_env_file=None, tavily_api_key="tavily-key")
+
+        with patch.object(
+            web_search_service_module,
+            "get_settings",
+            return_value=settings,
+        ):
+            service = web_search_service_module.WebSearchService()
+
+        fake_client = SimpleNamespace(
+            search=Mock(
+                return_value={
+                    "answer": "summary",
+                    "results": [
+                        {
+                            "title": "High score result",
+                            "url": "https://example.com/high",
+                            "content": "fallback content",
+                            "raw_content": "full markdown content",
+                            "score": 0.8,
+                        },
+                        {
+                            "title": "Low score result",
+                            "url": "https://example.com/low",
+                            "content": "should be filtered",
+                            "score": 0.1,
+                        },
+                    ],
+                }
+            )
+        )
+
+        with patch.object(service, "_get_client", return_value=fake_client):
+            response = await service.search(
+                "台北今天新聞",
+                include_raw_content="markdown",
+                country="taiwan",
+            )
+
+        self.assertEqual(response.answer, "summary")
+        self.assertEqual(len(response.results), 1)
+        self.assertEqual(response.results[0].url, "https://example.com/high")
+        self.assertEqual(response.results[0].raw_content, "full markdown content")
+        fake_client.search.assert_called_once_with(
+            query="台北今天新聞",
+            max_results=3,
+            include_answer=True,
+            search_depth="advanced",
+            include_raw_content="markdown",
+            country="taiwan",
+        )
+
+    async def test_search_falls_back_to_low_score_results_when_no_high_scores_exist(self) -> None:
+        settings = Settings(_env_file=None, tavily_api_key="tavily-key")
+
+        with patch.object(
+            web_search_service_module,
+            "get_settings",
+            return_value=settings,
+        ):
+            service = web_search_service_module.WebSearchService()
+
+        fake_client = SimpleNamespace(
+            search=Mock(
+                return_value={
+                    "results": [
+                        {
+                            "title": "Low score result 1",
+                            "url": "https://example.com/one",
+                            "content": "first fallback result",
+                            "score": 0.28,
+                        },
+                        {
+                            "title": "Low score result 2",
+                            "url": "https://example.com/two",
+                            "content": "second fallback result",
+                            "score": 0.19,
+                        },
+                    ],
+                }
+            )
+        )
+
+        with patch.object(service, "_get_client", return_value=fake_client):
+            response = await service.search("obscure query", include_answer=False)
+
+        self.assertEqual(len(response.results), 2)
+        self.assertEqual(response.results[0].url, "https://example.com/one")
+        self.assertEqual(response.results[1].url, "https://example.com/two")
+        self.assertIsNone(response.answer)
 
 
 class AgentPromptContextTests(unittest.TestCase):
@@ -1358,6 +1571,25 @@ class OrchestratorFastRuleTests(unittest.TestCase):
                 decision = orchestrator._apply_fast_rules(AgentRequest(text=text))
                 self.assertIsNotNone(decision)
                 self.assertEqual(decision.agent, "web_search")
+
+    def test_review_price_and_location_keywords_route_to_web_search(self) -> None:
+        orchestrator = Orchestrator(
+            Settings(_env_file=None),
+            SimpleNamespace(),
+            targets=[],
+        )
+
+        for text in (
+            "這家餐廳評價如何",
+            "iPhone 16 哪裡買",
+            "台北車站怎麼去",
+            "演唱會票價多少",
+        ):
+            with self.subTest(text=text):
+                decision = orchestrator._apply_fast_rules(AgentRequest(text=text))
+                self.assertIsNotNone(decision)
+                self.assertEqual(decision.agent, "web_search")
+                self.assertEqual(decision.output_format, "text")
 
     def test_today_without_search_topic_does_not_force_web_search(self) -> None:
         orchestrator = Orchestrator(

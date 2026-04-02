@@ -1,7 +1,7 @@
 """Web Search Agent — searches the web and synthesises answers.
 
-Pipeline: user query → keyword extraction → current datetime context →
-Tavily search → inject results into context → LLM synthesis.
+Pipeline: user query → keyword extraction → Tavily search (with topic,
+time-range, country hints) → inject results into context → LLM synthesis.
 """
 
 from __future__ import annotations
@@ -30,11 +30,21 @@ _FINANCE_KEYWORDS = re.compile(
     r"(股票|股價|匯率|stock|crypto|bitcoin|eth|加密貨幣|期貨|基金|market|S&P|nasdaq|道瓊|恆生|台股|美股)",
     re.IGNORECASE,
 )
-# Time-sensitive: recent / today / this week
-_RECENT_KEYWORDS = re.compile(
-    r"(今[天日]|今年|最近|最新|剛剛|目前|現在|this week|today|recent|latest|current|now|昨[天日]|本週|這週|上週)",
+# Taiwan context: geo-target search results
+_TW_CONTEXT_KEYWORDS = re.compile(
+    r"(台灣|台北|高雄|台中|台南|新北|桃園|新竹|嘉義|彰化|屏東|花蓮|台東|宜蘭|基隆"
+    r"|苗栗|雲林|南投|澎湖|金門|馬祖|台股|健保|勞保|中華民國|立法院|行政院)",
     re.IGNORECASE,
 )
+
+# Time-sensitive: granular time range detection
+_TODAY_KEYWORDS = re.compile(r"(今[天日]|today|稍早|剛剛|昨[天日])", re.IGNORECASE)
+_WEEK_KEYWORDS = re.compile(
+    r"(最近|最新|近期|這週|本週|上週|this week|recent|latest|current|now|目前|現在)",
+    re.IGNORECASE,
+)
+_MONTH_KEYWORDS = re.compile(r"(這個月|本月|上個月|上月|this month|last month)", re.IGNORECASE)
+_YEAR_KEYWORDS = re.compile(r"(今年|去年|this year|last year)", re.IGNORECASE)
 
 
 class WebSearchAgent(BaseAgent):
@@ -44,10 +54,6 @@ class WebSearchAgent(BaseAgent):
     def _current_search_datetime() -> str:
         tw_tz = timezone(timedelta(hours=8))
         return datetime.now(tw_tz).strftime("%Y-%m-%d %H:%M UTC+8")
-
-    @classmethod
-    def _with_current_datetime_context(cls, query: str) -> str:
-        return f"{cls._current_search_datetime()} {query.strip()}"
 
     async def process(self, request: AgentRequest) -> AgentResponse:
         self.call_count += 1
@@ -116,16 +122,14 @@ class WebSearchAgent(BaseAgent):
                 # Fallback: if extract failed for some/all URLs, search as backup
                 if not extracted_context and result.failed_urls:
                     for failed_url in result.failed_urls[:2]:
-                        timed_query = self._with_current_datetime_context(failed_url)
                         logger.info(
-                            "Extract failed, falling back to search with datetime context: "
-                            f"{timed_query[:120]}"
+                            f"Extract failed, falling back to search: {failed_url[:120]}"
                         )
                         try:
                             fallback = await svc.search(
-                                timed_query, max_results=3, search_depth="advanced"
+                                failed_url, max_results=3, search_depth="advanced"
                             )
-                            if fallback.has_results:
+                            if fallback.has_results or fallback.answer:
                                 return None, fallback.to_context_text(), urls, query_without_urls
                         except WebSearchError:
                             pass
@@ -139,9 +143,11 @@ class WebSearchAgent(BaseAgent):
         if not search_query.strip():
             return None, None, urls, query_without_urls
 
-        # Detect topic and time-sensitivity for deeper Tavily search
+        # Detect topic, time-sensitivity, and country on the ORIGINAL query
+        # (before keyword optimization which may strip context keywords)
         topic = self._detect_topic(search_query)
         time_range = self._detect_time_range(search_query)
+        country = self._detect_country(search_query)
 
         # Extract keywords from the query for better search results
         optimized_query = await self._extract_search_keywords(search_query)
@@ -151,10 +157,7 @@ class WebSearchAgent(BaseAgent):
         else:
             logger.info(f"Search using original query: '{search_query}'")
 
-        # Always prepend current datetime so relative terms like
-        # "今天 / 最近 / 最新 / 現在" stay grounded for Tavily.
-        search_query = self._with_current_datetime_context(search_query)
-        logger.info(f"Search query with datetime context: '{search_query}'")
+        logger.info(f"Final search query: '{search_query}'")
 
         try:
             result = await svc.search(
@@ -164,7 +167,22 @@ class WebSearchAgent(BaseAgent):
                 max_results=5,
                 topic=topic,
                 time_range=time_range,
+                country=country,
             )
+            # Retry without time_range if the initial search returned nothing
+            if not result.has_results and not result.answer and time_range:
+                logger.info(
+                    f"No results with time_range='{time_range}', "
+                    "retrying without time constraint"
+                )
+                result = await svc.search(
+                    search_query,
+                    include_answer="advanced",
+                    search_depth="advanced",
+                    max_results=5,
+                    topic=topic,
+                    country=country,
+                )
             if not result.has_results and not result.answer:
                 logger.warning("Web search returned no useful results")
                 return None, None, urls, query_without_urls
@@ -172,6 +190,13 @@ class WebSearchAgent(BaseAgent):
         except WebSearchError as e:
             logger.error(f"Web search failed: {e}")
             return None, None, urls, query_without_urls
+
+    @staticmethod
+    def _detect_country(query: str) -> str | None:
+        """Return Tavily country name for geo-targeted search."""
+        if _TW_CONTEXT_KEYWORDS.search(query):
+            return "taiwan"
+        return None
 
     @staticmethod
     def _detect_topic(query: str) -> str | None:
@@ -184,9 +209,15 @@ class WebSearchAgent(BaseAgent):
 
     @staticmethod
     def _detect_time_range(query: str) -> str | None:
-        """Return Tavily time_range if query implies recency."""
-        if _RECENT_KEYWORDS.search(query):
+        """Return Tavily time_range based on granular time keyword detection."""
+        if _TODAY_KEYWORDS.search(query):
+            return "day"
+        if _WEEK_KEYWORDS.search(query):
             return "week"
+        if _MONTH_KEYWORDS.search(query):
+            return "month"
+        if _YEAR_KEYWORDS.search(query):
+            return "year"
         return None
 
     async def _extract_search_keywords(self, query: str) -> str | None:
@@ -195,14 +226,14 @@ class WebSearchAgent(BaseAgent):
         Similar to Claude's search approach: break down the query into key terms
         rather than searching the full sentence verbatim.
         """
-        # Short queries (≤15 chars) or queries with ≤3 words are likely already keyword-like
+        # Short queries (≤10 chars) or queries with ≤2 words are likely already keyword-like
         stripped = query.strip()
-        if len(stripped) <= 15:
+        if len(stripped) <= 10:
             return None
         # Count "words" — Chinese chars + space-separated tokens
         import re as _re
         tokens = _re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z0-9]+', stripped)
-        if len(tokens) <= 3:
+        if len(tokens) <= 2:
             return None
 
         current_time = self._current_search_datetime()
@@ -210,19 +241,21 @@ class WebSearchAgent(BaseAgent):
             f"現在時間：{current_time}\n"
             "你是搜尋查詢優化器。將使用者的自然語言問題轉換為最佳搜尋關鍵字。\n"
             "規則：\n"
-            "1. 提取核心關鍵字，去除語氣詞、助詞、冗餘修飾\n"
-            "2. 保留專有名詞、時間詞、地點、數字等重要限定詞\n"
-            "3. 如果問題包含多個子主題，用空格分隔關鍵字\n"
-            "4. 輸出格式：純 JSON {\"keywords\": \"優化後的搜尋字串\"}\n"
-            "5. 不要加引號包裹整個搜尋字串，讓每個關鍵字獨立\n"
-            "6. 如果原始查詢已經很精簡（≤3個詞），直接返回原文\n"
-            "7. 如果使用者用了「今天 / 最近 / 最新 / 現在」等相對時間詞，要結合現在時間理解，但不要丟掉時間語意\n\n"
+            "1. 去除語氣詞、助詞、冗餘修飾（嗎、呢、吧、的、了、啊、請問、幫我、可以）\n"
+            "2. 保留專有名詞、地點、數字、品牌、人名等重要限定詞\n"
+            "3. 保留搜尋意圖詞：比較、推薦、評價、教學、價格、怎麼去、差異、優缺點\n"
+            "4. 不要自己添加年份或日期（系統已另外處理時間過濾）\n"
+            "5. 保留使用者原本的時間詞（今天、最近、最新），但不要展開成具體日期\n"
+            "6. 如果問題包含多個子主題，用空格分隔關鍵字\n"
+            "7. 如果原始查詢已經很精簡（≤3個詞），直接返回原文\n"
+            "8. 輸出格式：純 JSON {\"keywords\": \"優化後的搜尋字串\"}\n\n"
             "範例：\n"
             "「台灣最近有什麼重要的新聞嗎」→ {\"keywords\": \"台灣 最新 重要新聞\"}\n"
             "「諮商心理師的收費標準大概是多少」→ {\"keywords\": \"諮商心理師 收費標準\"}\n"
-            "「2024年美國總統大選最新民調」→ {\"keywords\": \"2024 美國總統大選 最新民調\"}\n"
             "「iPhone 16 Pro 跟 Samsung S24 Ultra 比較」→ {\"keywords\": \"iPhone 16 Pro Samsung S24 Ultra 比較\"}\n"
-            "「高雄今天天氣」→ {\"keywords\": \"高雄 今天天氣\"}\n"
+            "「高雄有什麼好吃的餐廳推薦嗎」→ {\"keywords\": \"高雄 餐廳 推薦\"}\n"
+            "「從台北車站怎麼去九份」→ {\"keywords\": \"台北車站 九份 交通方式\"}\n"
+            "「特斯拉跟BMW電動車哪個好」→ {\"keywords\": \"特斯拉 BMW 電動車 比較\"}\n"
         )
         messages = [
             {"role": "system", "content": system},

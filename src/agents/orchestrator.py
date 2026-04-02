@@ -71,7 +71,11 @@ _IMAGE_GEN_NEGATIVES = re.compile(
 
 # Topics that usually require external lookup or time-sensitive verification
 _WEB_SEARCH_TOPIC_KEYWORDS = re.compile(
-    r"(時事|新聞|天氣|氣溫|降雨|降水|股價|股市|大盤|匯率|匯價|油價|金價|票價|地址|營業時間|開盤|收盤|現價|賽果|比分|賽程|路況|交通|航班|班次|地震|颱風|公告|政策|法規|疫情|選情|結果)",
+    r"(時事|新聞|天氣|氣溫|降雨|降水|股價|股市|大盤|匯率|匯價|油價|金價|票價"
+    r"|地址|營業時間|開盤|收盤|現價|賽果|比分|賽程|路況|交通|航班|班次"
+    r"|地震|颱風|公告|政策|法規|疫情|選情|結果"
+    r"|評價|推薦|排名|怎麼去|在哪|哪裡買|多少錢|價[格錢]"
+    r"|review|recommend|price|where|how to get)",
     re.IGNORECASE,
 )
 

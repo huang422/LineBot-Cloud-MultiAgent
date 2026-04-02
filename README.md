@@ -58,7 +58,7 @@ System prompts live in `prompts/*.md`, and most runtime tuning lives in `.env`. 
 | Chat | General conversation, coding help, translation, and creative replies via the fallback chain |
 | Adaptive thinking control | The orchestrator decides per request whether to switch to the dedicated thinking model; most requests stay on non-thinking 397B, while only clearly reasoning-heavy tasks activate the 122B model |
 | Vision | Accepts images, screenshots, and photos for analysis |
-| Web search | User queries are optimized into search keywords, prefixed with current date/time context, then Tavily search results are injected into the prompt before synthesis |
+| Web search | User queries are optimized into search keywords, then Tavily search results are fetched with topic/time/country hints and injected into the prompt before synthesis |
 | Webpage reading | If the user posts a URL, Tavily Extract fetches the page body and injects the webpage content into the prompt before synthesis |
 | Image generation | Prompt refinement and description generation run in parallel, then NVIDIA Stable Diffusion 3 generates the image; both image and text description are delivered together |
 | Voice reply | `edge-tts` produces audio, uploads it to GCS, and sends a LINE audio reply |
@@ -185,7 +185,7 @@ For detailed deployment options, GCS/scheduler setup, log monitoring, and troubl
 - Incoming audio is **not** transcribed yet. The bot currently supports **voice replies only**, not speech-to-text input.
 - Conversation history, quoted-message cache, LINE push counters, and model rate-tracker state are **in-memory per instance**. They reset on redeploy and are not shared across multiple Cloud Run instances.
 - `WEB_SEARCH_MONTHLY_QUOTA` is kept only for backward compatibility. The app no longer enforces a local search quota; actual availability depends on Tavily credentials and provider-side limits.
-- Tavily search queries automatically include the current date/time context, which helps relative terms like `today`, `latest`, `recent`, `現在`, and `今天` resolve more accurately.
+- Relative search phrases like `today`, `latest` and `recent` are handled through keyword extraction plus Tavily topic/time-range targeting rather than by prefixing the raw query with a timestamp.
 
 ---
 

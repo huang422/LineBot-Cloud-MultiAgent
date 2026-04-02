@@ -27,11 +27,20 @@ class SearchResult:
     title: str
     url: str
     content: str
+    raw_content: str | None = None
     score: float = 0.0
 
     def to_text(self, index: int) -> str:
-        content = self.content[:2000] if len(self.content) > 2000 else self.content
-        return f"[{index}] {self.title}\nURL: {self.url}\n{content}"
+        text = self.raw_content or self.content
+        if len(text) > 3000:
+            # Smart truncation: find nearest sentence/line boundary
+            cut = text[:3000].rfind('。')
+            if cut == -1:
+                cut = text[:3000].rfind('\n')
+            if cut == -1:
+                cut = 3000
+            text = text[:cut + 1]
+        return f"[{index}] {self.title}\nURL: {self.url}\n{text}"
 
 
 @dataclass
@@ -46,8 +55,6 @@ class WebSearchResponse:
         return len(self.results) > 0
 
     def to_context_text(self) -> str:
-        if not self.results:
-            return ""
         parts = []
         if self.answer:
             parts.append(f"AI Summary: {self.answer}")
@@ -152,6 +159,8 @@ class WebSearchService:
         time_range: Optional[str] = None,
         include_domains: Optional[list[str]] = None,
         exclude_domains: Optional[list[str]] = None,
+        include_raw_content: bool | str = False,
+        country: Optional[str] = None,
     ) -> WebSearchResponse:
         """Execute a Tavily search.
 
@@ -166,6 +175,10 @@ class WebSearchService:
             time_range: ``"day"``, ``"week"``, ``"month"`` or ``"year"``.
             include_domains: Restrict results to these domains.
             exclude_domains: Exclude results from these domains.
+            include_raw_content: ``True`` or ``"markdown"`` to include full
+                webpage content; ``"text"`` for plain text.
+            country: Lowercase country name (e.g. ``"taiwan"``, ``"japan"``)
+                to boost results from that country.
         """
         if not query or not query.strip():
             raise ValueError("Search query cannot be empty")
@@ -188,6 +201,10 @@ class WebSearchService:
             kwargs["include_domains"] = include_domains
         if exclude_domains:
             kwargs["exclude_domains"] = exclude_domains
+        if include_raw_content:
+            kwargs["include_raw_content"] = include_raw_content
+        if country:
+            kwargs["country"] = country
 
         try:
             client = self._get_client()
@@ -196,15 +213,17 @@ class WebSearchService:
                 None, lambda: client.search(**kwargs)
             )
 
-            results = [
+            all_results = [
                 SearchResult(
                     title=item.get("title", ""),
                     url=item.get("url", ""),
                     content=item.get("content", ""),
+                    raw_content=item.get("raw_content") or None,
                     score=item.get("score", 0.0),
                 )
                 for item in response.get("results", [])
             ]
+            results = [item for item in all_results if item.score >= 0.3] or all_results
 
             depth_tag = search_depth
             logger.info(

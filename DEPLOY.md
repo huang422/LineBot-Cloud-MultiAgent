@@ -213,6 +213,15 @@ SERVICE_URL="$(gcloud run services describe "$SERVICE_NAME" \
 curl -fsS "$SERVICE_URL/health" | python -m json.tool
 ```
 
+### 查看部署後目前設定的排程 push 訊息內容
+
+```bash
+gcloud run services describe "$SERVICE_NAME" \
+  --project "$PROJECT_ID" \
+  --region "$REGION" \
+  --format=json | python -c 'import json,sys; svc=json.load(sys.stdin); env={e["name"]: e.get("value","") for e in svc["spec"]["template"]["spec"]["containers"][0].get("env", [])}; out={"SCHEDULED_MESSAGES_ENABLED": env.get("SCHEDULED_MESSAGES_ENABLED"), "SCHEDULED_GROUP_ID": env.get("SCHEDULED_GROUP_ID"), "SCHEDULED_WEEKLY_MESSAGES": json.loads(env.get("SCHEDULED_WEEKLY_MESSAGES", "[]") or "[]"), "SCHEDULED_YEARLY_MESSAGES": json.loads(env.get("SCHEDULED_YEARLY_MESSAGES", "[]") or "[]")}; print(json.dumps(out, ensure_ascii=False, indent=2))'
+```
+
 ### 查看最新 revision
 
 ```bash
@@ -285,6 +294,15 @@ gcloud run services logs read "$SERVICE_NAME" \
   --limit 200
 ```
 
+```bash
+gcloud logging read \
+   "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE_NAME}\" AND textPayload:\"Input:\" AND textPayload:\"user_text=\" AND timestamp>=\"2026-04-02T00:00:00Z\" AND timestamp<=\"2026-04-06T23:59:59Z\"" \
+   --project "$PROJECT_ID" \
+   --limit 200 \
+   --order=asc \
+   --format='table(timestamp,textPayload)'
+```
+
 ### 只看錯誤 log
 
 ```bash
@@ -300,6 +318,16 @@ gcloud logging read \
 ```bash
 gcloud logging read \
   "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE_NAME}\" AND textPayload=~\"POST /webhook|Reply sent|Reply failed|Push failed|Input:\"" \
+  --project "$PROJECT_ID" \
+  --limit 50 \
+  --format='table(timestamp,textPayload)'
+```
+
+### 只看聊天記憶摘要 log
+
+```bash
+gcloud logging read \
+  "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE_NAME}\" AND textPayload:\"Memory summary\"" \
   --project "$PROJECT_ID" \
   --limit 50 \
   --format='table(timestamp,textPayload)'
@@ -358,7 +386,10 @@ gcloud logging read \
 - `/health` 可能回 `200` 但 `ready_for_webhook=false`，要看 payload 不能只看 HTTP status。
 - 語音和圖片生成需要 `GCS_BUCKET_NAME`，沒設定時文字回覆仍正常。
 - 目前只支援**語音輸出**，不支援把使用者傳來的音訊自動轉文字。
-- 對話歷史、引用訊息快取、LINE push 計數與模型 rate state 都是 **in-memory / per-instance**；重部署後會重置，多 instance 之間也不共享。
+- 主 prompt 記憶是「1 份長期摘要 + 最多 5 則近期文字訊息」；目前仍是 **in-memory / per-instance**，重部署後會重置，多 instance 之間也不共享。
+- `!new` 會清空當前 user / group / room 的近期記憶與長期摘要，並回覆 `Let's start a new chat!`。
+- 長期摘要內容會直接寫進 log（loaded / updated / cleared），請自行評估 Cloud Logging 的敏感資訊風險。
+- 引用訊息快取、LINE push 計數與模型 rate state 仍是 **in-memory / per-instance**；重部署後會重置，多 instance 之間也不共享。
 - 網路搜尋目前不做 app 內配額限制；真正可用額度以 Tavily free plan / API 回應為準。
 - Tavily 搜尋查詢會自動帶入目前日期時間，幫助「今天 / 最近 / 現在 / 最新」這類相對時間詞對齊到當下時點。
 - 排程訊息需要同時設定 `SCHEDULED_MESSAGES_ENABLED=true`、`LINE_PUSH_FALLBACK_ENABLED=true`、`SCHEDULED_GROUP_ID`、以及至少一個排程 job。

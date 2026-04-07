@@ -11,14 +11,16 @@ from __future__ import annotations
 import re
 
 from src.config import get_settings
-from src.models.agent_request import AgentRequest, InputType
+from src.models.agent_request import AgentRequest
 from src.models.conversation import ConversationMessage
 from src.services.conversation_service import get_conversation_service
+from src.services.memory_service import get_memory_service, MemoryServiceError
 from src.services.rate_limit_service import get_rate_limit_service
 from src.utils.logger import logger
 from src.utils.validators import sanitize_input
 
 _HEJ_PREFIX = re.compile(r"^!hej\s*", re.IGNORECASE)
+_NEW_CHAT_PATTERN = re.compile(r"^(?:!hej\s*)?!new\s*$", re.IGNORECASE)
 
 
 def _is_line_bot_mentioned(event: dict, settings) -> bool:
@@ -66,6 +68,8 @@ def should_handle(event: dict) -> bool:
 
     # Group/room: need trigger
     if msg_type == "text":
+        if _NEW_CHAT_PATTERN.match(text.strip()):
+            return True
         # !hej command
         if _HEJ_PREFIX.match(text):
             return True
@@ -116,9 +120,19 @@ async def enrich_request(request: AgentRequest) -> AgentRequest:
         request.image_base64 = None  # Clear both to trigger rate-limit path in main
         return request
 
-    # Conversation history
-    conv_svc = get_conversation_service()
-    request.conversation_history = conv_svc.get_history(request.group_id)
+    # Persistent/rolling memory context
+    try:
+        memory = await get_memory_service().load_context(
+            source_type=request.source_type,
+            chat_scope=request.chat_scope,
+            chat_id=request.group_id,
+        )
+        request.conversation_history = memory.to_openai_messages()
+        request.memory_summary = memory.summary_text
+    except MemoryServiceError as e:
+        logger.error(f"Memory context load failed: {e}")
+        request.conversation_history = []
+        request.memory_summary = ""
 
     return request
 
@@ -129,7 +143,7 @@ def record_conversation(
     *,
     assistant_delivered: bool = True,
 ) -> None:
-    """Record the bot's assistant response in conversation history.
+    """Record the bot's assistant response in the legacy conversation cache.
 
     User messages are recorded separately by ``main.py`` once each event has
     been handled, so we only add the assistant reply here.

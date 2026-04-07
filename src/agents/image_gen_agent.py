@@ -1,7 +1,7 @@
 """Image Generation Agent — two-stage pipeline.
 
-Stage 1: Qwen3.5 397B (NVIDIA) refines the user's request into an optimised
-         English image generation prompt (non-thinking mode).
+Stage 1: Text LLM (via fallback chain) refines the user's request into an
+         optimised English image generation prompt (non-thinking mode).
 Stage 2: NVIDIA Stable Diffusion generates the actual image
          (SD3 Medium primary → SD3.5 Large fallback).
 """

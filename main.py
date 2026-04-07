@@ -23,6 +23,12 @@ from src.services.line_service import get_line_service, close_line_service
 from src.services.conversation_service import get_conversation_service
 from src.models.conversation import ConversationMessage
 from src.services.message_cache_service import get_message_cache_service
+from src.services.memory_service import (
+    configure_memory_service,
+    get_memory_service,
+    close_memory_service,
+    MemoryServiceError,
+)
 
 # Providers
 from src.providers.openrouter_provider import OpenRouterProvider
@@ -294,6 +300,8 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Scheduler disabled (SCHEDULED_MESSAGES_ENABLED=false or no group ID)")
 
+    configure_memory_service(settings, nvidia_provider=nvidia_provider)
+
     logger.info("LineBot-CloudAgent started (Orchestrator + NVIDIA Qwen3.5 architecture)")
     yield
 
@@ -302,6 +310,7 @@ async def lifespan(app: FastAPI):
     from src.services.web_search_service import close_web_search_service
     await close_web_search_service()
     await close_line_service()
+    await close_memory_service()
     if openrouter_provider:
         await openrouter_provider.close()
     if nvidia_provider:
@@ -338,6 +347,10 @@ def _track_background_task(task: asyncio.Task) -> None:
     _background_tasks.add(task)
     task.add_done_callback(_log_background_task_exception)
     task.add_done_callback(_background_tasks.discard)
+
+
+def _is_new_chat_command(text: str) -> bool:
+    return text.strip().lower() == "!new"
 
 
 def _apply_cleaned_text(request, event: dict) -> None:
@@ -378,6 +391,28 @@ def _get_request_block_message(request) -> str | None:
     return None
 
 
+def _build_user_memory_text(request) -> str:
+    text = request.text.strip()
+    if text:
+        return text
+    if request.quoted_image_base64 or request.quoted_image_url:
+        return "[使用者引用圖片]"
+    if request.input_type in (InputType.IMAGE, InputType.IMAGE_TEXT) or request.image_base64:
+        return "[使用者傳送圖片]"
+    return ""
+
+
+def _build_assistant_memory_text(response) -> str:
+    text = (response.text or "").strip()
+    if text:
+        return text
+    if response.output_format == "image":
+        return "[已傳送圖片]"
+    if response.output_format == "voice":
+        return "[已傳送語音]"
+    return ""
+
+
 # ── Health ───────────────────────────────────────────────────
 
 @app.get("/health")
@@ -403,6 +438,7 @@ async def health():
     storage = get_storage_service()
     web_search = get_web_search_service()
     line = get_line_service()
+    memory = get_memory_service()
 
     return {
         "status": status,
@@ -417,6 +453,7 @@ async def health():
         "agents_stats": agents_stats,
         "fallback_count": fallback_chain.fallback_count if fallback_chain else 0,
         "conversation": get_conversation_service().get_stats(),
+        "memory": memory.get_stats(),
         "scheduler": (
             scheduler.get_stats()
             if scheduler is not None
@@ -473,11 +510,7 @@ async def webhook(request: Request):
 
 
 def _record_group_message(event: dict) -> None:
-    """Proactively record ALL incoming messages for conversation context.
-
-    This captures messages from users who don't trigger the bot (no !hej
-    or @mention), so the LLM has full group conversation context.
-    """
+    """Record incoming messages in the legacy passive conversation cache."""
     if event.get("type") != "message":
         return
 
@@ -534,9 +567,7 @@ async def _process_event(event: dict) -> None:
     reply_token = event.get("replyToken", "")
 
     try:
-        # Send loading animation (free)
         line = get_line_service()
-        await line.send_loading_animation(chat_id)
 
         # Build request from event
         request = await process_input(event)
@@ -545,9 +576,27 @@ async def _process_event(event: dict) -> None:
 
         # Override text with cleaned version (remove !hej prefix etc.)
         _apply_cleaned_text(request, event)
+
+        if _is_new_chat_command(request.text):
+            await get_memory_service().clear_chat(
+                source_type=request.source_type,
+                chat_scope=request.chat_scope,
+                chat_id=request.group_id,
+            )
+            get_conversation_service().clear_history(request.group_id)
+            await line.send_text(
+                request.reply_token,
+                chat_id,
+                "Let's start a new chat!",
+            )
+            return
+
+        # Send loading animation (free)
+        await line.send_loading_animation(chat_id)
+
         get_message_cache_service().cache_processed_request(event, request)
 
-        # Enrich: rate limit + conversation history
+        # Enrich: rate limit + memory context
         request = await enrich_request(request)
         block_message = _get_request_block_message(request)
         if block_message:
@@ -590,6 +639,18 @@ async def _process_event(event: dict) -> None:
                 f"[{request.request_id}] Response could not be delivered "
                 "(reply failed or push budget unavailable)"
             )
+        else:
+            try:
+                await get_memory_service().record_interaction(
+                    source_type=request.source_type,
+                    chat_scope=request.chat_scope,
+                    chat_id=request.group_id,
+                    user_id=request.user_id,
+                    user_text=_build_user_memory_text(request),
+                    assistant_text=_build_assistant_memory_text(response),
+                )
+            except MemoryServiceError as e:
+                logger.error(f"Memory interaction record failed: {e}")
 
         # Record conversation
         record_conversation(
@@ -612,7 +673,8 @@ async def _process_event(event: dict) -> None:
     finally:
         # Record handled messages after processing so the current turn is not
         # duplicated in the prompt history passed to the agent.
-        _record_group_message(event)
+        if not _is_new_chat_command(extract_text(event)):
+            _record_group_message(event)
 
 
 async def _send_error_message(reply_token: str, chat_id: str, text: str) -> None:

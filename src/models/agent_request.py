@@ -23,6 +23,8 @@ class AgentRequest:
     user_id: str = ""
     group_id: str = ""
     reply_token: str = ""
+    source_type: str = "user"  # user | group | room
+    chat_scope: str = "user"  # user | multi
 
     # Input content
     input_type: InputType = InputType.TEXT
@@ -36,6 +38,7 @@ class AgentRequest:
 
     # Conversation context
     conversation_history: list[dict] | None = None
+    memory_summary: str = ""
     rate_limited: bool = False
 
     # Orchestrator decision

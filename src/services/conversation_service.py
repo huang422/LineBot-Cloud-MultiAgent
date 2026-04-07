@@ -1,4 +1,8 @@
-"""In-memory conversation history per group/user."""
+"""Legacy in-memory conversation cache per chat.
+
+This cache is kept for lightweight compatibility / observability paths and is
+no longer the primary prompt-memory source.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,6 @@ from time import time
 
 from src.config import get_settings
 from src.models.conversation import ConversationMessage
-from src.utils.logger import logger
 
 
 class ConversationService:
@@ -41,10 +44,10 @@ class ConversationService:
         self._history[chat_id].append(msg)
 
     def get_history(self, chat_id: str) -> list[dict]:
-        """Return OpenAI-format message list for context.
+        """Return cached messages in OpenAI-style format.
 
-        User messages include a short user tag (``User_XXXX:``) so the
-        LLM can distinguish speakers in group conversations.
+        This legacy cache still tags group speakers for compatibility with
+        older consumers, but it is no longer the primary prompt-memory source.
         """
         now = time()
         messages = self._prune_expired_messages(chat_id, now)
@@ -94,6 +97,10 @@ class ConversationService:
             "groups_tracked": len(self._history),
             "total_messages": total_messages,
         }
+
+    def clear_history(self, chat_id: str) -> None:
+        """Remove all cached conversation history for one chat."""
+        self._history.pop(chat_id, None)
 
 
 _instance: ConversationService | None = None

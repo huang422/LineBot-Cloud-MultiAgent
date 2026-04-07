@@ -27,12 +27,16 @@ async def process_input(event: dict) -> AgentRequest | None:
     reply_token = event.get("replyToken", "")
 
     user_id = source.get("userId", "")
+    source_type = str(source.get("type", "user")).strip().lower() or "user"
     group_id = source.get("groupId", "") or source.get("roomId", "") or user_id
+    chat_scope = "user" if source_type == "user" else "multi"
 
     request = AgentRequest(
         user_id=user_id,
         group_id=group_id,
         reply_token=reply_token,
+        source_type=source_type,
+        chat_scope=chat_scope,
     )
 
     if msg_type == "text":

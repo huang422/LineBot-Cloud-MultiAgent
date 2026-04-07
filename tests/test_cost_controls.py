@@ -47,6 +47,10 @@ class SettingsValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Settings(_env_file=None, openrouter_reasoning_effort="ultra")
 
+    def test_settings_default_memory_summary_timeout_is_180_seconds(self) -> None:
+        settings = Settings(_env_file=None)
+        self.assertEqual(settings.memory_summary_timeout_seconds, 180)
+
 
 class LineServiceBudgetTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_text_blocks_push_when_disabled(self) -> None:

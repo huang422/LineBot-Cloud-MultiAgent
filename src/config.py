@@ -144,6 +144,12 @@ class Settings(BaseSettings):
     rate_limit_max_requests: int = 30
     rate_limit_window_seconds: int = 60
 
+    # ── Conversation Memory ───────────────────────────────────
+    memory_recent_message_limit: int = 5
+    memory_summary_timeout_seconds: int = 180
+    memory_summary_temperature: float = 0.2
+    memory_summary_max_tokens: int = 384
+
     # ── Server ────────────────────────────────────────────────
     host: str = "0.0.0.0"
     port: int = 8080
@@ -187,8 +193,12 @@ class Settings(BaseSettings):
         "conversation_ttl_seconds",
         "rate_limit_max_requests",
         "rate_limit_window_seconds",
+        "memory_recent_message_limit",
+        "memory_summary_timeout_seconds",
+        "memory_summary_max_tokens",
         "port",
         "gcs_media_cleanup_delay_seconds",
+        "gcs_signed_url_expiry_hours",
     )
     @classmethod
     def validate_positive_int(cls, v: int) -> int:
@@ -213,6 +223,7 @@ class Settings(BaseSettings):
         "vision_temperature",
         "web_search_temperature",
         "image_gen_temperature",
+        "memory_summary_temperature",
     )
     @classmethod
     def validate_non_negative_float(cls, v: float) -> float:
@@ -229,12 +240,6 @@ class Settings(BaseSettings):
             raise ValueError(f"Invalid openrouter_reasoning_effort: {v}")
         return v
 
-    @field_validator("gcs_signed_url_expiry_hours")
-    @classmethod
-    def validate_positive_expiry(cls, v: int) -> int:
-        if v <= 0:
-            raise ValueError("GCS signed URL expiry must be greater than 0")
-        return v
 
     model_config = {
         "env_file": ".env",

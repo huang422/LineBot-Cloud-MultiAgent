@@ -231,8 +231,7 @@ class WebSearchAgent(BaseAgent):
         if len(stripped) <= 10:
             return None
         # Count "words" — Chinese chars + space-separated tokens
-        import re as _re
-        tokens = _re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z0-9]+', stripped)
+        tokens = re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z0-9]+', stripped)
         if len(tokens) <= 2:
             return None
 

@@ -190,7 +190,7 @@ class LineService:
             return True
         if self._push_monthly_limit <= 0:
             return True
-        return self._push_monthly_limit > 0 and self._direct_push_count < self._push_monthly_limit
+        return self._direct_push_count < self._push_monthly_limit
 
     def get_push_stats(self) -> dict:
         self._check_and_reset_push_budget()

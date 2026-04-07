@@ -38,7 +38,7 @@ class ProviderError(Exception):
 
 @dataclass
 class ProviderResponse:
-    """Unified response from OpenRouter."""
+    """Unified response from any LLM provider."""
 
     text: str | None = None
     images: list[str] | None = None  # base64 data URLs

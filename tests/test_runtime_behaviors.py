@@ -41,6 +41,7 @@ from src.providers.openrouter_provider import (
 from src.services import conversation_service as conversation_service_module
 from src.services import image_service as image_service_module
 from src.services import message_cache_service as message_cache_service_module
+from src.services import memory_service as memory_service_module
 from src.services.storage_service import UploadedMedia
 from src.services.message_cache_service import CachedMessage
 from src.services import rate_limit_service as rate_limit_service_module
@@ -307,6 +308,17 @@ class WebhookTriggerTests(unittest.TestCase):
         with patch.object(webhook_handler, "get_settings", return_value=settings):
             self.assertFalse(webhook_handler.should_handle(event))
 
+    def test_group_new_command_is_handled_without_mention(self) -> None:
+        settings = Settings(_env_file=None, bot_name="小助手", line_bot_user_id="U_BOT")
+        event = {
+            "type": "message",
+            "source": {"type": "group"},
+            "message": {"type": "text", "text": "!new"},
+        }
+
+        with patch.object(webhook_handler, "get_settings", return_value=settings):
+            self.assertTrue(webhook_handler.should_handle(event))
+
 
 class ConversationRecordingTests(unittest.TestCase):
     def test_record_conversation_skips_undelivered_assistant_reply(self) -> None:
@@ -334,6 +346,265 @@ class ConversationRecordingTests(unittest.TestCase):
         # No assistant recorded because assistant_delivered=False;
         # user messages are not recorded here (handled elsewhere).
         self.assertEqual(recorded, [])
+
+
+class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_load_context_logs_current_summary_content(self) -> None:
+        service = memory_service_module.MemoryService(Settings(_env_file=None))
+        doc = service._default_document(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+        )
+        doc["summary_text"] = "這是目前的長期記憶"
+        service._memory_store["user::U1"] = doc
+
+        with patch.object(memory_service_module.logger, "info") as log_info:
+            memory = await service.load_context(
+                source_type="user",
+                chat_scope="user",
+                chat_id="U1",
+            )
+
+        self.assertEqual(memory.summary_text, "這是目前的長期記憶")
+        log_info.assert_any_call(
+            "[user:U1] Memory summary loaded: 這是目前的長期記憶"
+        )
+
+    async def test_clear_chat_logs_previous_summary_and_empties_memory(self) -> None:
+        service = memory_service_module.MemoryService(Settings(_env_file=None))
+        doc = service._default_document(
+            source_type="group",
+            chat_scope="multi",
+            chat_id="G1",
+        )
+        doc["summary_text"] = "舊的長期記憶"
+        doc["recent_messages"] = [
+            {
+                "role": "user",
+                "content": "你好",
+                "user_id": "U1000",
+                "created_at": 1.0,
+            }
+        ]
+        doc["recent_count"] = 1
+        service._memory_store["group::G1"] = doc
+
+        with patch.object(memory_service_module.logger, "info") as log_info:
+            await service.clear_chat(
+                source_type="group",
+                chat_scope="multi",
+                chat_id="G1",
+            )
+
+        cleared = service._memory_store["group::G1"]
+        self.assertEqual(cleared["summary_text"], "")
+        self.assertEqual(cleared["recent_messages"], [])
+        log_info.assert_any_call("[group:G1] Memory summary before !new: 舊的長期記憶")
+        log_info.assert_any_call("[group:G1] Memory summary cleared by !new: (empty)")
+
+    async def test_record_interaction_compacts_existing_summary_and_recent_window(self) -> None:
+        nvidia = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=ProviderResponse(text="更新後的長期摘要", model="qwen/test")
+            )
+        )
+        service = memory_service_module.MemoryService(
+            Settings(
+                _env_file=None,
+                memory_recent_message_limit=5,
+                memory_summary_timeout_seconds=180,
+            ),
+            nvidia_provider=nvidia,
+        )
+        doc = service._default_document(
+            source_type="group",
+            chat_scope="multi",
+            chat_id="G1",
+        )
+        doc["summary_text"] = "既有摘要"
+        service._memory_store["group::G1"] = doc
+
+        await service.record_interaction(
+            source_type="group",
+            chat_scope="multi",
+            chat_id="G1",
+            user_id="U1000",
+            user_text="第一個問題",
+            assistant_text="第一個回答",
+        )
+        await service.record_interaction(
+            source_type="group",
+            chat_scope="multi",
+            chat_id="G1",
+            user_id="U2000",
+            user_text="第二個問題",
+            assistant_text="第二個回答",
+        )
+        await service.record_interaction(
+            source_type="group",
+            chat_scope="multi",
+            chat_id="G1",
+            user_id="U3000",
+            user_text="第三個問題",
+            assistant_text="第三個回答",
+        )
+
+        await asyncio.gather(*list(service._summary_tasks.values()))
+
+        compacted = await service.load_context(
+            source_type="group",
+            chat_scope="multi",
+            chat_id="G1",
+        )
+        self.assertEqual(compacted.summary_text, "更新後的長期摘要")
+        self.assertEqual(compacted.recent_count, 0)
+        summary_system_prompt = nvidia.generate.await_args.kwargs["messages"][0]["content"]
+        summary_prompt = nvidia.generate.await_args.kwargs["messages"][1]["content"]
+        self.assertIn("請把現有長期記憶視為預設保留", summary_system_prompt)
+        self.assertIn("若最近對話沒有帶來足以改寫的長期資訊", summary_system_prompt)
+        self.assertIn("既有摘要", summary_prompt)
+        self.assertIn("現有長期記憶摘要（預設保留", summary_prompt)
+        self.assertIn("不要因為主題切換就刪除舊的有效資訊", summary_prompt)
+        self.assertNotIn("User_1000: 第一個問題", summary_prompt)
+        self.assertIn("Assistant: 第一個回答", summary_prompt)
+        self.assertIn("Assistant: 第三個回答", summary_prompt)
+
+    async def test_group_recent_memory_keeps_user_tags_for_multi_chat(self) -> None:
+        service = memory_service_module.MemoryService(Settings(_env_file=None))
+        doc = service._default_document(
+            source_type="group",
+            chat_scope="multi",
+            chat_id="G1",
+        )
+        doc["recent_messages"] = [
+            {
+                "role": "user",
+                "content": "哈囉",
+                "user_id": "U1234",
+                "created_at": 1.0,
+            },
+            {
+                "role": "assistant",
+                "content": "你好",
+                "user_id": "",
+                "created_at": 2.0,
+            },
+        ]
+        doc["recent_count"] = 2
+        service._memory_store["group::G1"] = doc
+
+        memory = await service.load_context(
+            source_type="group",
+            chat_scope="multi",
+            chat_id="G1",
+        )
+
+        self.assertEqual(
+            memory.to_openai_messages(),
+            [
+                {"role": "user", "content": "User_1234: 哈囉"},
+                {"role": "assistant", "content": "你好"},
+            ],
+        )
+
+    async def test_recent_memory_stays_bounded_when_summary_provider_is_unavailable(self) -> None:
+        service = memory_service_module.MemoryService(
+            Settings(_env_file=None, memory_recent_message_limit=5)
+        )
+
+        await service.record_interaction(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+            user_id="U1",
+            user_text="一",
+            assistant_text="二",
+        )
+        await service.record_interaction(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+            user_id="U1",
+            user_text="三",
+            assistant_text="四",
+        )
+        await service.record_interaction(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+            user_id="U1",
+            user_text="五",
+            assistant_text="六",
+        )
+
+        memory = await service.load_context(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+        )
+
+        self.assertEqual(memory.recent_count, 5)
+        self.assertEqual(
+            [message.content for message in memory.recent_messages],
+            ["二", "三", "四", "五", "六"],
+        )
+
+    async def test_summary_timeout_logs_once_and_keeps_recent_memory_capped(self) -> None:
+        nvidia = SimpleNamespace(generate=AsyncMock(side_effect=asyncio.TimeoutError()))
+        service = memory_service_module.MemoryService(
+            Settings(
+                _env_file=None,
+                memory_recent_message_limit=5,
+                memory_summary_timeout_seconds=180,
+            ),
+            nvidia_provider=nvidia,
+        )
+
+        with patch.object(memory_service_module.logger, "warning") as log_warning, patch.object(
+            memory_service_module.logger, "error"
+        ) as log_error:
+            await service.record_interaction(
+                source_type="user",
+                chat_scope="user",
+                chat_id="U1",
+                user_id="U1",
+                user_text="第一句",
+                assistant_text="第二句",
+            )
+            await service.record_interaction(
+                source_type="user",
+                chat_scope="user",
+                chat_id="U1",
+                user_id="U1",
+                user_text="第三句",
+                assistant_text="第四句",
+            )
+            await service.record_interaction(
+                source_type="user",
+                chat_scope="user",
+                chat_id="U1",
+                user_id="U1",
+                user_text="第五句",
+                assistant_text="第六句",
+            )
+
+            await asyncio.gather(*list(service._summary_tasks.values()))
+
+        memory = await service.load_context(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+        )
+        self.assertEqual(memory.recent_count, 5)
+        self.assertEqual(
+            [message.content for message in memory.recent_messages],
+            ["第二句", "第三句", "第四句", "第五句", "第六句"],
+        )
+        log_warning.assert_any_call(
+            "[user:U1] Memory summary timed out after 180s; keeping the latest recent memory window"
+        )
+        log_error.assert_not_called()
 
 
 class WebSearchRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -782,6 +1053,21 @@ class AgentPromptContextTests(unittest.TestCase):
         self.assertIn("調度任務摘要", messages[0]["content"])
         self.assertIn("請先把需求翻成英文再回答", messages[0]["content"])
         self.assertIn("調度補充說明", messages[0]["content"])
+
+    def test_agent_messages_include_long_term_memory_before_recent_history(self) -> None:
+        fallback = SimpleNamespace(generate=AsyncMock())
+        agent = ChatAgent(Settings(_env_file=None), fallback, targets=[])
+        request = AgentRequest(
+            text="新的問題",
+            memory_summary="這是長期記憶摘要",
+            conversation_history=[{"role": "user", "content": "最近的對話"}],
+        )
+
+        messages = agent._build_messages(request)
+
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertIn("長期記憶摘要", messages[1]["content"])
+        self.assertEqual(messages[2], {"role": "user", "content": "最近的對話"})
 
     def test_agent_messages_include_quoted_text_context(self) -> None:
         fallback = SimpleNamespace(generate=AsyncMock())

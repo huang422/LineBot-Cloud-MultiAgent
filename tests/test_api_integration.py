@@ -46,6 +46,17 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             get_stats=lambda: {
                 "groups_tracked": 0,
                 "total_messages": 0,
+            },
+            clear_history=Mock(),
+        )
+        self.fake_memory = SimpleNamespace(
+            get_stats=lambda: {
+                "backend": "memory",
+                "persistent": False,
+                "recent_message_limit": 5,
+                "summary_timeout_seconds": 180,
+                "summary_tasks": 0,
+                "tracked_chats": 0,
             }
         )
         self.fake_scheduler = SimpleNamespace(
@@ -92,6 +103,12 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             )
             stack.enter_context(
                 patch.object(main_module, "close_line_service", new=AsyncMock())
+            )
+            stack.enter_context(
+                patch.object(main_module, "get_memory_service", return_value=self.fake_memory)
+            )
+            stack.enter_context(
+                patch.object(main_module, "close_memory_service", new=AsyncMock())
             )
             stack.enter_context(
                 patch(
@@ -144,6 +161,8 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
         self.assertIn("orchestrator", payload["agents_stats"])
         self.assertIn("chat", payload["agents_stats"])
         self.assertEqual(payload["conversation"]["groups_tracked"], 0)
+        self.assertEqual(payload["memory"]["backend"], "memory")
+        self.assertEqual(payload["memory"]["summary_timeout_seconds"], 180)
         self.assertEqual(payload["scheduler"]["job_count"], 0)
         self.assertTrue(payload["cost_controls"]["line_push"]["enabled"])
 
@@ -308,3 +327,67 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.target_agent, "chat")
         self.assertEqual(request.output_format, "text")
         self.assertFalse(request.disable_thinking)
+
+    async def test_process_event_handles_new_chat_without_routing(self) -> None:
+        event = {
+            "type": "message",
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "G1", "userId": "U1"},
+            "message": {"type": "text", "id": "M4", "text": "!new"},
+        }
+        request = AgentRequest(
+            user_id="U1",
+            group_id="G1",
+            reply_token="reply-token",
+            text="!new",
+            source_type="group",
+            chat_scope="multi",
+        )
+        line_service = SimpleNamespace(
+            send_loading_animation=AsyncMock(),
+            send_text=AsyncMock(),
+        )
+        conversation_service = SimpleNamespace(clear_history=Mock())
+        memory_service = SimpleNamespace(clear_chat=AsyncMock())
+        cache_service = SimpleNamespace(cache_processed_request=Mock())
+
+        with patch.object(
+            main_module, "get_line_service", return_value=line_service
+        ), patch.object(
+            main_module, "process_input", AsyncMock(return_value=request)
+        ), patch.object(
+            main_module, "extract_text", return_value="!new"
+        ), patch.object(
+            main_module, "get_conversation_service", return_value=conversation_service
+        ), patch.object(
+            main_module, "get_memory_service", return_value=memory_service
+        ), patch.object(
+            main_module, "get_message_cache_service", return_value=cache_service
+        ), patch.object(
+            main_module, "enrich_request", AsyncMock()
+        ) as enrich_request, patch.object(
+            main_module, "send_response", AsyncMock()
+        ) as send_response, patch.object(
+            main_module, "record_conversation"
+        ) as record_conversation, patch.object(
+            main_module, "_record_group_message"
+        ) as record_group_message:
+            await main_module._process_event(event)
+
+        line_service.send_loading_animation.assert_not_called()
+        memory_service.clear_chat.assert_awaited_once_with(
+            source_type="group",
+            chat_scope="multi",
+            chat_id="G1",
+        )
+        conversation_service.clear_history.assert_called_once_with("G1")
+        line_service.send_text.assert_awaited_once_with(
+            "reply-token",
+            "G1",
+            "Let's start a new chat!",
+        )
+        cache_service.cache_processed_request.assert_not_called()
+        enrich_request.assert_not_called()
+        send_response.assert_not_called()
+        record_conversation.assert_not_called()
+        record_group_message.assert_not_called()

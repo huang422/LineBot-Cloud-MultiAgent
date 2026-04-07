@@ -41,6 +41,10 @@ User requests are first refined into optimized English prompts by the text LLM, 
 
 `edge-tts` synthesizes speech at zero cost. Audio is uploaded to GCS with signed URLs and sent as a LINE audio message. Voice and language are configurable.
 
+### Layered Chat Memory
+
+Each `user` / `group` / `room` chat keeps a rolling **5-message recent text window** plus **one long-term summary**. When the recent window fills up, the app uses NVIDIA Qwen3.5 397B to compact `existing summary + latest 5 messages` into the next summary in the background, with a bias toward preserving still-valid long-term facts and preferences unless newer dialogue clearly invalidates them. Sending `!new` clears both layers for the current chat scope and replies with `Let's start a new chat!`.
+
 ### Cloud-Only, One-Command Deploy
 
 `./scripts/deploy_cloud_run.sh` handles everything — API enablement, Cloud Build submission, smoke checks, revision routing, and old image/revision pruning. No local Docker build step required.
@@ -95,7 +99,7 @@ This project is the next-generation successor to [LineBot-VLM-GroupAgent](https:
 1. `POST /webhook` receives a LINE event and validates the HMAC signature.
 2. The API returns `200 OK` immediately, then continues processing in background tasks.
 3. Input processing downloads image payloads, sanitizes text, and recovers quoted context.
-4. Rate limiting and conversation history enrichment happen before routing.
+4. Rate limiting and chat-memory enrichment happen before routing.
 5. The orchestrator chooses `chat`, `vision`, `web_search`, or `image_gen`, and also decides whether the request needs deep thinking.
 6. The selected agent runs through the fallback chain and returns a normalized response.
 7. The output processor sends text, voice, or image messages back to LINE.
@@ -183,9 +187,11 @@ For detailed deployment options, GCS/scheduler setup, log monitoring, and troubl
 
 - `OPENROUTER_API_KEY` is part of the minimum setup because `/health` readiness and orchestrator primary routing depend on it.
 - Incoming audio is **not** transcribed yet. The bot currently supports **voice replies only**, not speech-to-text input.
-- Conversation history, quoted-message cache, LINE push counters, and model rate-tracker state are **in-memory per instance**. They reset on redeploy and are not shared across multiple Cloud Run instances.
+- The main prompt memory is now `1 long-term summary + up to 5 recent text messages` per chat. It is currently in-memory per instance, so it resets on redeploy and is not shared across multiple Cloud Run instances.
+- Quoted-message cache, LINE push counters, and model rate-tracker state are still **in-memory per instance**.
 - `WEB_SEARCH_MONTHLY_QUOTA` is kept only for backward compatibility. The app no longer enforces a local search quota; actual availability depends on Tavily credentials and provider-side limits.
 - Relative search phrases like `today`, `latest` and `recent` are handled through keyword extraction plus Tavily topic/time-range targeting rather than by prefixing the raw query with a timestamp.
+- Users can send `!new` in DM, group, or room chats to clear the current chat memory scope.
 
 ---
 
@@ -270,14 +276,23 @@ These flags control provider-side reasoning support, but the actual on/off decis
 | `RATE_LIMIT_MAX_REQUESTS` | `30` | Per-user request limit |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit sliding window |
 
+### Conversation memory
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MEMORY_RECENT_MESSAGE_LIMIT` | `5` | Recent text-message window size before compaction |
+| `MEMORY_SUMMARY_TIMEOUT_SECONDS` | `180` | Background summary timeout; on timeout the memory keeps the latest 5-message recent window |
+| `MEMORY_SUMMARY_TEMPERATURE` | `0.2` | Summary compaction temperature |
+| `MEMORY_SUMMARY_MAX_TOKENS` | `384` | Max tokens for long-term summary updates |
+
 ### Bot & conversation
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `BOT_NAME` | `Assistant` | Bot display name in prompts |
 | `LINE_BOT_USER_ID` | — | Bot's LINE userId for precise @mention detection |
-| `MAX_CONVERSATION_HISTORY` | `10` | In-memory messages kept per conversation |
-| `CONVERSATION_TTL_SECONDS` | `3600` | In-memory conversation expiry (1 hour, resets on redeploy) |
+| `MAX_CONVERSATION_HISTORY` | `10` | Legacy in-memory passive conversation cache size |
+| `CONVERSATION_TTL_SECONDS` | `3600` | Legacy in-memory passive conversation cache expiry |
 | `TTS_ENABLED` | `true` | Enable voice replies (incoming audio transcription is not included) |
 | `TTS_VOICE` | `zh-TW-HsiaoChenNeural` | [edge-tts](https://github.com/rany2/edge-tts) voice |
 

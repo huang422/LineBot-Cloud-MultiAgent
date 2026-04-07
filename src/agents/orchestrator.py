@@ -134,7 +134,7 @@ _VALID_OUTPUTS = {"text", "voice", "image"}
 _SIMPLE_QUERY_PATTERNS = re.compile(
     r"^("
     # Greetings / farewells
-    r"(嗨|哈囉|你好|早安|午安|晚安|安安|掰掰|拜拜|再見|晚安|謝謝|感謝|好的|OK|ok|收到|了解|bye|hello|hi|hey|thanks|thank you|good morning|good night|gn|gm)"
+    r"(嗨|哈囉|你好|早安|午安|晚安|安安|掰掰|拜拜|再見|謝謝|感謝|好的|OK|ok|收到|了解|bye|hello|hi|hey|thanks|thank you|good morning|good night|gn|gm)"
     # Very short messages (≤5 chars) that are likely chitchat
     r"|.{1,5}"
     r")$",

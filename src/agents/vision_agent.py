@@ -1,7 +1,8 @@
 """Vision Agent — analyses images and answers questions about visual content.
 
-Uses Qwen3.5 397B VLM (NVIDIA) as primary (thinking mode swaps to 122B),
-with OpenRouter fallback. Qwen3.5 natively supports image input.
+Uses NVIDIA Qwen3.5 397B as the primary vision model. When the primary NVIDIA
+leg needs deeper reasoning, it swaps to NVIDIA Gemma 4 31B; OpenRouter Gemma 4
+31B serves as the fallback.
 """
 
 from __future__ import annotations

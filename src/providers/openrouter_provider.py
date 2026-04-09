@@ -171,7 +171,7 @@ class OpenRouterProvider:
         """Call OpenRouter and return a unified response.
 
         Args:
-            model: Model ID (e.g. "google/gemma-3-27b-it:free")
+            model: Model ID (e.g. "nvidia/nemotron-3-super-120b-a12b:free")
             messages: OpenAI-format message list
             temperature: Sampling temperature
             max_tokens: Maximum completion tokens

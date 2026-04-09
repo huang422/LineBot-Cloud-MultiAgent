@@ -39,6 +39,11 @@ class AgentRequest:
     # Conversation context
     conversation_history: list[dict] | None = None
     memory_summary: str = ""
+    previous_agent: str = ""
+    previous_output_format: str = "text"
+    previous_task_description: str = ""
+    previous_routing_reasoning: str = ""
+    previous_disable_thinking: bool = True
     rate_limited: bool = False
 
     # Orchestrator decision

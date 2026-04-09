@@ -204,6 +204,102 @@ class NvidiaProviderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.text, "ok")
 
+    async def test_generate_enables_gemma4_thinking_with_chat_template_kwargs(self) -> None:
+        from src.providers.nvidia_provider import NvidiaProvider
+
+        provider = NvidiaProvider(
+            "test-key",
+            RateTracker(),
+            thinking_enabled=True,
+            thinking_budget=1024,
+        )
+
+        class FakeResponse:
+            status_code = 200
+            text = "ok"
+
+            def json(self):
+                return {
+                    "choices": [{"message": {"content": "ok"}}],
+                    "model": "google/gemma-4-31b-it",
+                    "usage": {},
+                }
+
+        fake_post = AsyncMock(return_value=FakeResponse())
+        provider._client = SimpleNamespace(post=fake_post)
+
+        response = await provider.generate(
+            "google/gemma-4-31b-it",
+            [{"role": "user", "content": "hello"}],
+        )
+
+        self.assertEqual(response.text, "ok")
+        self.assertEqual(
+            fake_post.await_args.kwargs["json"]["chat_template_kwargs"],
+            {"enable_thinking": True},
+        )
+        self.assertEqual(fake_post.await_args.kwargs["json"]["max_tokens"], 3072)
+
+    async def test_generate_keeps_qwen_think_injection(self) -> None:
+        from src.providers.nvidia_provider import NvidiaProvider
+
+        provider = NvidiaProvider(
+            "test-key",
+            RateTracker(),
+            thinking_enabled=True,
+            thinking_budget=1024,
+        )
+
+        class FakeResponse:
+            status_code = 200
+            text = "ok"
+
+            def json(self):
+                return {
+                    "choices": [{"message": {"content": "ok"}}],
+                    "model": "qwen/qwen3.5-397b-a17b",
+                    "usage": {},
+                }
+
+        fake_post = AsyncMock(return_value=FakeResponse())
+        provider._client = SimpleNamespace(post=fake_post)
+
+        await provider.generate(
+            "qwen/qwen3.5-397b-a17b",
+            [{"role": "user", "content": "hello"}],
+        )
+
+        self.assertEqual(
+            fake_post.await_args.kwargs["json"]["chat_template_kwargs"],
+            {"enable_thinking": True},
+        )
+        self.assertEqual(
+            fake_post.await_args.kwargs["json"]["messages"][-1]["content"],
+            "hello /think",
+        )
+
+    async def test_resolve_model_only_swaps_configured_primary_model(self) -> None:
+        from src.providers.nvidia_provider import NvidiaProvider
+
+        provider = NvidiaProvider(
+            "test-key",
+            RateTracker(),
+            thinking_enabled=True,
+            thinking_budget=1024,
+            thinking_model="google/gemma-4-31b-it",
+            primary_model="qwen/qwen3.5-397b-a17b",
+        )
+
+        self.assertEqual(
+            provider.resolve_model("qwen/qwen3.5-397b-a17b"),
+            "google/gemma-4-31b-it",
+        )
+        self.assertEqual(
+            provider.resolve_model("nvidia/nemotron-3-super-120b-a12b"),
+            "nvidia/nemotron-3-super-120b-a12b",
+        )
+        await provider.close()
+
     async def test_fallback_chain_skips_rate_limited_dedicated_thinking_model(self) -> None:
         from src.providers.nvidia_provider import NvidiaProvider
 
@@ -213,10 +309,11 @@ class NvidiaProviderTests(unittest.IsolatedAsyncioTestCase):
             tracker,
             thinking_enabled=True,
             thinking_budget=1024,
-            thinking_model="qwen/qwen3.5-122b-a10b",
+            thinking_model="google/gemma-4-31b-it",
+            primary_model="qwen/qwen3.5-397b-a17b",
         )
         provider._client = SimpleNamespace(post=AsyncMock())
-        tracker.record_limit_hit("qwen/qwen3.5-122b-a10b", 60)
+        tracker.record_limit_hit("google/gemma-4-31b-it", 60)
 
         backup = SimpleNamespace(
             generate=AsyncMock(
@@ -348,6 +445,49 @@ class ConversationRecordingTests(unittest.TestCase):
         self.assertEqual(recorded, [])
 
 
+class WebhookEnrichmentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_enrich_request_copies_previous_route_state_from_memory(self) -> None:
+        request = AgentRequest(
+            user_id="U1",
+            group_id="G1",
+            source_type="group",
+            chat_scope="multi",
+            text="我要詳細一點的深度分析報告",
+        )
+        fake_memory = SimpleNamespace(
+            to_openai_messages=lambda: [{"role": "user", "content": "給我英文聽力的練習建議和資源"}],
+            summary_text="",
+            last_agent="chat",
+            last_output_format="text",
+            last_task_description="提供英文聽力練習建議和資源",
+            last_routing_reasoning="一般文字任務",
+            last_disable_thinking=True,
+        )
+        fake_rate_limit = SimpleNamespace(check=Mock(return_value=(True, 9)))
+        fake_memory_service = SimpleNamespace(load_context=AsyncMock(return_value=fake_memory))
+
+        with patch.object(
+            webhook_handler,
+            "get_rate_limit_service",
+            return_value=fake_rate_limit,
+        ), patch.object(
+            webhook_handler,
+            "get_memory_service",
+            return_value=fake_memory_service,
+        ):
+            enriched = await webhook_handler.enrich_request(request)
+
+        self.assertEqual(
+            enriched.conversation_history,
+            [{"role": "user", "content": "給我英文聽力的練習建議和資源"}],
+        )
+        self.assertEqual(enriched.previous_agent, "chat")
+        self.assertEqual(enriched.previous_output_format, "text")
+        self.assertEqual(enriched.previous_task_description, "提供英文聽力練習建議和資源")
+        self.assertEqual(enriched.previous_routing_reasoning, "一般文字任務")
+        self.assertTrue(enriched.previous_disable_thinking)
+
+
 class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_load_context_logs_current_summary_content(self) -> None:
         service = memory_service_module.MemoryService(Settings(_env_file=None))
@@ -388,6 +528,13 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             }
         ]
         doc["recent_count"] = 1
+        doc["last_route"] = {
+            "agent": "chat",
+            "output_format": "text",
+            "task_description": "舊任務",
+            "reasoning": "舊理由",
+            "disable_thinking": True,
+        }
         service._memory_store["group::G1"] = doc
 
         with patch.object(memory_service_module.logger, "info") as log_info:
@@ -400,6 +547,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         cleared = service._memory_store["group::G1"]
         self.assertEqual(cleared["summary_text"], "")
         self.assertEqual(cleared["recent_messages"], [])
+        self.assertEqual(cleared["last_route"]["agent"], "")
         log_info.assert_any_call("[group:G1] Memory summary before !new: 舊的長期記憶")
         log_info.assert_any_call("[group:G1] Memory summary cleared by !new: (empty)")
 
@@ -412,7 +560,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         service = memory_service_module.MemoryService(
             Settings(
                 _env_file=None,
-                memory_recent_message_limit=5,
+                memory_recent_message_limit=6,
                 memory_summary_timeout_seconds=180,
             ),
             nvidia_provider=nvidia,
@@ -466,9 +614,38 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("既有摘要", summary_prompt)
         self.assertIn("現有長期記憶摘要（預設保留", summary_prompt)
         self.assertIn("不要因為主題切換就刪除舊的有效資訊", summary_prompt)
-        self.assertNotIn("User_1000: 第一個問題", summary_prompt)
+        self.assertIn("User_1000: 第一個問題", summary_prompt)
         self.assertIn("Assistant: 第一個回答", summary_prompt)
         self.assertIn("Assistant: 第三個回答", summary_prompt)
+
+    async def test_record_interaction_persists_last_route_state(self) -> None:
+        service = memory_service_module.MemoryService(Settings(_env_file=None))
+
+        await service.record_interaction(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+            user_id="U1",
+            user_text="今天新聞",
+            assistant_text="我幫你整理今天新聞",
+            agent_name="web_search",
+            output_format="voice",
+            task_description="查詢今天新聞並口語回答",
+            routing_reasoning="需要即時資訊",
+            disable_thinking=True,
+        )
+
+        memory = await service.load_context(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+        )
+
+        self.assertEqual(memory.last_agent, "web_search")
+        self.assertEqual(memory.last_output_format, "voice")
+        self.assertEqual(memory.last_task_description, "查詢今天新聞並口語回答")
+        self.assertEqual(memory.last_routing_reasoning, "需要即時資訊")
+        self.assertTrue(memory.last_disable_thinking)
 
     async def test_group_recent_memory_keeps_user_tags_for_multi_chat(self) -> None:
         service = memory_service_module.MemoryService(Settings(_env_file=None))
@@ -510,7 +687,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_recent_memory_stays_bounded_when_summary_provider_is_unavailable(self) -> None:
         service = memory_service_module.MemoryService(
-            Settings(_env_file=None, memory_recent_message_limit=5)
+            Settings(_env_file=None, memory_recent_message_limit=6)
         )
 
         await service.record_interaction(
@@ -537,6 +714,14 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             user_text="五",
             assistant_text="六",
         )
+        await service.record_interaction(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+            user_id="U1",
+            user_text="七",
+            assistant_text="八",
+        )
 
         memory = await service.load_context(
             source_type="user",
@@ -544,10 +729,10 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             chat_id="U1",
         )
 
-        self.assertEqual(memory.recent_count, 5)
+        self.assertEqual(memory.recent_count, 6)
         self.assertEqual(
             [message.content for message in memory.recent_messages],
-            ["二", "三", "四", "五", "六"],
+            ["三", "四", "五", "六", "七", "八"],
         )
 
     async def test_summary_timeout_logs_once_and_keeps_recent_memory_capped(self) -> None:
@@ -555,7 +740,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         service = memory_service_module.MemoryService(
             Settings(
                 _env_file=None,
-                memory_recent_message_limit=5,
+                memory_recent_message_limit=6,
                 memory_summary_timeout_seconds=180,
             ),
             nvidia_provider=nvidia,
@@ -588,6 +773,14 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 user_text="第五句",
                 assistant_text="第六句",
             )
+            await service.record_interaction(
+                source_type="user",
+                chat_scope="user",
+                chat_id="U1",
+                user_id="U1",
+                user_text="第七句",
+                assistant_text="第八句",
+            )
 
             await asyncio.gather(*list(service._summary_tasks.values()))
 
@@ -596,10 +789,10 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             chat_scope="user",
             chat_id="U1",
         )
-        self.assertEqual(memory.recent_count, 5)
+        self.assertEqual(memory.recent_count, 6)
         self.assertEqual(
             [message.content for message in memory.recent_messages],
-            ["第二句", "第三句", "第四句", "第五句", "第六句"],
+            ["第三句", "第四句", "第五句", "第六句", "第七句", "第八句"],
         )
         log_warning.assert_any_call(
             "[user:U1] Memory summary timed out after 180s; keeping the latest recent memory window"
@@ -1192,7 +1385,7 @@ class AgentTimeoutPropagationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fallback.generate.await_args.kwargs["thinking_timeout"], 24)
 
-    async def test_orchestrator_passes_thinking_timeout_to_fallback_chain(self) -> None:
+    async def test_orchestrator_disables_thinking_for_stable_json_routing(self) -> None:
         fallback = SimpleNamespace(
             generate=AsyncMock(
                 return_value=ProviderResponse(
@@ -1211,6 +1404,8 @@ class AgentTimeoutPropagationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fallback.generate.await_args.kwargs["thinking_timeout"], 9)
         self.assertEqual(fallback.generate.await_args.kwargs["max_tokens"], 384)
+        self.assertTrue(fallback.generate.await_args.kwargs["disable_thinking"])
+        self.assertFalse(fallback.generate.await_args.kwargs["require_reasoning_tokens"])
 
 
 class ImageGenPromptRefinementTests(unittest.IsolatedAsyncioTestCase):
@@ -1515,11 +1710,11 @@ class MainTargetBuilderTests(unittest.TestCase):
             ],
         )
 
-    def test_vision_targets_keep_only_reasoning_capable_target_when_available(self) -> None:
+    def test_vision_targets_keep_reasoning_capable_fallbacks(self) -> None:
         settings = Settings(
             _env_file=None,
             nvidia_model="qwen/qwen3.5-397b-a17b",
-            vision_fallback_model="google/gemma-3-27b-it:free",
+            vision_fallback_model="google/gemma-4-31b-it:free",
         )
         openrouter = object()
         nvidia = object()
@@ -1530,20 +1725,21 @@ class MainTargetBuilderTests(unittest.TestCase):
             targets,
             [
                 (nvidia, "qwen/qwen3.5-397b-a17b"),
+                (openrouter, "google/gemma-4-31b-it:free"),
             ],
         )
 
-    def test_vision_targets_keep_original_fallback_if_no_reasoning_target_exists(self) -> None:
+    def test_vision_targets_keep_reasoning_capable_fallback_without_nvidia(self) -> None:
         settings = Settings(
             _env_file=None,
             nvidia_api_key="",
-            vision_fallback_model="google/gemma-3-27b-it:free",
+            vision_fallback_model="google/gemma-4-31b-it:free",
         )
         openrouter = object()
 
         targets = main_module._build_vision_agent_targets(settings, openrouter, None)
 
-        self.assertEqual(targets, [(openrouter, "google/gemma-3-27b-it:free")])
+        self.assertEqual(targets, [(openrouter, "google/gemma-4-31b-it:free")])
 
 
 class LifespanInitTests(unittest.IsolatedAsyncioTestCase):
@@ -1588,6 +1784,54 @@ class LifespanInitTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
         self.assertEqual(openrouter_cls.call_args.kwargs["thinking_budget"], 1536)
+
+    async def test_lifespan_passes_nvidia_primary_and_thinking_models_to_provider(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            line_channel_secret="secret",
+            line_channel_access_token="token",
+            openrouter_api_key="key",
+            nvidia_api_key="nvidia-key",
+            nvidia_model="qwen/qwen3.5-397b-a17b",
+            nvidia_thinking_model="google/gemma-4-31b-it",
+            require_reasoning_models=False,
+        )
+        fake_openrouter = SimpleNamespace(close=AsyncMock())
+        fake_nvidia = SimpleNamespace(close=AsyncMock())
+
+        with patch.object(main_module, "get_settings", return_value=settings), patch.object(
+            main_module, "setup_logger"
+        ), patch.object(
+            main_module, "OpenRouterProvider", return_value=fake_openrouter
+        ), patch.object(
+            main_module, "NvidiaProvider", return_value=fake_nvidia
+        ) as nvidia_cls, patch.object(
+            main_module, "FallbackChain", return_value=object()
+        ), patch.object(
+            main_module, "Orchestrator", return_value=object()
+        ), patch.object(
+            main_module, "ChatAgent", return_value=object()
+        ), patch(
+            "src.agents.vision_agent.VisionAgent", return_value=object()
+        ), patch(
+            "src.agents.web_search_agent.WebSearchAgent", return_value=object()
+        ), patch(
+            "src.agents.image_gen_agent.ImageGenAgent", return_value=object()
+        ), patch.object(
+            main_module, "get_line_service", return_value=object()
+        ), patch.object(
+            main_module, "close_line_service", new=AsyncMock()
+        ), patch(
+            "src.services.scheduler_service.close_scheduler_service"
+        ), patch(
+            "src.services.web_search_service.close_web_search_service",
+            new=AsyncMock(),
+        ):
+            async with main_module.lifespan(main_module.app):
+                pass
+
+        self.assertEqual(nvidia_cls.call_args.kwargs["primary_model"], "qwen/qwen3.5-397b-a17b")
+        self.assertEqual(nvidia_cls.call_args.kwargs["thinking_model"], "google/gemma-4-31b-it")
 
 
 class SchedulerRegistrationTests(unittest.TestCase):
@@ -1971,6 +2215,32 @@ class OrchestratorFastRuleTests(unittest.TestCase):
         self.assertEqual(decision.agent, "vision")
         self.assertFalse(decision.disable_thinking)
 
+    def test_follow_up_detail_request_continues_previous_chat_route(self) -> None:
+        orchestrator = Orchestrator(
+            Settings(_env_file=None),
+            SimpleNamespace(),
+            targets=[],
+        )
+
+        decision = orchestrator._apply_fast_rules(
+            AgentRequest(
+                text="我要詳細一點的深度分析報告",
+                conversation_history=[
+                    {"role": "user", "content": "給我英文聽力的練習建議和資源"},
+                    {"role": "assistant", "content": "以下是英文聽力的練習建議與資源整理"},
+                ],
+                previous_agent="chat",
+                previous_output_format="text",
+                previous_task_description="提供英文聽力練習建議和資源",
+            )
+        )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.agent, "chat")
+        self.assertEqual(decision.output_format, "text")
+        self.assertIn("延續上一輪", decision.task_description)
+        self.assertFalse(decision.disable_thinking)
+
 
 class ConversationHistoryExpiryTests(unittest.TestCase):
     def test_get_history_prunes_expired_messages_from_deque(self) -> None:
@@ -2183,6 +2453,52 @@ class OrchestratorParsingTests(unittest.TestCase):
         self.assertEqual(decision.task_description, "回答翻譯需求")
         self.assertTrue(decision.disable_thinking)
 
+    def test_parse_llm_response_accepts_python_style_dict(self) -> None:
+        orchestrator = Orchestrator(
+            Settings(_env_file=None),
+            SimpleNamespace(),
+            targets=[],
+        )
+
+        decision = orchestrator._parse_llm_response(
+            "{'agent': 'web_search', 'output_format': 'voice', 'needs_thinking': False, 'task_description': '查詢今天新聞並口語回答', 'reasoning': '需要即時資訊'}",
+            "今天新聞念給我聽",
+        )
+
+        self.assertEqual(decision.agent, "web_search")
+        self.assertEqual(decision.output_format, "voice")
+        self.assertTrue(decision.disable_thinking)
+
+    def test_routing_messages_exclude_long_term_memory_summary(self) -> None:
+        orchestrator = Orchestrator(
+            Settings(_env_file=None),
+            SimpleNamespace(),
+            targets=[],
+        )
+
+        messages = orchestrator._build_routing_messages(
+            AgentRequest(
+                text="幫我整理一下",
+                memory_summary="使用者長期偏好：總是用語音回答",
+                conversation_history=[
+                    {"role": "user", "content": "之前聊過旅遊"},
+                    {"role": "assistant", "content": "好的"},
+                ],
+                previous_agent="chat",
+                previous_output_format="text",
+                previous_task_description="整理旅遊建議",
+            )
+        )
+
+        all_content = " ".join(
+            str(part.get("content", "")) if isinstance(part, dict) else str(part)
+            for part in messages
+            if isinstance(part, dict)
+        )
+        self.assertNotIn("使用者長期偏好", all_content)
+        self.assertIn("上一輪已完成 agent: chat", all_content)
+        self.assertIn("之前聊過旅遊", all_content)
+
     def test_parse_llm_response_inverts_needs_thinking_into_disable_thinking(self) -> None:
         orchestrator = Orchestrator(
             Settings(_env_file=None),
@@ -2224,6 +2540,34 @@ class OrchestratorParsingTests(unittest.TestCase):
 
         self.assertEqual(decision.agent, "chat")
         self.assertEqual(decision.output_format, "text")
+        self.assertTrue(decision.disable_thinking)
+
+
+class OrchestratorRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_llm_classify_retries_once_when_first_response_is_unparseable(self) -> None:
+        fallback = SimpleNamespace(
+            generate=AsyncMock(
+                side_effect=[
+                    ProviderResponse(text="我建議使用 chat agent", model="model-1"),
+                    ProviderResponse(
+                        text='{"agent":"chat","output_format":"text","needs_thinking":false,"task_description":"簡短回答","reasoning":"一般對話"}',
+                        model="model-1",
+                    ),
+                ]
+            )
+        )
+        orchestrator = Orchestrator(
+            Settings(_env_file=None),
+            fallback,
+            targets=[],
+        )
+
+        decision = await orchestrator._llm_classify(AgentRequest(text="你好"))
+
+        self.assertEqual(fallback.generate.await_count, 2)
+        self.assertTrue(fallback.generate.await_args_list[0].kwargs["disable_thinking"])
+        self.assertTrue(fallback.generate.await_args_list[1].kwargs["disable_thinking"])
+        self.assertEqual(decision.agent, "chat")
         self.assertTrue(decision.disable_thinking)
 
 

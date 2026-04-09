@@ -129,10 +129,20 @@ async def enrich_request(request: AgentRequest) -> AgentRequest:
         )
         request.conversation_history = memory.to_openai_messages()
         request.memory_summary = memory.summary_text
+        request.previous_agent = memory.last_agent
+        request.previous_output_format = memory.last_output_format
+        request.previous_task_description = memory.last_task_description
+        request.previous_routing_reasoning = memory.last_routing_reasoning
+        request.previous_disable_thinking = memory.last_disable_thinking
     except MemoryServiceError as e:
         logger.error(f"Memory context load failed: {e}")
         request.conversation_history = []
         request.memory_summary = ""
+        request.previous_agent = ""
+        request.previous_output_format = "text"
+        request.previous_task_description = ""
+        request.previous_routing_reasoning = ""
+        request.previous_disable_thinking = True
 
     return request
 

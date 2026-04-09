@@ -11,9 +11,10 @@ LLM classification only for ambiguous text.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from src.agents.base_agent import BaseAgent
 from src.config import Settings
@@ -129,15 +130,42 @@ _VOICE_OUTPUT_KEYWORDS = re.compile(
 _URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 _VALID_AGENTS = {"chat", "vision", "web_search", "image_gen"}
 _VALID_OUTPUTS = {"text", "voice", "image"}
+_JSONISH_TRANSLATION = str.maketrans(
+    {
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+        "：": ":",
+        "，": ",",
+    }
+)
 
 # Simple queries that don't need thinking — greetings, short chitchat, trivial requests
 _SIMPLE_QUERY_PATTERNS = re.compile(
     r"^("
     # Greetings / farewells
     r"(嗨|哈囉|你好|早安|午安|晚安|安安|掰掰|拜拜|再見|謝謝|感謝|好的|OK|ok|收到|了解|bye|hello|hi|hey|thanks|thank you|good morning|good night|gn|gm)"
-    # Very short messages (≤5 chars) that are likely chitchat
-    r"|.{1,5}"
     r")$",
+    re.IGNORECASE,
+)
+
+# Follow-up indicators: messages that reference prior context and need LLM routing.
+_FOLLOW_UP_INDICATORS = re.compile(
+    r"("
+    # Demonstratives / continuations referencing prior content
+    r"那(?:個|呢)?|然後呢?|接下來呢?|繼續|還有(?:呢|嗎)?"
+    r"|再說多一點|更多|多說一點|多講一點"
+    # Questions about what was just said
+    r"|什麼意思|為什麼|為何|怎麼說|怎麼辦|怎麼了"
+    # Explicit back-references
+    r"|上面|剛剛|前面|之前|上一(?:個|則|條|篇)|你剛"
+    # Continuation / expansion requests
+    r"|例如呢?|舉例|比如呢|詳細一點|再詳細一點|更詳細一點"
+    r"|深入一點|再深入一點|更深入一點|補充說明|延伸說明"
+    # English follow-ups
+    r"|go on|continue|more|and then|what about|what do you mean|why is that|how so"
+    r")",
     re.IGNORECASE,
 )
 
@@ -231,6 +259,26 @@ def _iter_json_candidates(text: str):
                     break
 
 
+def _load_jsonish_dict(candidate: str) -> dict | None:
+    normalized = candidate.strip().translate(_JSONISH_TRANSLATION)
+
+    try:
+        parsed = json.loads(normalized)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    pythonish = re.sub(r"\btrue\b", "True", normalized, flags=re.IGNORECASE)
+    pythonish = re.sub(r"\bfalse\b", "False", pythonish, flags=re.IGNORECASE)
+    pythonish = re.sub(r"\bnull\b", "None", pythonish, flags=re.IGNORECASE)
+
+    try:
+        parsed = ast.literal_eval(pythonish)
+        return parsed if isinstance(parsed, dict) else None
+    except (SyntaxError, ValueError):
+        return None
+
+
 def _should_disable_thinking(text: str, *, has_image: bool = False) -> bool:
     """Heuristic: return True for queries that don't need reasoning.
 
@@ -279,6 +327,131 @@ def _prefers_voice_output(text: str) -> bool:
     return not _prefers_text_output(text) and bool(_VOICE_OUTPUT_KEYWORDS.search(text))
 
 
+def _message_content_to_text(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
+                text = str(item.get("text", "")).strip()
+                if text:
+                    parts.append(text)
+            elif item.get("type") == "image_url":
+                parts.append("[圖片]")
+        return " ".join(parts).strip()
+
+    return str(content).strip()
+
+
+def _last_history_text(messages: list[dict] | None, role: str) -> str:
+    for message in reversed(messages or []):
+        if message.get("role") != role:
+            continue
+        text = _message_content_to_text(message.get("content", ""))
+        if text:
+            return text
+    return ""
+
+
+def _has_follow_up_context(request: AgentRequest) -> bool:
+    return bool(
+        request.previous_agent
+        or request.conversation_history
+        or request.quoted_message_id
+        or request.quoted_text
+        or request.quoted_image_base64
+        or request.quoted_image_url
+    )
+
+
+def _looks_like_follow_up(request: AgentRequest) -> bool:
+    if not request.text.strip() or not _has_follow_up_context(request):
+        return False
+
+    if (
+        request.quoted_message_id
+        or request.quoted_text
+        or request.quoted_image_base64
+        or request.quoted_image_url
+    ):
+        return True
+
+    return bool(_FOLLOW_UP_INDICATORS.search(request.text))
+
+
+def _infer_previous_agent(request: AgentRequest) -> str:
+    if request.previous_agent in _VALID_AGENTS:
+        return request.previous_agent
+
+    last_user_text = _last_history_text(request.conversation_history, "user")
+    last_assistant_text = _last_history_text(request.conversation_history, "assistant")
+    history_blob = " ".join(
+        part
+        for part in (
+            last_user_text,
+            last_assistant_text,
+            request.quoted_text.strip(),
+        )
+        if part
+    )
+
+    if any(
+        marker in history_blob
+        for marker in ("[使用者傳送圖片]", "[使用者引用圖片]", "[發送了圖片]", "[已傳送圖片]", "[圖片]")
+    ):
+        if _IMAGE_GEN_KEYWORDS.search(last_user_text) and not _IMAGE_GEN_NEGATIVES.search(last_user_text):
+            return "image_gen"
+        return "vision"
+
+    if last_user_text and _IMAGE_GEN_KEYWORDS.search(last_user_text) and not _IMAGE_GEN_NEGATIVES.search(last_user_text):
+        return "image_gen"
+
+    if last_user_text and (_URL_PATTERN.search(last_user_text) or _needs_web_search(last_user_text)):
+        return "web_search"
+
+    return "chat"
+
+
+def _infer_follow_up_output_format(request: AgentRequest, previous_agent: str) -> str:
+    current_text = request.text.strip()
+
+    if previous_agent == "image_gen":
+        return "image"
+
+    if _prefers_text_output(current_text):
+        return "text"
+    if _prefers_voice_output(current_text):
+        return "voice"
+
+    previous_output = request.previous_output_format.strip()
+    if previous_output in {"text", "voice"}:
+        return previous_output
+
+    last_user_text = _last_history_text(request.conversation_history, "user")
+    if _prefers_voice_output(last_user_text):
+        return "voice"
+    return "text"
+
+
+def _clip_text(text: str, limit: int = 80) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[: limit - 1]}…"
+
+
+def _build_follow_up_task_description(request: AgentRequest) -> str:
+    current_text = request.text.strip() or "延續上一輪主題回答使用者"
+    previous_task = request.previous_task_description.strip()
+    if previous_task:
+        return f"延續上一輪「{_clip_text(previous_task, 28)}」的脈絡，回應使用者續問：{current_text}"
+    return f"延續上一輪主題，回應使用者續問：{current_text}"
+
+
 class Orchestrator(BaseAgent):
     """Central dispatcher: fast rules + LLM classification."""
 
@@ -295,6 +468,88 @@ class Orchestrator(BaseAgent):
     async def process(self, request: AgentRequest) -> AgentResponse:
         """Not used directly — use route() instead."""
         raise NotImplementedError("Use Orchestrator.route()")
+
+    def _build_routing_messages(
+        self,
+        request: AgentRequest,
+        *,
+        system_override: str | None = None,
+    ) -> list[dict]:
+        """Build routing messages without long-term memory summaries.
+
+        Long-term memory is useful for downstream answer generation, but it can
+        distract the routing model away from the required single-line JSON
+        output. Keep quoted context and recent conversation history, but drop
+        the summary layer for classification stability.
+        """
+        routing_request = replace(request, memory_summary="")
+        messages = self._build_messages(routing_request, system_override=system_override)
+
+        context_lines: list[str] = []
+        if _looks_like_follow_up(routing_request):
+            context_lines.append("- 這次訊息疑似續問：是")
+
+        previous_agent = _infer_previous_agent(routing_request)
+        if routing_request.previous_agent:
+            context_lines.append(f"- 上一輪已完成 agent: {routing_request.previous_agent}")
+            context_lines.append(
+                f"- 上一輪 output_format: {routing_request.previous_output_format or 'text'}"
+            )
+            if routing_request.previous_task_description.strip():
+                context_lines.append(
+                    f"- 上一輪 task_description: {_clip_text(routing_request.previous_task_description, 120)}"
+                )
+            if routing_request.previous_routing_reasoning.strip():
+                context_lines.append(
+                    f"- 上一輪 routing_reasoning: {_clip_text(routing_request.previous_routing_reasoning, 120)}"
+                )
+        elif _has_follow_up_context(routing_request):
+            context_lines.append(f"- 從最近對話推定上一輪 agent: {previous_agent}")
+
+        last_user_text = _last_history_text(routing_request.conversation_history, "user")
+        last_assistant_text = _last_history_text(routing_request.conversation_history, "assistant")
+        if last_user_text:
+            context_lines.append(f"- 最近一則使用者訊息: {_clip_text(last_user_text, 120)}")
+        if last_assistant_text:
+            context_lines.append(f"- 最近一則助理回覆重點: {_clip_text(last_assistant_text, 160)}")
+
+        if context_lines:
+            context_message = {
+                "role": "user",
+                "content": (
+                    "以下是供路由判斷使用的結構化上下文，不是要你回答的內容：\n"
+                    + "\n".join(context_lines)
+                    + "\n若本輪是續問且沒有明確轉題，優先延續上一輪 agent。"
+                ),
+            }
+            insert_at = 1 if messages and messages[0].get("role") == "system" else 0
+            messages.insert(insert_at, context_message)
+
+        return messages
+
+    def _build_repair_messages(self, request: AgentRequest, raw_text: str) -> list[dict]:
+        repair_system = (
+            f"{self.system_prompt}\n\n"
+            "你上一則回覆無法被程式解析。\n"
+            "這次只允許輸出單行 JSON 物件；不要輸出任何前後說明、Markdown、註解、換行、額外文字、分析過程或推理步驟。\n"
+            "直接以 { 開頭輸出 JSON，不要有任何前導文字。"
+        )
+        messages = self._build_routing_messages(request, system_override=repair_system)
+        messages.append({"role": "assistant", "content": raw_text or "(empty)"})
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "請把你上一則回覆修正為可解析的單行 JSON。"
+                    "欄位固定為 agent、output_format、needs_thinking、task_description、reasoning。"
+                    "若不確定，請輸出保守結果：chat + text + needs_thinking=false。"
+                    "直接輸出 JSON，第一個字元必須是 {"
+                ),
+            }
+        )
+        # Assistant prefill to force the model to start with JSON
+        messages.append({"role": "assistant", "content": '{"agent":"'})
+        return messages
 
     async def route(self, request: AgentRequest) -> RouterDecision:
         """Determine which agent and output format to use."""
@@ -360,6 +615,17 @@ class Orchestrator(BaseAgent):
                 disable_thinking=no_think,
             )
 
+        if _looks_like_follow_up(request):
+            previous_agent = _infer_previous_agent(request)
+            if previous_agent in {"chat", "vision", "web_search"}:
+                return RouterDecision(
+                    previous_agent,
+                    _infer_follow_up_output_format(request, previous_agent),
+                    _build_follow_up_task_description(request),
+                    "follow-up continuation from previous route",
+                    disable_thinking=no_think,
+                )
+
         if _prefers_voice_output(text):
             return RouterDecision("chat", "voice", text, "voice output keywords", disable_thinking=no_think)
 
@@ -377,8 +643,13 @@ class Orchestrator(BaseAgent):
     # ── LLM classification ───────────────────────────────────
 
     async def _llm_classify(self, request: AgentRequest) -> RouterDecision:
-        """Use a lightweight LLM to classify ambiguous text."""
-        messages = self._build_messages(request)
+        """Use a lightweight LLM to classify ambiguous text.
+
+        Routing stays in non-thinking mode for JSON stability. The
+        ``needs_thinking`` field still controls whether downstream agents
+        should switch to a reasoning-capable model.
+        """
+        messages = self._build_routing_messages(request)
 
         try:
             resp = await self.fallback_chain.generate(
@@ -386,11 +657,45 @@ class Orchestrator(BaseAgent):
                 messages=messages,
                 temperature=self.settings.orchestrator_temperature,
                 max_tokens=self.settings.orchestrator_max_tokens,
-                require_reasoning_tokens=self.settings.require_reasoning_tokens,
+                require_reasoning_tokens=False,
                 thinking_timeout=self.settings.thinking_timeout_seconds,
+                disable_thinking=True,
             )
+            decision = self._try_parse_llm_response(resp.text or "", request.text)
+            if decision is not None:
+                return decision
 
-            return self._parse_llm_response(resp.text or "", request.text)
+            logger.warning(
+                f"Orchestrator LLM returned unparseable response, retrying once: "
+                f"{(resp.text or '')[:200]}"
+            )
+            repair_resp = await self.fallback_chain.generate(
+                targets=self.targets,
+                messages=self._build_repair_messages(request, resp.text or ""),
+                temperature=self.settings.orchestrator_temperature,
+                max_tokens=self.settings.orchestrator_max_tokens,
+                require_reasoning_tokens=False,
+                thinking_timeout=self.settings.thinking_timeout_seconds,
+                disable_thinking=True,
+            )
+            # Prepend the assistant prefill so the response completes the JSON
+            repair_text = '{"agent":"' + (repair_resp.text or "")
+            decision = self._try_parse_llm_response(repair_text, request.text)
+            if decision is not None:
+                logger.info("Orchestrator LLM parse recovered on strict retry")
+                return decision
+
+            logger.warning(
+                f"Orchestrator LLM returned unparseable response after retry: "
+                f"{(repair_resp.text or '')[:200]}"
+            )
+            return RouterDecision(
+                "chat",
+                "text",
+                request.text,
+                "could not parse LLM response",
+                disable_thinking=True,
+            )
         except Exception as e:
             logger.error(f"Orchestrator LLM classification failed: {e}")
             return RouterDecision(
@@ -401,43 +706,53 @@ class Orchestrator(BaseAgent):
                 disable_thinking=True,
             )
 
+    def _try_parse_llm_response(self, text: str, user_text: str) -> RouterDecision | None:
+        # Strip leading reasoning/narrative text before the first JSON brace
+        stripped = text
+        brace_idx = text.find("{")
+        if brace_idx > 0:
+            stripped = text[brace_idx:]
+
+        for candidate in _iter_json_candidates(stripped):
+            data = _load_jsonish_dict(candidate)
+            if not isinstance(data, dict):
+                continue
+
+            agent = data.get("agent", "chat")
+            output = data.get("output_format", "text")
+
+            if agent not in _VALID_AGENTS:
+                agent = "chat"
+
+            if output not in _VALID_OUTPUTS:
+                output = "text"
+
+            # Enforce consistency: image_gen ↔ image output
+            if agent == "image_gen":
+                output = "image"
+            elif output == "image" and agent != "image_gen":
+                output = "text"
+
+            # Default to non-thinking unless the classifier explicitly asks for it.
+            needs_thinking = data.get("needs_thinking", False)
+            if isinstance(needs_thinking, str):
+                needs_thinking = needs_thinking.lower() not in ("false", "no", "0")
+
+            return RouterDecision(
+                agent=agent,
+                output_format=output,
+                task_description=data.get("task_description") or user_text,
+                reasoning=data.get("reasoning", ""),
+                disable_thinking=not needs_thinking,
+            )
+
+        return None
+
     def _parse_llm_response(self, text: str, user_text: str) -> RouterDecision:
         """Parse the JSON response from the orchestrator LLM."""
-        for candidate in _iter_json_candidates(text):
-            try:
-                data = json.loads(candidate)
-                if not isinstance(data, dict):
-                    continue
-
-                agent = data.get("agent", "chat")
-                output = data.get("output_format", "text")
-
-                if agent not in _VALID_AGENTS:
-                    agent = "chat"
-
-                if output not in _VALID_OUTPUTS:
-                    output = "text"
-
-                # Enforce consistency: image_gen ↔ image output
-                if agent == "image_gen":
-                    output = "image"
-                elif output == "image" and agent != "image_gen":
-                    output = "text"
-
-                # Default to non-thinking unless the classifier explicitly asks for it.
-                needs_thinking = data.get("needs_thinking", False)
-                if isinstance(needs_thinking, str):
-                    needs_thinking = needs_thinking.lower() not in ("false", "no", "0")
-
-                return RouterDecision(
-                    agent=agent,
-                    output_format=output,
-                    task_description=data.get("task_description") or user_text,
-                    reasoning=data.get("reasoning", ""),
-                    disable_thinking=not needs_thinking,
-                )
-            except json.JSONDecodeError:
-                continue
+        decision = self._try_parse_llm_response(text, user_text)
+        if decision is not None:
+            return decision
 
         logger.warning(f"Orchestrator LLM returned unparseable response: {text[:200]}")
         return RouterDecision(

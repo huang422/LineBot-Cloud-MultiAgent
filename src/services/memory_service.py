@@ -21,6 +21,9 @@ from src.config import Settings, get_settings
 from src.providers.nvidia_provider import NvidiaProvider
 from src.utils.logger import logger
 
+_VALID_ROUTE_AGENTS = {"chat", "vision", "web_search", "image_gen"}
+_VALID_ROUTE_OUTPUTS = {"text", "voice", "image"}
+
 _SUMMARY_SYSTEM_PROMPT = (
     "你是對話長期記憶整理器。根據『現有長期記憶摘要』與『最近對話』，"
     "輸出更新後的唯一長期記憶摘要。"
@@ -67,6 +70,11 @@ class ChatMemory:
     last_summarized_at: float | None = None
     summary_model: str = ""
     summary_version: int = 0
+    last_agent: str = ""
+    last_output_format: str = "text"
+    last_task_description: str = ""
+    last_routing_reasoning: str = ""
+    last_disable_thinking: bool = True
 
     def to_openai_messages(self) -> list[dict]:
         return [
@@ -92,6 +100,48 @@ def _chat_key(source_type: str, chat_id: str) -> str:
 
 def _display_summary(summary_text: str) -> str:
     return summary_text if summary_text else "(empty)"
+
+
+def _default_last_route() -> dict[str, Any]:
+    return {
+        "agent": "",
+        "output_format": "text",
+        "task_description": "",
+        "reasoning": "",
+        "disable_thinking": True,
+    }
+
+
+def _normalize_last_route(raw_route: Any) -> dict[str, Any]:
+    if not isinstance(raw_route, dict):
+        raw_route = {}
+
+    agent = str(raw_route.get("agent", "")).strip()
+    if agent not in _VALID_ROUTE_AGENTS:
+        agent = ""
+
+    output_format = str(raw_route.get("output_format", "text")).strip() or "text"
+    if output_format not in _VALID_ROUTE_OUTPUTS:
+        output_format = "text"
+
+    if agent == "image_gen":
+        output_format = "image"
+    elif output_format == "image" and agent != "image_gen":
+        output_format = "text"
+
+    disable_thinking = raw_route.get("disable_thinking", True)
+    if isinstance(disable_thinking, str):
+        disable_thinking = disable_thinking.strip().lower() not in {"false", "0", "no", "off"}
+    else:
+        disable_thinking = bool(disable_thinking)
+
+    return {
+        "agent": agent,
+        "output_format": output_format,
+        "task_description": str(raw_route.get("task_description", "")).strip(),
+        "reasoning": str(raw_route.get("reasoning", "")).strip(),
+        "disable_thinking": disable_thinking,
+    }
 
 
 def _parse_recent_messages(raw_messages: list[dict] | None) -> list[MemoryMessage]:
@@ -191,6 +241,11 @@ class MemoryService:
         user_id: str,
         user_text: str,
         assistant_text: str,
+        agent_name: str = "",
+        output_format: str = "text",
+        task_description: str = "",
+        routing_reasoning: str = "",
+        disable_thinking: bool = True,
     ) -> None:
         source_type = _normalize_source_type(source_type)
         chat_scope = chat_scope or _normalize_chat_scope(source_type)
@@ -221,6 +276,16 @@ class MemoryService:
                     recent_messages = recent_messages[-self._recent_limit:]
                 doc["recent_messages"] = [asdict(message) for message in recent_messages]
                 doc["recent_count"] = len(recent_messages)
+                if agent_name.strip() or task_description.strip() or routing_reasoning.strip():
+                    doc["last_route"] = _normalize_last_route(
+                        {
+                            "agent": agent_name,
+                            "output_format": output_format,
+                            "task_description": task_description,
+                            "reasoning": routing_reasoning,
+                            "disable_thinking": disable_thinking,
+                        }
+                    )
                 doc["updated_at"] = time()
                 await self._save_document(
                     source_type=source_type,
@@ -269,6 +334,7 @@ class MemoryService:
                 doc["recent_count"] = 0
                 doc["summary_model"] = ""
                 doc["last_summarized_at"] = None
+                doc["last_route"] = _default_last_route()
                 doc["updated_at"] = time()
                 doc["summary_version"] = int(doc.get("summary_version", 0)) + 1
                 await self._save_document(
@@ -498,6 +564,7 @@ class MemoryService:
             "last_summarized_at": None,
             "summary_model": "",
             "summary_version": 0,
+            "last_route": _default_last_route(),
         }
 
     async def _load_document(
@@ -526,6 +593,7 @@ class MemoryService:
 
     def _document_to_chat_memory(self, document: dict[str, Any]) -> ChatMemory:
         recent_messages = _parse_recent_messages(document.get("recent_messages"))
+        last_route = _normalize_last_route(document.get("last_route"))
         return ChatMemory(
             chat_scope=str(document.get("chat_scope", "user")).strip() or "user",
             source_type=_normalize_source_type(document.get("source_type", "user")),
@@ -537,6 +605,11 @@ class MemoryService:
             last_summarized_at=document.get("last_summarized_at"),
             summary_model=str(document.get("summary_model", "")).strip(),
             summary_version=int(document.get("summary_version", 0)),
+            last_agent=last_route["agent"],
+            last_output_format=last_route["output_format"],
+            last_task_description=last_route["task_description"],
+            last_routing_reasoning=last_route["reasoning"],
+            last_disable_thinking=last_route["disable_thinking"],
         )
 
     def _log_summary_task_exception(self, task: asyncio.Task) -> None:

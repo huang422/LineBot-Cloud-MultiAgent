@@ -5,7 +5,7 @@
 [![Cloud Run](https://img.shields.io/badge/Cloud%20Run-GCP-4285F4?logo=googlecloud&logoColor=white)](https://cloud.google.com/run)
 [![LINE](https://img.shields.io/badge/LINE-Messaging%20API-00C300?logo=line&logoColor=white)](https://developers.line.biz/)
 [![NVIDIA](https://img.shields.io/badge/NVIDIA-Qwen3.5%20397B-76B900?logo=nvidia&logoColor=white)](https://build.nvidia.com/)
-[![OpenRouter](https://img.shields.io/badge/OpenRouter-Nemotron%20120B-6366F1)](https://openrouter.ai/)
+[![OpenRouter](https://img.shields.io/badge/OpenRouter-Gemma%204%2031B-6366F1)](https://openrouter.ai/)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Donate-orange.svg?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/huang422)
 
 
@@ -19,11 +19,11 @@ LineBot-Cloud-MultiAgent receives LINE webhook events, routes them through a sma
 
 ### Multi-Agent Orchestration
 
-Fast regex rules handle obvious requests without an LLM call; harder cases fall back to model-based routing. The orchestrator dispatches to four specialist agents — `chat`, `vision`, `web_search`, and `image_gen` — each with its own model configuration and system prompt.
+Fast regex rules handle obvious requests without an LLM call; harder cases fall back to model-based routing. The orchestrator dispatches to four specialist agents — `chat`, `vision`, `web_search`, and `image_gen` — each with its own model configuration and system prompt. For short follow-up turns, the router now also carries forward the previous routed agent / task state so continuation messages stay anchored to the prior context instead of relying on raw chat history alone.
 
 ### Adaptive Thinking Control
 
-The orchestrator does more than choose an agent: it also decides whether the downstream model should use provider-native reasoning / thinking mode for that specific request. **By default, requests run on the larger Qwen3.5 397B model without thinking for fast, high-quality responses.** Only clearly reasoning-heavy requests — for example step-by-step debugging, traceback / exception troubleshooting, proofs / derivations, deep planning, or full-length writing / translation — switch to the dedicated Qwen3.5 122B thinking model. If a thinking attempt runs too long, the fallback chain retries once with thinking disabled.
+The orchestrator does more than choose an agent: it also decides whether the downstream model should use provider-native reasoning / thinking mode for that specific request. **The orchestrator's own JSON routing stays in non-thinking mode for stability.** By default, downstream requests run on the larger Qwen3.5 397B model without thinking for fast, high-quality responses. Only clearly reasoning-heavy requests — for example step-by-step debugging, traceback / exception troubleshooting, proofs / derivations, deep planning, or full-length writing / translation — switch to the dedicated NVIDIA Gemma 4 31B thinking model. If a downstream thinking attempt runs too long, the fallback chain retries once with thinking disabled.
 
 ### Multi-Modal Input & Output
 
@@ -31,7 +31,7 @@ Text, images, quoted context, and voice replies all flow through the same webhoo
 
 ### Intelligent Provider Fallback
 
-Every agent call goes through a rate-limit-aware fallback chain. Exhausted models are skipped before sending a request, so a `429` moves to the next provider without waiting for a failed full response cycle. Text agents try NVIDIA Qwen3.5 397B (or 122B when thinking) → OpenRouter Nemotron → `openrouter/free`; vision tries NVIDIA → Gemma 3.
+Every agent call goes through a rate-limit-aware fallback chain. Exhausted models are skipped before sending a request, so a `429` moves to the next provider without waiting for a failed full response cycle. Text agents try NVIDIA Qwen3.5 397B (or NVIDIA Gemma 4 31B when thinking) → OpenRouter Nemotron → `openrouter/free`; vision uses NVIDIA Qwen3.5 397B and falls back to OpenRouter Gemma 4 31B.
 
 ### Image Generation with Description
 
@@ -43,7 +43,7 @@ User requests are first refined into optimized English prompts by the text LLM, 
 
 ### Layered Chat Memory
 
-Each `user` / `group` / `room` chat keeps a rolling **5-message recent text window** plus **one long-term summary**. When the recent window fills up, the app uses NVIDIA Qwen3.5 397B to compact `existing summary + latest 5 messages` into the next summary in the background, with a bias toward preserving still-valid long-term facts and preferences unless newer dialogue clearly invalidates them. Sending `!new` clears both layers for the current chat scope and replies with `Let's start a new chat!`.
+Each `user` / `group` / `room` chat keeps a rolling **6-message recent text window** plus **one long-term summary**. When the recent window fills up, the app uses NVIDIA Qwen3.5 397B to compact `existing summary + latest 6 messages` into the next summary in the background, with a bias toward preserving still-valid long-term facts and preferences unless newer dialogue clearly invalidates them. Sending `!new` clears both layers for the current chat scope and replies with `Let's start a new chat!`.
 
 ### Cloud-Only, One-Command Deploy
 
@@ -60,7 +60,7 @@ System prompts live in `prompts/*.md`, and most runtime tuning lives in `.env`. 
 | Feature | How it works |
 | --- | --- |
 | Chat | General conversation, coding help, translation, and creative replies via the fallback chain |
-| Adaptive thinking control | The orchestrator decides per request whether to switch to the dedicated thinking model; most requests stay on non-thinking 397B, while only clearly reasoning-heavy tasks activate the 122B model |
+| Adaptive thinking control | The orchestrator decides per request whether to switch to the dedicated thinking model; most requests stay on non-thinking 397B, while only clearly reasoning-heavy tasks activate NVIDIA Gemma 4 31B |
 | Vision | Accepts images, screenshots, and photos for analysis |
 | Web search | User queries are optimized into search keywords, then Tavily search results are fetched with topic/time/country hints and injected into the prompt before synthesis |
 | Webpage reading | If the user posts a URL, Tavily Extract fetches the page body and injects the webpage content into the prompt before synthesis |
@@ -108,7 +108,7 @@ This project is the next-generation successor to [LineBot-VLM-GroupAgent](https:
 
 - **Orchestrator**: OpenRouter `ORCHESTRATOR_MODEL`, then NVIDIA `ORCHESTRATOR_FALLBACK_MODEL` by default
 - **Text-centric agents (`chat`, `web_search`, image prompt refinement)**: NVIDIA `NVIDIA_MODEL` (or `NVIDIA_THINKING_MODEL` when thinking), then OpenRouter `AGENT_FALLBACK_MODEL`, then `openrouter/free`
-- **Vision**: NVIDIA `NVIDIA_MODEL`, then `VISION_FALLBACK_MODEL`
+- **Vision**: NVIDIA `NVIDIA_MODEL` (or `NVIDIA_THINKING_MODEL` when the primary NVIDIA leg needs thinking), then `VISION_FALLBACK_MODEL`
 
 The rate tracker skips exhausted models before sending a request, so a `429` can move to the next provider without waiting for a failed full response cycle.
 
@@ -121,9 +121,9 @@ The rate tracker skips exhausted models before sending a request, so a `429` can
 | Runtime | GCP Cloud Run |
 | Framework | FastAPI + Uvicorn |
 | Text LLM (default) | NVIDIA Qwen3.5 397B (non-thinking) |
-| Text reasoning LLM | NVIDIA Qwen3.5 122B (thinking) / OpenRouter Nemotron 120B |
-| Vision LLM | NVIDIA Qwen3.5 397B (thinking: 122B) |
-| Fallback LLMs | Nemotron 120B / Gemma 3 27B / `openrouter/free` (task-dependent) |
+| Text reasoning LLM | NVIDIA Gemma 4 31B (thinking) / OpenRouter Nemotron 120B |
+| Vision LLM | NVIDIA Qwen3.5 397B (primary) / NVIDIA Gemma 4 31B when thinking |
+| Fallback LLMs | NVIDIA Nemotron 3 Super 120B / OpenRouter Nemotron 120B / OpenRouter Gemma 4 31B / `openrouter/free` (task-dependent) |
 | Image generation | NVIDIA Stable Diffusion 3 (`stabilityai/stable-diffusion-3-medium`) |
 | Web search | Tavily |
 | Voice | `edge-tts` |
@@ -187,7 +187,7 @@ For detailed deployment options, GCS/scheduler setup, log monitoring, and troubl
 
 - `OPENROUTER_API_KEY` is part of the minimum setup because `/health` readiness and orchestrator primary routing depend on it.
 - Incoming audio is **not** transcribed yet. The bot currently supports **voice replies only**, not speech-to-text input.
-- The main prompt memory is now `1 long-term summary + up to 5 recent text messages` per chat. It is currently in-memory per instance, so it resets on redeploy and is not shared across multiple Cloud Run instances.
+- The main prompt memory is now `1 long-term summary + up to 6 recent text messages` per chat. It is currently in-memory per instance, so it resets on redeploy and is not shared across multiple Cloud Run instances.
 - Quoted-message cache, LINE push counters, and model rate-tracker state are still **in-memory per instance**.
 - `WEB_SEARCH_MONTHLY_QUOTA` is kept only for backward compatibility. The app no longer enforces a local search quota; actual availability depends on Tavily credentials and provider-side limits.
 - Relative search phrases like `today`, `latest` and `recent` are handled through keyword extraction plus Tavily topic/time-range targeting rather than by prefixing the raw query with a timestamp.
@@ -212,9 +212,9 @@ All settings are loaded from `.env`. See [.env.example](.env.example) for a read
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `NVIDIA_API_KEY` | — | [NVIDIA](https://build.nvidia.com) API key; enables Qwen3.5 397B/122B + image generation |
+| `NVIDIA_API_KEY` | — | [NVIDIA](https://build.nvidia.com) API key; enables Qwen3.5 397B / Gemma 4 31B + image generation |
 | `NVIDIA_MODEL` | `qwen/qwen3.5-397b-a17b` | NVIDIA primary model (non-thinking) |
-| `NVIDIA_THINKING_MODEL` | `qwen/qwen3.5-122b-a10b` | NVIDIA thinking model (auto-switched when deep reasoning needed) |
+| `NVIDIA_THINKING_MODEL` | `google/gemma-4-31b-it` | Dedicated NVIDIA thinking model (Gemma 4 31B; auto-switched when deep reasoning is needed) |
 | `TAVILY_API_KEY` | — | [Tavily](https://tavily.com) key for web search + URL extraction |
 | `GCS_BUCKET_NAME` | — | GCS bucket for voice/image delivery; required if you want generated images or TTS audio to reach LINE |
 | `GOOGLE_APPLICATION_CREDENTIALS` | — | Optional local-only GCP SDK credential JSON path; leave empty on Cloud Run |
@@ -229,22 +229,22 @@ All settings are loaded from `.env`. See [.env.example](.env.example) for a read
 | `OPENROUTER_THINKING_BUDGET` | `4096` | Extra completion tokens reserved for OpenRouter reasoning |
 | `NVIDIA_THINKING_ENABLED` | `true` | Enable thinking for NVIDIA models |
 | `NVIDIA_THINKING_BUDGET` | `4096` | Extra tokens reserved for model thinking |
-| `THINKING_TIMEOUT_SECONDS` | `150` | Abort a reasoning attempt after N seconds and retry once with thinking disabled; set `0` to disable |
+| `THINKING_TIMEOUT_SECONDS` | `180` | Abort a reasoning attempt after N seconds and retry once with thinking disabled; set `0` to disable |
 | `REQUIRE_REASONING_MODELS` | `true` | Only route to reasoning-capable models |
 | `REQUIRE_REASONING_TOKENS` | `true` | Warn when a reasoning model returns no reasoning content |
 
-These flags control provider-side reasoning support, but the actual on/off decision is made per request by the orchestrator. **By default, all requests use the larger 397B model without thinking.** Only clearly reasoning-heavy tasks — such as step-by-step debugging, traceback / exception troubleshooting, proofs / derivations, deep planning, or full-length writing / translation — switch to the dedicated 122B thinking model. When thinking mode activates, the provider automatically swaps from `NVIDIA_MODEL` to `NVIDIA_THINKING_MODEL`.
+These flags control provider-side reasoning support, but the actual on/off decision is made per request by the orchestrator for downstream agents. **The orchestrator's own routing classification stays non-thinking to keep JSON output stable.** By default, downstream requests use the larger 397B model without thinking. Only clearly reasoning-heavy tasks — such as step-by-step debugging, traceback / exception troubleshooting, proofs / derivations, deep planning, or full-length writing / translation — switch to the dedicated NVIDIA Gemma 4 31B thinking model. When thinking mode activates on the primary NVIDIA leg, the provider automatically swaps from `NVIDIA_MODEL` to `NVIDIA_THINKING_MODEL`. Explicit alternate NVIDIA targets such as `ORCHESTRATOR_FALLBACK_MODEL` keep their configured model ID and receive their native thinking flag instead. OpenRouter-hosted reasoning models continue to use OpenRouter's `reasoning` payload, while direct NVIDIA Gemma 4 and Nemotron 3 use `chat_template_kwargs.enable_thinking` automatically.
 
 ### Model routing
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `ORCHESTRATOR_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | Primary orchestrator model (OpenRouter) |
-| `ORCHESTRATOR_FALLBACK_MODEL` | `qwen/qwen3.5-122b-a10b` | Orchestrator NVIDIA fallback target (with default settings, this runs in thinking mode) |
+| `ORCHESTRATOR_FALLBACK_MODEL` | `nvidia/nemotron-3-super-120b-a12b` | Orchestrator NVIDIA fallback target; keeps Nemotron and uses NVIDIA's native thinking flag when needed |
 | `ORCHESTRATOR_TEMPERATURE` | `0` | Sampling temperature for LLM-based routing |
 | `ORCHESTRATOR_MAX_TOKENS` | `384` | Max tokens for orchestrator JSON routing output |
 | `AGENT_FALLBACK_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | Shared fallback for text agents |
-| `VISION_FALLBACK_MODEL` | `google/gemma-3-27b-it:free` | Vision agent fallback |
+| `VISION_FALLBACK_MODEL` | `google/gemma-4-31b-it:free` | Vision agent fallback |
 
 ### Per-agent tuning
 
@@ -280,8 +280,8 @@ These flags control provider-side reasoning support, but the actual on/off decis
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `MEMORY_RECENT_MESSAGE_LIMIT` | `5` | Recent text-message window size before compaction |
-| `MEMORY_SUMMARY_TIMEOUT_SECONDS` | `180` | Background summary timeout; on timeout the memory keeps the latest 5-message recent window |
+| `MEMORY_RECENT_MESSAGE_LIMIT` | `6` | Recent text-message window size before compaction |
+| `MEMORY_SUMMARY_TIMEOUT_SECONDS` | `180` | Background summary timeout; on timeout the memory keeps the latest 6-message recent window |
 | `MEMORY_SUMMARY_TEMPERATURE` | `0.2` | Summary compaction temperature |
 | `MEMORY_SUMMARY_MAX_TOKENS` | `384` | Max tokens for long-term summary updates |
 

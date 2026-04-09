@@ -26,7 +26,7 @@ async def run_openrouter_reasoning():
 
     import httpx
 
-    model = "nvidia/nemotron-3-super-120b-a12b:free"
+    model = os.getenv("ORCHESTRATOR_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
     print(f"\n{'='*60}")
     print(f"[OpenRouter] Testing reasoning with {model}")
     print(f"{'='*60}")
@@ -84,7 +84,7 @@ async def run_openrouter_reasoning():
 
 
 async def run_nvidia_thinking():
-    """Test NVIDIA Qwen3.5 with fixed top-level chat_template_kwargs."""
+    """Test NVIDIA Gemma 4 thinking with fixed top-level chat_template_kwargs."""
     api_key = os.getenv("NVIDIA_API_KEY", "")
     if not api_key or api_key.startswith("your_"):
         print("[SKIP] NVIDIA: no valid API key")
@@ -92,7 +92,7 @@ async def run_nvidia_thinking():
 
     import httpx
 
-    model = os.getenv("NVIDIA_MODEL", "qwen/qwen3.5-397b-a17b")
+    model = os.getenv("NVIDIA_THINKING_MODEL", "google/gemma-4-31b-it")
     print(f"\n{'='*60}")
     print(f"[NVIDIA] Testing thinking with {model}")
     print(f"  (fixed: chat_template_kwargs as top-level param)")
@@ -101,10 +101,10 @@ async def run_nvidia_thinking():
     payload = {
         "model": model,
         "messages": [
-            {"role": "user", "content": "What is 17 * 23? /think"}
+            {"role": "user", "content": "What is 17 * 23? Think step by step."}
         ],
-        "max_tokens": 8192,
-        "temperature": 0.6,
+        "max_tokens": 4096,
+        "temperature": 0,
         "chat_template_kwargs": {"enable_thinking": True},
     }
 
@@ -173,6 +173,8 @@ async def run_nvidia_provider_class():
         RateTracker(),
         thinking_enabled=True,
         thinking_budget=4096,
+        thinking_model=os.getenv("NVIDIA_THINKING_MODEL", "google/gemma-4-31b-it"),
+        primary_model=os.getenv("NVIDIA_MODEL", "qwen/qwen3.5-397b-a17b"),
     )
 
     try:

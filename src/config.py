@@ -77,20 +77,20 @@ class Settings(BaseSettings):
     # ── NVIDIA API ────────────────────────────────────────────
     nvidia_api_key: str = ""
     nvidia_model: str = "qwen/qwen3.5-397b-a17b"
-    nvidia_thinking_model: str = "qwen/qwen3.5-122b-a10b"
+    nvidia_thinking_model: str = "google/gemma-4-31b-it"
     nvidia_thinking_enabled: bool = True
     nvidia_thinking_budget: int = 4096
-    thinking_timeout_seconds: int = 150  # 0 disables the timeout retry behavior
+    thinking_timeout_seconds: int = 180  # 0 disables the timeout retry behavior
 
     # ── Orchestrator (routing / task dispatch) ────────────────
     orchestrator_model: str = "nvidia/nemotron-3-super-120b-a12b:free"
-    orchestrator_fallback_model: str = "qwen/qwen3.5-122b-a10b"
+    orchestrator_fallback_model: str = "nvidia/nemotron-3-super-120b-a12b"
     orchestrator_temperature: float = 0.0
     orchestrator_max_tokens: int = 384
 
     # ── Text agents / Vision fallback ─────────────────────────
     agent_fallback_model: str = "nvidia/nemotron-3-super-120b-a12b:free"
-    vision_fallback_model: str = "google/gemma-3-27b-it:free"
+    vision_fallback_model: str = "google/gemma-4-31b-it:free"
 
     # ── Per-agent temperature & max_tokens ────────────────────
     chat_temperature: float = 0.7
@@ -145,7 +145,7 @@ class Settings(BaseSettings):
     rate_limit_window_seconds: int = 60
 
     # ── Conversation Memory ───────────────────────────────────
-    memory_recent_message_limit: int = 5
+    memory_recent_message_limit: int = 6
     memory_summary_timeout_seconds: int = 180
     memory_summary_temperature: float = 0.2
     memory_summary_max_tokens: int = 384

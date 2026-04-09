@@ -14,6 +14,10 @@ class SettingsValidationTests(unittest.TestCase):
         settings = Settings(_env_file=None)
         self.assertEqual(settings.gcs_media_cleanup_delay_seconds, 172800)
 
+    def test_settings_default_memory_recent_limit_is_six(self) -> None:
+        settings = Settings(_env_file=None)
+        self.assertEqual(settings.memory_recent_message_limit, 6)
+
     def test_settings_allow_unlisted_model_ids(self) -> None:
         settings = Settings(
             _env_file=None,

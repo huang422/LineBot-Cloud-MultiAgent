@@ -1,6 +1,6 @@
 """Registry of model metadata used for local documentation/reference.
 
-Updated: 2026-03-20. The defaults in this project still point to free-tier-
+Updated: 2026-04-08. The defaults in this project still point to free-tier-
 friendly models, but configured model IDs are no longer hard-enforced against
 this catalog at runtime.
 """
@@ -36,11 +36,14 @@ _register(
     # --- NVIDIA hosted models ---
     ModelInfo("qwen/qwen3.5-397b-a17b", "Qwen3.5 397B", "397B MoE (17B active)", 262_144, vision=True, reasoning=True),
     ModelInfo("qwen/qwen3.5-122b-a10b", "Qwen3.5 122B", "122B MoE (10B active)", 262_144, vision=True, reasoning=True),
+    ModelInfo("google/gemma-4-31b-it", "Gemma 4 31B", "31B", 262_144, vision=True, tool_calling=True, reasoning=True),
+    ModelInfo("nvidia/nemotron-3-super-120b-a12b", "Nemotron 3 Super 120B", "120B MoE", 1_000_000, tool_calling=True, reasoning=True),
 
     # --- Largest text models (OpenRouter free) ---
     ModelInfo("qwen/qwen3-coder:free", "Qwen3 Coder 480B", "480B", 262_144, tool_calling=True),
     ModelInfo("nousresearch/hermes-3-llama-3.1-405b:free", "Hermes 3 405B", "405B", 131_072),
     ModelInfo("stepfun/step-3.5-flash:free", "Step 3.5 Flash", "196B MoE", 256_000, tool_calling=True, reasoning=True),
+    ModelInfo("google/gemma-4-31b-it:free", "Gemma 4 31B", "31B", 262_144, vision=True, tool_calling=True, reasoning=True),
     ModelInfo("nvidia/nemotron-3-super-120b-a12b:free", "Nemotron 3 Super 120B", "120B MoE", 262_144, tool_calling=True, reasoning=True),
     ModelInfo("openai/gpt-oss-120b:free", "GPT-OSS 120B", "120B MoE", 131_072, tool_calling=True),
     ModelInfo("qwen/qwen3-next-80b-a3b-instruct:free", "Qwen3 Next 80B", "80B", 262_144, tool_calling=True),

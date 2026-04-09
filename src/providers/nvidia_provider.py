@@ -33,7 +33,7 @@ class NvidiaProvider:
 
     Reasoning activation is model-family-specific:
     - Qwen3/3.5: ``/think`` soft switch + ``chat_template_kwargs`` (top-level).
-    - Nemotron 3 Nano/Super: ``chat_template_kwargs`` (top-level).
+    - Gemma 4 / Nemotron 3 Nano/Super: ``chat_template_kwargs`` (top-level).
     - Nemotron Super V1 / Ultra V1: system prompt ``"detailed thinking on"``.
     - GPT-OSS: ``reasoning_effort`` at top level.
     ``parse_openai_response`` extracts reasoning from all response formats.
@@ -49,12 +49,14 @@ class NvidiaProvider:
         thinking_enabled: bool = False,
         thinking_budget: int = 4096,
         thinking_model: str = "",
+        primary_model: str = "",
     ) -> None:
         self.api_key = api_key
         self.rate_tracker = rate_tracker
         self._thinking_enabled = thinking_enabled
         self._thinking_budget = thinking_budget
         self._thinking_model = thinking_model.strip()
+        self._primary_model = primary_model.strip()
         self._headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -71,6 +73,7 @@ class NvidiaProvider:
             and self._thinking_model
             and model != self._thinking_model
             and _supports_reasoning(model)
+            and (not self._primary_model or model == self._primary_model)
         ):
             return self._thinking_model
         return model
@@ -94,8 +97,8 @@ class NvidiaProvider:
         Reasoning mode depends on the model family (per official docs):
         - **Qwen3/3.5**: ``/think`` soft switch + ``chat_template_kwargs``
           (recommended temp=0.6, top_p=0.95).
+        - **Gemma 4 / Nemotron 3 Nano / Super**: ``chat_template_kwargs: {enable_thinking: true}``.
         - **Nemotron Super V1 / Ultra V1**: system prompt ``"detailed thinking on"``.
-        - **Nemotron 3 Nano / Super**: ``chat_template_kwargs: {enable_thinking: true}``.
         - **GPT-OSS**: ``reasoning_effort`` at top level.
         """
         from src.providers.model_registry import supports_reasoning as _supports_reasoning
@@ -115,6 +118,11 @@ class NvidiaProvider:
         elif expect_reasoning:
             logger.info(f"NVIDIA: thinking ON for {model}")
         model_lower = model.lower()
+        uses_chat_template_payload = (
+            "gemma-4" in model_lower
+            or "nemotron-3-" in model_lower
+            or "qwen" in model_lower
+        )
 
         # --- Explicit thinking deactivation ---
         if disable_thinking and self._thinking_enabled and "qwen" in model_lower:
@@ -140,7 +148,7 @@ class NvidiaProvider:
 
         # --- Model-family-specific reasoning activation (per official docs) ---
         if expect_reasoning:
-            if "nemotron-3-" in model_lower:
+            if "gemma-4" in model_lower or "nemotron-3-" in model_lower:
                 pass  # message injection not needed; payload handled below
             elif "nemotron" in model_lower:
                 # Nemotron Super V1 / Ultra V1: system prompt "detailed thinking on"
@@ -182,9 +190,10 @@ class NvidiaProvider:
                 if not injected:
                     logger.warning(f"Qwen /think: could not inject into messages for {model}")
 
-        # Qwen3 thinking mode needs extra tokens for <think> block
+        # Qwen3 and Gemma 4 reasoning both need extra room so the final answer
+        # is not squeezed out by thinking tokens.
         effective_max_tokens = max_tokens
-        if expect_reasoning and "qwen" in model_lower:
+        if expect_reasoning and ("qwen" in model_lower or "gemma-4" in model_lower):
             effective_max_tokens = self._thinking_budget + max_tokens
 
         payload: dict = {
@@ -197,13 +206,13 @@ class NvidiaProvider:
         if expect_reasoning:
             if "gpt-oss" in model_lower:
                 payload["reasoning_effort"] = "high"
-            elif "nemotron-3-" in model_lower or "qwen" in model_lower:
+            elif uses_chat_template_payload:
                 payload["chat_template_kwargs"] = {"enable_thinking": True}
             # Nemotron V1/Ultra: reasoning via system prompt (injected above).
         elif disable_thinking and self._thinking_enabled:
             # Explicitly disable thinking to prevent the model from
             # entering thinking mode by default.
-            if "nemotron-3-" in model_lower or "qwen" in model_lower:
+            if uses_chat_template_payload:
                 payload["chat_template_kwargs"] = {"enable_thinking": False}
 
         logger.info(

@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 venv/
 .vscode/
+.claude
 .DS_Store
 credentials.json
 /tmp/

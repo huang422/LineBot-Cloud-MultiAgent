@@ -287,6 +287,7 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         agent = SimpleNamespace(process=AsyncMock(return_value=response))
         orchestrator = SimpleNamespace(route=AsyncMock(return_value=decision))
+        memory_service = SimpleNamespace(record_interaction=AsyncMock())
 
         with patch.object(
             main_module, "get_line_service", return_value=line_service
@@ -303,6 +304,8 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             main_module, "_get_agent", return_value=agent
         ), patch.object(
+            main_module, "get_memory_service", return_value=memory_service
+        ), patch.object(
             main_module, "send_response", AsyncMock(return_value=True)
         ) as send_response, patch.object(
             main_module, "record_conversation"
@@ -316,6 +319,19 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         orchestrator.route.assert_awaited_once_with(request)
         agent.process.assert_awaited_once_with(request)
         send_response.assert_awaited_once_with(request, response)
+        memory_service.record_interaction.assert_awaited_once_with(
+            source_type="user",
+            chat_scope="user",
+            chat_id="G1",
+            user_id="U1",
+            user_text="幫我整理重點",
+            assistant_text="這是整理後的回覆",
+            agent_name="chat",
+            output_format="text",
+            task_description="整理使用者需求後回覆",
+            routing_reasoning="一般文字任務",
+            disable_thinking=False,
+        )
         line_service.send_text.assert_not_called()
         record_conversation.assert_called_once_with(
             request,

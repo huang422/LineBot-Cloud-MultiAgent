@@ -187,6 +187,7 @@ async def lifespan(app: FastAPI):
             thinking_enabled=settings.nvidia_thinking_enabled,
             thinking_budget=settings.nvidia_thinking_budget,
             thinking_model=settings.nvidia_thinking_model,
+            primary_model=settings.nvidia_model,
         )
         logger.info(
             f"NvidiaProvider initialized "
@@ -648,6 +649,11 @@ async def _process_event(event: dict) -> None:
                     user_id=request.user_id,
                     user_text=_build_user_memory_text(request),
                     assistant_text=_build_assistant_memory_text(response),
+                    agent_name=request.target_agent,
+                    output_format=request.output_format,
+                    task_description=request.task_description,
+                    routing_reasoning=request.routing_reasoning,
+                    disable_thinking=request.disable_thinking,
                 )
             except MemoryServiceError as e:
                 logger.error(f"Memory interaction record failed: {e}")

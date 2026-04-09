@@ -56,6 +56,19 @@ cp .env.example .env
 - `DEPLOY_KEEP_IMAGES`
 - `DEPLOY_ENABLE_APIS`
 
+目前預設模型組合也會跟著 `.env` / `.env.example` 一起部署：
+
+- `NVIDIA_THINKING_MODEL=google/gemma-4-31b-it`
+- `ORCHESTRATOR_MODEL=nvidia/nemotron-3-super-120b-a12b:free`
+- `ORCHESTRATOR_FALLBACK_MODEL=nvidia/nemotron-3-super-120b-a12b`
+- `VISION_FALLBACK_MODEL=google/gemma-4-31b-it:free`
+
+供應商不變：
+
+- 帶 `:free` 的預設模型仍走 OpenRouter
+- 不帶 `:free` 的 NVIDIA 模型仍走 build.nvidia.com
+- thinking 參數會由應用程式依供應商 / 模型家族自動套用，不需要另外修改 deploy 指令
+
 如果你有開：
 
 - `SCHEDULED_MESSAGES_ENABLED=true`

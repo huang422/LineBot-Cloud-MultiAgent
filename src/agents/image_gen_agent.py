@@ -2,8 +2,8 @@
 
 Stage 1: Text LLM (via fallback chain) refines the user's request into an
          optimised English image generation prompt (non-thinking mode).
-Stage 2: NVIDIA Stable Diffusion generates the actual image
-         (SD3 Medium primary → SD3.5 Large fallback).
+Stage 2: NVIDIA Visual GenAI NIM generates the actual image
+         (FLUX.1-dev by default).
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from src.providers.openrouter_provider import (
 from src.utils.logger import logger
 
 _PROMPT_REFINE_SYSTEM = (
-    "Convert the user's request into a detailed, optimized English prompt for Stable Diffusion image generation. "
+    "Convert the user's request into a detailed, optimized English prompt for FLUX.1-dev image generation. "
     "If a reference image is provided, preserve its important subject, composition, or style cues unless the user asks to change them. "
     "Output ONLY the prompt text, nothing else. "
     "Include: subject, style, lighting, composition, mood, color palette, camera angle, and any relevant details. "
@@ -77,7 +77,7 @@ class ImageGenAgent(BaseAgent):
 
         logger.info(f"[{request.request_id}] Stage 1 refined prompt: {refined_prompt[:100]}...")
 
-        # ── Stage 2: Generate image via NVIDIA SD (primary → fallback) ──
+        # ── Stage 2: Generate image via NVIDIA Visual GenAI NIM (primary → fallback) ──
         image_models = [self.settings.image_gen_primary_model]
         fallback = self.settings.image_gen_fallback_model.strip()
         if fallback and fallback != self.settings.image_gen_primary_model:

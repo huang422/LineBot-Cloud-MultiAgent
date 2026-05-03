@@ -276,11 +276,6 @@ gcloud artifacts docker images list \
 gcloud beta run services logs tail "$SERVICE_NAME" \
   --project "$PROJECT_ID" \
   --region "$REGION"
-
-gcloud beta run services logs tail linebot-cloud-agent \
-  --project terabanana \
-  --region us-west1
-
 ```
 
 如果這台機器沒有 `beta` 的 tail 指令，就改用下面這個**輪詢式監看**（實測可用）：
@@ -399,14 +394,106 @@ gcloud logging read \
 - `/health` 可能回 `200` 但 `ready_for_webhook=false`，要看 payload 不能只看 HTTP status。
 - 語音和圖片生成需要 `GCS_BUCKET_NAME`，沒設定時文字回覆仍正常。
 - 目前只支援**語音輸出**，不支援把使用者傳來的音訊自動轉文字。
-- 主 prompt 記憶是「1 份長期摘要 + 最多 5 則近期文字訊息」；目前仍是 **in-memory / per-instance**，重部署後會重置，多 instance 之間也不共享。
-- `!new` 會清空當前 user / group / room 的近期記憶與長期摘要，並回覆 `Let's start a new chat!`。
+- 主 prompt 記憶是「1 份長期摘要 + 最多 6 則近期文字訊息」。預設使用 **in-memory backend**（per-instance），重部署 / cold start 會重置；要長期保存請啟用下方的 **Firestore backend**。
+- `!new` 會清空當前 user / group / room 的近期記憶、長期摘要與 episodic recall 記錄，並回覆 `Let's start a new chat!`；跨聊天室的 `linebot_user_profile/{user_id}` 不會被 `!new` 刪除，需要時請在 Firestore 手動刪除。
 - 長期摘要內容會直接寫進 log（loaded / updated / cleared），請自行評估 Cloud Logging 的敏感資訊風險。
 - 引用訊息快取、LINE push 計數與模型 rate state 仍是 **in-memory / per-instance**；重部署後會重置，多 instance 之間也不共享。
 - 網路搜尋目前不做 app 內配額限制；真正可用額度以 Tavily free plan / API 回應為準。
 - Tavily 搜尋查詢會自動帶入目前日期時間，幫助「今天 / 最近 / 現在 / 最新」這類相對時間詞對齊到當下時點。
 - 排程訊息需要同時設定 `SCHEDULED_MESSAGES_ENABLED=true`、`LINE_PUSH_FALLBACK_ENABLED=true`、`SCHEDULED_GROUP_ID`、以及至少一個排程 job。
 - Prompts 從 `prompts/*.md` 載入，調整路由或語氣不需要改 Python 程式碼。
+
+---
+
+## 啟用 Firestore 持久化記憶（選用）
+
+Cloud Run 預設 `min-instances=0`，沒人聊天時 instance 會被回收，**in-memory 記憶會清空**。
+若希望跨 cold start / 多 instance 共享長期摘要與 user profile，可啟用 Firestore Native backend：
+
+### 1. 建立 Firestore Native database（與 Cloud Run 同 region 避免跨區流量費）
+
+```bash
+gcloud firestore databases create \
+  --project YOUR_PROJECT_ID \
+  --database='(default)' \
+  --location=us-west1 \
+  --type=firestore-native
+```
+
+> ℹ️ 一個 GCP project 只能有一個 `(default)` Firestore database；若已存在可直接沿用，
+> 或用具名 database（例：`--database=linebot-memory`）並把 `FIRESTORE_DATABASE` 設為相同名稱。
+
+### 2. 授權 Cloud Run service account 讀寫 Firestore
+
+```bash
+SA="$(gcloud run services describe ${SERVICE_NAME} \
+  --project YOUR_PROJECT_ID --region us-west1 \
+  --format='value(spec.template.spec.serviceAccountName)')"
+
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
+  --member="serviceAccount:${SA}" \
+  --role="roles/datastore.user"
+```
+
+### 3. 設定環境變數（Cloud Run / `.env`）
+
+```bash
+FIRESTORE_ENABLED=true
+FIRESTORE_PROJECT_ID=YOUR_PROJECT_ID
+FIRESTORE_DATABASE="(default)"
+FIRESTORE_COLLECTION_PREFIX=linebot
+FIRESTORE_LOCATION=us-west1
+MEMORY_CACHE_TTL_SECONDS=60
+LINE_PROFILE_CACHE_TTL_SECONDS=86400
+```
+
+部署後可從 `/health` 的 `memory.backend` 欄位確認目前使用的 backend（`in_memory` 或 `firestore`）。
+若 `google-cloud-firestore` 套件缺失或憑證不足，啟動時會印出 warning 並自動退回 in-memory，不會中斷服務。
+
+### 4. 免費額度提醒
+
+- Firestore Native 每天免費 **50K reads / 20K writes / 1 GiB 儲存**。
+- 本 bot 每輪對話約 1~2 reads + 1~3 writes（含 chat memory + user profile），個人用量遠低於免費額度。
+- 文件 ID 格式：`{source_type}::{chat_id}`（chat memory）、`{user_id}`（user profile），**不含 LINE token / 個資**，但長期摘要本身可能含使用者對話內容，請自行評估。
+- 想清空可在 Firestore console 直接刪除 collection，或用 `gcloud firestore` CLI；app 端傳 `!new` 則只清當前 chat scope（含對應的 episodes 子集合）。
+
+### 5. 啟用 Episodic Memory（向量檢索 + 自動 TTL）
+
+Phase B 會在每次 summary rotation 時，把舊摘要 + 最近訊息 + 1024 維向量寫入
+`{prefix}_episodes/{chat_key}/items/{auto_id}`，讓 chat agent 透過 `recall_memory`
+工具用語意檢索找出較舊的對話片段。要啟用向量搜尋必須建立 Vector Index：
+
+```bash
+# 建立 cosine 距離的向量索引（embedding 欄位 = 1024 維 nv-embedqa-e5-v5）
+gcloud firestore indexes composite create \
+  --project=YOUR_PROJECT_ID \
+  --database='(default)' \
+  --collection-group=items \
+  --query-scope=COLLECTION \
+  --field-config=vector-config='{"dimension":"1024","flat":"{}"}',field-path=embedding
+```
+
+> ℹ️ 索引建立會花數分鐘；建立完成前 `recall_memory` 會回傳空結果，但 chat agent
+> 會自動 fallback，不會中斷對話。
+
+設定 90 天自動清理舊 episodes（避免長期累積爆量）。程式會在每筆 episode 寫入 `expires_at = now + 90 days`：
+
+```bash
+gcloud firestore fields ttls update expires_at \
+  --project=YOUR_PROJECT_ID \
+  --database='(default)' \
+  --collection-group=items \
+  --enable-ttl
+```
+
+> Firestore TTL 會以 `expires_at` timestamp 欄位為準自動刪除過期文件。
+> 若要改保留週期，請在程式端調整 episode 寫入時的 `expires_at` 或自行設不同 TTL 策略。
+
+### 6. NVIDIA Embedding 模型
+
+- 使用免費的 `nvidia/nv-embedqa-e5-v5`（多語言，1024 維），共用既有 `NVIDIA_API_KEY`，無需另外設定 endpoint。
+- 若要改其他 embedding 模型，可在 Cloud Run 環境變數加 `NVIDIA_EMBEDDING_MODEL`、`NVIDIA_EMBEDDING_ENDPOINT`（皆為選填，內部自動讀取）。
+- Embedding 失敗會 graceful degrade：episode 仍會儲存（沒有向量欄位），只是無法被 `recall_memory` 找到。
 
 ---
 

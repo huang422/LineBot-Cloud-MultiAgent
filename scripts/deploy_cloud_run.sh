@@ -114,12 +114,28 @@ read_env_key() {
   python3 "$ROOT_DIR/scripts/envfile.py" get --file "$ENV_FILE" "$1" 2>/dev/null || true
 }
 
+is_placeholder_value() {
+  python3 "$ROOT_DIR/scripts/envfile.py" is-placeholder "$1" >/dev/null 2>&1
+}
+
 require_env_key() {
   local key="$1"
   local value
   value="$(read_env_key "$key")"
   if [[ -z "$value" ]]; then
     fail "Required env key missing or empty in $ENV_FILE: $key"
+  fi
+  if is_placeholder_value "$value"; then
+    fail "Required env key still uses an example placeholder in $ENV_FILE: $key"
+  fi
+}
+
+reject_placeholder_env_key() {
+  local key="$1"
+  local value
+  value="$(read_env_key "$key")"
+  if [[ -n "$value" ]] && is_placeholder_value "$value"; then
+    fail "Env key still uses an example placeholder in $ENV_FILE: $key. Set a real value or leave it empty."
   fi
 }
 
@@ -220,6 +236,10 @@ fi
 [[ -z "$ENABLE_APIS" ]] && ENABLE_APIS="true"
 ENABLE_APIS="$(normalize_bool "$ENABLE_APIS" 'DEPLOY_ENABLE_APIS / --skip-enable-apis')"
 
+if [[ -n "$PROJECT_ID" ]] && is_placeholder_value "$PROJECT_ID"; then
+  fail "GCP project is still an example placeholder. Set GCP_PROJECT_ID in $ENV_FILE, use --project-id, or run: gcloud config set project YOUR_PROJECT_ID"
+fi
+
 if [[ -z "$PROJECT_ID" ]]; then
   usage >&2
   fail "No GCP project configured. Set GCP_PROJECT_ID in $ENV_FILE, use --project-id, or run: gcloud config set project YOUR_PROJECT_ID"
@@ -240,6 +260,8 @@ fi
 require_env_key LINE_CHANNEL_SECRET
 require_env_key LINE_CHANNEL_ACCESS_TOKEN
 require_env_key OPENROUTER_API_KEY
+reject_placeholder_env_key NVIDIA_API_KEY
+reject_placeholder_env_key TAVILY_API_KEY
 
 SCHEDULED_MESSAGES_ENABLED_VALUE="$(read_env_key SCHEDULED_MESSAGES_ENABLED)"
 [[ -z "$SCHEDULED_MESSAGES_ENABLED_VALUE" ]] && SCHEDULED_MESSAGES_ENABLED_VALUE="false"

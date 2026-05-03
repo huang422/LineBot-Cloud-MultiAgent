@@ -26,5 +26,10 @@ opencc-python-reimplemented>=0.1.7
 # GCP Cloud Storage (for audio/image temp URLs)
 google-cloud-storage>=2.14.0
 
+# GCP Firestore Native (persistent long-term memory; optional)
+# Free tier: 50K reads / 20K writes / 1 GiB storage per day.
+# Disable via FIRESTORE_ENABLED=false to fall back to in-memory.
+google-cloud-firestore>=2.16.0
+
 # Scheduler (weekly/yearly scheduled messages)
 APScheduler>=3.10.0

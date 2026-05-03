@@ -35,7 +35,7 @@ Every agent call goes through a rate-limit-aware fallback chain. Exhausted model
 
 ### Image Generation with Description
 
-User requests are first refined into optimized English prompts by the text LLM, then passed to NVIDIA Stable Diffusion 3. Prompt refinement and user-facing description generation run in parallel for lower latency. The image is uploaded to GCS and delivered as a LINE image message alongside a text description.
+User requests are first refined into optimized English prompts by the text LLM, then passed to NVIDIA FLUX.1-dev through the existing NVIDIA Visual GenAI NIM API. Prompt refinement and user-facing description generation run in parallel for lower latency. The image is uploaded to GCS and delivered as a LINE image message alongside a text description.
 
 ### Voice Replies
 
@@ -43,7 +43,26 @@ User requests are first refined into optimized English prompts by the text LLM, 
 
 ### Layered Chat Memory
 
-Each `user` / `group` / `room` chat keeps a rolling **6-message recent text window** plus **one long-term summary**. When the recent window fills up, the app uses NVIDIA Qwen3.5 397B to compact `existing summary + latest 6 messages` into the next summary in the background, with a bias toward preserving still-valid long-term facts and preferences unless newer dialogue clearly invalidates them. Sending `!new` clears both layers for the current chat scope and replies with `Let's start a new chat!`.
+Each `user` / `group` / `room` chat keeps a rolling **6-message recent text window** plus **one long-term summary**. When the recent window fills up, the app uses NVIDIA Qwen3.5 397B to compact `existing summary + latest 6 messages` into the next summary in the background, with a bias toward preserving still-valid long-term facts and preferences unless newer dialogue clearly invalidates them. Sending `!new` clears the current chat scope's recent window, summary, and episodic recall records, then replies with `Let's start a new chat!`.
+
+For groups and rooms, non-triggered user text can also be buffered and batch-persisted into memory so a later `!hej` / @mention turn can still see the surrounding thread without forcing a write for every single message.
+
+Memory is stored through a pluggable backend layer:
+
+- **`InMemoryBackend`** (default) — fast, no external dependencies, but resets on Cloud Run scale-to-zero. Suitable for local dev and tests.
+- **`FirestoreBackend`** (opt-in) — persists `chat_memory/{source_type}::{chat_id}` and `user_profile/{user_id}` documents in Firestore Native, surviving cold starts and multi-instance deployments. Stays inside the Firestore free tier (50K reads / 20K writes / 1 GiB per day) when the database is co-located with Cloud Run (e.g. `us-west1`). Enable by setting `FIRESTORE_ENABLED=true` and `FIRESTORE_PROJECT_ID=<gcp-project>` (see `.env.example`).
+
+In addition to the chat-scoped memory, the bot maintains a **per-user profile** (`user_profile/{user_id}`) that is shared across DMs and groups. Phase A populates it with the LINE `displayName` (resolved via `/v2/bot/profile/{userId}` or `/v2/bot/{group|room}/{id}/member/{userId}` depending on context) and `last_seen` metadata. Phase B lets the LLM actively extend the profile via the `update_user_profile` tool when the user volunteers durable facts (nickname, hobbies, location). `!new` intentionally does not delete this cross-chat profile; remove that document manually from Firestore if a user needs a full profile reset.
+
+### Native Tool Calling for Chat Agent
+
+The chat agent now ships with an OpenAI-style **agentic tool loop**. While a normal reply is being generated, the LLM can decide to invoke tools and re-enter the loop with the results — no orchestrator round-trip required:
+
+- **`recall_memory(query, k)`** — vector-search older episodic snapshots stored in Firestore (`{prefix}_episodes/...`). Episodes are written automatically on every summary rotation using free NVIDIA `nv-embedqa-e5-v5` embeddings (1024-dim). When the user references something older than the recent window, the model can pull just the relevant snippet on demand instead of carrying everything in the prompt.
+- **`update_user_profile(facts, confidence)`** — persists durable user facts into `user_profile/{user_id}`. Confidence-gated (>= 0.7) and capped at 20 facts.
+- **`web_search(query)`** — fallback web search via Tavily when the orchestrator's fast-rules did not pre-route to the dedicated `web_search` agent (dual-track design). Fast-rule routing for news / URLs / finance still wins by default, but the LLM can also pull live data on its own.
+
+The tool loop falls back to a plain `fallback_chain.generate()` call on any error so users always get a reply, and the iteration count is hard-capped by `tool_loop_max_iterations` (default 4) to keep request budgets bounded.
 
 ### Cloud-Only, One-Command Deploy
 
@@ -64,7 +83,7 @@ System prompts live in `prompts/*.md`, and most runtime tuning lives in `.env`. 
 | Vision | Accepts images, screenshots, and photos for analysis |
 | Web search | User queries are optimized into search keywords, then Tavily search results are fetched with topic/time/country hints and injected into the prompt before synthesis |
 | Webpage reading | If the user posts a URL, Tavily Extract fetches the page body and injects the webpage content into the prompt before synthesis |
-| Image generation | Prompt refinement and description generation run in parallel, then NVIDIA Stable Diffusion 3 generates the image; both image and text description are delivered together |
+| Image generation | Prompt refinement and description generation run in parallel, then NVIDIA FLUX.1-dev generates the image; both image and text description are delivered together |
 | Voice reply | `edge-tts` produces audio, uploads it to GCS, and sends a LINE audio reply |
 | Quoted context | Reply to an earlier text or image and recover the original content from local cache |
 | Scheduled messages | APScheduler can send recurring group reminders and yearly birthday messages |
@@ -85,7 +104,7 @@ This project is the next-generation successor to [LineBot-VLM-GroupAgent](https:
 | LLM Provider | Ollama (single local model) | NVIDIA + OpenRouter (multi-provider fallback) |
 | Architecture | Single model, serial queue | Multi-agent orchestrator with parallel dispatch |
 | Vision Model | Qwen3.5 9B/35B (local) | Qwen3.5 397B VLM (NVIDIA API) |
-| Image Generation | Not supported | NVIDIA Stable Diffusion 3 (two-stage pipeline) |
+| Image Generation | Not supported | NVIDIA FLUX.1-dev (two-stage pipeline) |
 | Voice Reply | Not supported | edge-tts + GCS signed URL |
 | Reasoning | Ollama thinking mode (may OOM) | Provider-native thinking with token budget control |
 | Resilience | Single point of failure | Auto-fallback across providers and models |
@@ -124,7 +143,7 @@ The rate tracker skips exhausted models before sending a request, so a `429` can
 | Text reasoning LLM | NVIDIA Gemma 4 31B (thinking) / OpenRouter Nemotron 120B |
 | Vision LLM | NVIDIA Qwen3.5 397B (primary) / NVIDIA Gemma 4 31B when thinking |
 | Fallback LLMs | NVIDIA Nemotron 3 Super 120B / OpenRouter Nemotron 120B / OpenRouter Gemma 4 31B / `openrouter/free` (task-dependent) |
-| Image generation | NVIDIA Stable Diffusion 3 (`stabilityai/stable-diffusion-3-medium`) |
+| Image generation | NVIDIA FLUX.1-dev (`black-forest-labs/flux.1-dev`) |
 | Web search | Tavily |
 | Voice | `edge-tts` |
 | Object storage | Google Cloud Storage |
@@ -187,7 +206,7 @@ For detailed deployment options, GCS/scheduler setup, log monitoring, and troubl
 
 - `OPENROUTER_API_KEY` is part of the minimum setup because `/health` readiness and orchestrator primary routing depend on it.
 - Incoming audio is **not** transcribed yet. The bot currently supports **voice replies only**, not speech-to-text input.
-- The main prompt memory is now `1 long-term summary + up to 6 recent text messages` per chat. It is currently in-memory per instance, so it resets on redeploy and is not shared across multiple Cloud Run instances.
+- The main prompt memory is `1 long-term summary + up to 6 recent text messages` per chat. It defaults to in-memory per instance; set `FIRESTORE_ENABLED=true` to persist chat memory, user profile, and episodic recall across redeploys / cold starts.
 - Quoted-message cache, LINE push counters, and model rate-tracker state are still **in-memory per instance**.
 - `WEB_SEARCH_MONTHLY_QUOTA` is kept only for backward compatibility. The app no longer enforces a local search quota; actual availability depends on Tavily credentials and provider-side limits.
 - Relative search phrases like `today`, `latest` and `recent` are handled through keyword extraction plus Tavily topic/time-range targeting rather than by prefixing the raw query with a timestamp.
@@ -212,7 +231,7 @@ All settings are loaded from `.env`. See [.env.example](.env.example) for a read
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `NVIDIA_API_KEY` | — | [NVIDIA](https://build.nvidia.com) API key; enables Qwen3.5 397B / Gemma 4 31B + image generation |
+| `NVIDIA_API_KEY` | — | [NVIDIA](https://build.nvidia.com) API key; enables Qwen3.5 397B / Gemma 4 31B, embeddings, and image generation |
 | `NVIDIA_MODEL` | `qwen/qwen3.5-397b-a17b` | NVIDIA primary model (non-thinking) |
 | `NVIDIA_THINKING_MODEL` | `google/gemma-4-31b-it` | Dedicated NVIDIA thinking model (Gemma 4 31B; auto-switched when deep reasoning is needed) |
 | `TAVILY_API_KEY` | — | [Tavily](https://tavily.com) key for web search + URL extraction |
@@ -259,7 +278,7 @@ These flags control provider-side reasoning support, but the actual on/off decis
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `IMAGE_GEN_PRIMARY_MODEL` | `stabilityai/stable-diffusion-3-medium` | Primary NVIDIA image model |
+| `IMAGE_GEN_PRIMARY_MODEL` | `black-forest-labs/flux.1-dev` | Primary NVIDIA Visual GenAI NIM image model |
 | `IMAGE_GEN_FALLBACK_MODEL` | — | Fallback image model |
 | `IMAGE_GEN_STEPS` | `50` | Diffusion steps |
 | `IMAGE_GEN_CFG_SCALE` | `5` | Classifier-free guidance scale |
@@ -285,14 +304,25 @@ These flags control provider-side reasoning support, but the actual on/off decis
 | `MEMORY_SUMMARY_TEMPERATURE` | `0.2` | Summary compaction temperature |
 | `MEMORY_SUMMARY_MAX_TOKENS` | `384` | Max tokens for long-term summary updates |
 
+### Persistent memory / episodic recall (optional)
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `FIRESTORE_ENABLED` | `false` | Keep `false` for free/local in-memory mode; set `true` to persist memory in Firestore Native |
+| `FIRESTORE_PROJECT_ID` | — | Firestore project; leave empty on Cloud Run to use the runtime project |
+| `FIRESTORE_DATABASE` | `(default)` | Firestore database name |
+| `FIRESTORE_COLLECTION_PREFIX` | `linebot` | Prefix for chat memory, user profile, and episode collections |
+| `MEMORY_CACHE_TTL_SECONDS` | `60` | Local read-through cache TTL to reduce Firestore reads |
+| `LINE_PROFILE_CACHE_TTL_SECONDS` | `86400` | LINE displayName cache TTL |
+| `NVIDIA_EMBEDDING_MODEL` | `nvidia/nv-embedqa-e5-v5` | Embedding model for episodic recall; only used when `NVIDIA_API_KEY` is set |
+| `NVIDIA_EMBEDDING_ENDPOINT` | NVIDIA embeddings API | Optional custom embeddings endpoint |
+
 ### Bot & conversation
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `BOT_NAME` | `Assistant` | Bot display name in prompts |
 | `LINE_BOT_USER_ID` | — | Bot's LINE userId for precise @mention detection |
-| `MAX_CONVERSATION_HISTORY` | `10` | Legacy in-memory passive conversation cache size |
-| `CONVERSATION_TTL_SECONDS` | `3600` | Legacy in-memory passive conversation cache expiry |
 | `TTS_ENABLED` | `true` | Enable voice replies (incoming audio transcription is not included) |
 | `TTS_VOICE` | `zh-TW-HsiaoChenNeural` | [edge-tts](https://github.com/rany2/edge-tts) voice |
 

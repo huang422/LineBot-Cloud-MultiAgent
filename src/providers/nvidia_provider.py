@@ -1,8 +1,8 @@
 """NVIDIA API provider — chat completions + image generation endpoints.
 
 Chat completions use the OpenAI-compatible endpoint on build.nvidia.com.
-Image generation uses the dedicated Stable Diffusion endpoints on
-ai.api.nvidia.com with model-specific request/response formats.
+Image generation uses NVIDIA Visual GenAI NIM endpoints on ai.api.nvidia.com
+with model-specific request/response formats.
 """
 
 from __future__ import annotations
@@ -21,10 +21,12 @@ from src.utils.rate_tracker import RateTracker
 # NVIDIA image generation endpoint base
 _IMAGE_GEN_BASE = "https://ai.api.nvidia.com/v1/genai"
 
-# Model-specific endpoint mapping
-_IMAGE_MODEL_ENDPOINTS = {
-    "stabilityai/stable-diffusion-3-medium": f"{_IMAGE_GEN_BASE}/stabilityai/stable-diffusion-3-medium",
-    "stabilityai/stable-diffusion-3.5-large": f"{_IMAGE_GEN_BASE}/stabilityai/stable-diffusion-3.5-large",
+# Model-specific endpoint mapping. NVIDIA's public FLUX endpoint uses the
+# lowercase slug even though the model is commonly written as FLUX.1-dev.
+_FLUX_1_DEV_MODEL = "black-forest-labs/flux.1-dev"
+_IMAGE_MODEL_ENDPOINTS: dict[str, str] = {
+    _FLUX_1_DEV_MODEL: f"{_IMAGE_GEN_BASE}/{_FLUX_1_DEV_MODEL}",
+    "black-forest-labs/FLUX.1-dev": f"{_IMAGE_GEN_BASE}/{_FLUX_1_DEV_MODEL}",
 }
 
 
@@ -91,6 +93,8 @@ class NvidiaProvider:
         modalities: list[str] | None = None,
         require_reasoning_tokens: bool = False,
         disable_thinking: bool = False,
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
     ) -> ProviderResponse:
         """Call NVIDIA chat completions API and return a unified response.
 
@@ -215,6 +219,11 @@ class NvidiaProvider:
             if uses_chat_template_payload:
                 payload["chat_template_kwargs"] = {"enable_thinking": False}
 
+        if tools:
+            payload["tools"] = tools
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
+
         logger.info(
             f"NVIDIA request → {model} "
             f"(temp={temperature}, max_tok={max_tokens}, "
@@ -244,7 +253,7 @@ class NvidiaProvider:
         except ValueError as e:
             logger.error(f"NVIDIA returned invalid JSON for {model}: {e}")
             raise ProviderError(model, resp.status_code, "Invalid JSON response", provider="NVIDIA") from e
-        text, images, reasoning_content = parse_openai_response(data)
+        text, images, reasoning_content, tool_calls, raw_message = parse_openai_response(data)
 
         usage = data.get("usage")
         reasoning_tokens = (usage or {}).get("reasoning_tokens", 0)
@@ -274,6 +283,8 @@ class NvidiaProvider:
             model=data.get("model", model),
             usage=usage,
             reasoning_content=reasoning_content,
+            tool_calls=tool_calls,
+            raw_message=raw_message,
         )
 
     # ── Image Generation ──────────────────────────────────────
@@ -289,19 +300,30 @@ class NvidiaProvider:
         width: int = 1024,
         height: int = 1024,
     ) -> ProviderResponse:
-        """Call NVIDIA image generation API (Stable Diffusion models).
+        """Call NVIDIA Visual GenAI NIM image generation API.
 
-        Supports SD3 Medium and SD3.5 Large with their different API formats.
         Returns a ProviderResponse with base64 image data in images[].
         """
-        model = model.strip()
-        endpoint = _IMAGE_MODEL_ENDPOINTS.get(model)
-        if not endpoint:
-            raise ProviderError(model, 400, f"Unknown NVIDIA image model: {model}", provider="NVIDIA")
+        requested_model = model.strip()
+        if not requested_model:
+            raise ProviderError("<empty>", 400, "Model ID must not be empty", provider="NVIDIA")
+        model = _normalize_image_model(requested_model)
+        endpoint = _IMAGE_MODEL_ENDPOINTS.get(model, f"{_IMAGE_GEN_BASE}/{model}")
 
+        is_flux = _is_flux_model(model)
         is_sd35 = "3.5" in model
+        is_qwen_image = _is_qwen_image_model(model)
         payload = self._build_image_payload(
-            model, prompt, negative_prompt, steps, cfg_scale, width, height, is_sd35
+            model,
+            prompt,
+            negative_prompt,
+            steps,
+            cfg_scale,
+            width,
+            height,
+            is_flux,
+            is_sd35,
+            is_qwen_image,
         )
 
         logger.info(f"NVIDIA image request → {model} (steps={steps}, {width}x{height})")
@@ -330,7 +352,7 @@ class NvidiaProvider:
             logger.error(f"NVIDIA image returned invalid JSON for {model}: {e}")
             raise ProviderError(model, resp.status_code, "Invalid JSON response", provider="NVIDIA") from e
 
-        base64_image, finish_reason = self._parse_image_response(data, is_sd35)
+        base64_image, finish_reason = self._parse_image_response(data)
 
         if finish_reason == "CONTENT_FILTERED":
             logger.warning(f"NVIDIA image {model}: content filtered")
@@ -341,7 +363,7 @@ class NvidiaProvider:
             return ProviderResponse(model=model)
 
         # Return as data URL so downstream can handle uniformly
-        data_url = f"data:image/jpeg;base64,{base64_image}"
+        data_url = f"data:image/png;base64,{base64_image}"
         logger.info(f"NVIDIA image response ← {model} (success)")
 
         return ProviderResponse(
@@ -358,12 +380,49 @@ class NvidiaProvider:
         cfg_scale: int,
         width: int,
         height: int,
+        is_flux: bool,
         is_sd35: bool,
+        is_qwen_image: bool = False,
     ) -> dict:
         """Build the request payload based on model variant."""
-        if is_sd35:
-            # SD 3.5 Large uses width/height
+        if is_qwen_image:
+            # NVIDIA NIM Qwen-Image schema. The endpoint accepts only
+            # ``prompt`` / ``mode`` / ``seed`` / ``steps`` and *both*
+            # ``width`` & ``height`` together (or neither). Sending
+            # ``cfg_scale`` / ``samples`` / ``num_inference_steps``
+            # results in HTTP 422. Steps default to a small value
+            # (4–8 typical) so we cap to avoid 422 from over-large
+            # diffusion budgets.
             payload: dict = {
+                "prompt": prompt,
+                "mode": "base",
+                "seed": 0,
+                "steps": max(1, min(steps, 8)),
+            }
+            if width and height:
+                payload["width"] = int(width)
+                payload["height"] = int(height)
+            return payload
+        if is_flux:
+            # NVIDIA NIM FLUX.1-dev schema (see
+            # https://docs.api.nvidia.com/nim/reference/black-forest-labs-flux_1-dev-infer):
+            # prompt / width(=1024) / height(=1024) / cfg_scale / steps /
+            # seed / mode / samples. Field names differ from the
+            # HuggingFace diffusers convention — using num_inference_steps
+            # or guidance_scale here returns HTTP 422.
+            payload = {
+                "prompt": prompt,
+                "mode": "base",
+                "width": 1024,
+                "height": 1024,
+                "cfg_scale": float(cfg_scale),
+                "steps": steps,
+                "samples": 1,
+                "seed": 0,
+            }
+        elif is_sd35:
+            # Legacy SD 3.5 endpoint uses width/height.
+            payload = {
                 "prompt": prompt,
                 "mode": "base",
                 "steps": steps,
@@ -373,7 +432,7 @@ class NvidiaProvider:
                 "samples": 1,
             }
         else:
-            # SD3 Medium uses aspect_ratio
+            # Some legacy image endpoints use aspect_ratio instead of dimensions.
             aspect = _nearest_aspect_ratio(width, height)
             payload = {
                 "prompt": prompt,
@@ -386,24 +445,78 @@ class NvidiaProvider:
         return payload
 
     @staticmethod
-    def _parse_image_response(
-        data: dict, is_sd35: bool
-    ) -> tuple[str | None, str | None]:
+    def _parse_image_response(data: dict) -> tuple[str | None, str | None]:
         """Extract base64 image and finish reason from the response."""
-        if is_sd35:
-            # SD 3.5 Large: {"artifacts": [{"base64": "...", "finishReason": "..."}]}
-            artifacts = data.get("artifacts") or []
-            if not artifacts:
-                return None, None
-            artifact = artifacts[0]
-            return artifact.get("base64"), artifact.get("finishReason")
-        else:
-            # SD3 Medium: {"image": "...", "finish_reason": "..."}
-            return data.get("image"), data.get("finish_reason")
+        finish_reason = data.get("finish_reason") or data.get("finishReason")
+
+        artifacts = data.get("artifacts") or []
+        if isinstance(artifacts, list):
+            for artifact in artifacts:
+                if not isinstance(artifact, dict):
+                    continue
+                item_finish_reason = (
+                    artifact.get("finishReason")
+                    or artifact.get("finish_reason")
+                    or finish_reason
+                )
+                image = (
+                    artifact.get("base64")
+                    or artifact.get("image")
+                    or artifact.get("b64_json")
+                )
+                if image or item_finish_reason:
+                    return image, item_finish_reason
+
+        image = data.get("image") or data.get("base64") or data.get("b64_json")
+        if image:
+            return image, finish_reason
+
+        images = data.get("images")
+        if isinstance(images, list) and images:
+            first = images[0]
+            if isinstance(first, str):
+                return first, finish_reason
+            if isinstance(first, dict):
+                return (
+                    first.get("base64")
+                    or first.get("image")
+                    or first.get("b64_json"),
+                    first.get("finishReason") or first.get("finish_reason") or finish_reason,
+                )
+
+        data_items = data.get("data")
+        if isinstance(data_items, list) and data_items:
+            first = data_items[0]
+            if isinstance(first, dict):
+                return (
+                    first.get("b64_json")
+                    or first.get("base64")
+                    or first.get("image"),
+                    first.get("finishReason") or first.get("finish_reason") or finish_reason,
+                )
+
+        return None, finish_reason
+
+
+def _normalize_image_model(model: str) -> str:
+    value = model.strip()
+    if value.lower() in {"flux.1-dev", _FLUX_1_DEV_MODEL}:
+        return _FLUX_1_DEV_MODEL
+    if value.lower() in {"flux.1-schnell", "black-forest-labs/flux.1-schnell"}:
+        return "black-forest-labs/flux.1-schnell"
+    return value
+
+
+def _is_flux_model(model: str) -> bool:
+    return "flux" in model.lower()
+
+
+def _is_qwen_image_model(model: str) -> bool:
+    return "qwen-image" in model.lower()
 
 
 def _nearest_aspect_ratio(width: int, height: int) -> str:
-    """Map width/height to the nearest SD3 Medium supported aspect ratio."""
+    """Map width/height to the nearest legacy image API aspect ratio."""
     ratio = width / height if height else 1.0
     options = [
         (1 / 1, "1:1"),

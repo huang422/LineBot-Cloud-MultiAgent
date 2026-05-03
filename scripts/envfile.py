@@ -5,6 +5,26 @@ import json
 from pathlib import Path
 
 
+_PLACEHOLDER_VALUES = {
+    "your_channel_secret",
+    "your_access_token",
+    "your_openrouter_api_key",
+    "your_nvidia_api_key",
+    "your_tavily_api_key",
+    "your_project_id",
+    "replace_me",
+    "changeme",
+    "todo",
+}
+
+
+def is_placeholder_value(value: str) -> bool:
+    normalized = (value or "").strip().strip("'\"").lower()
+    if not normalized:
+        return False
+    return normalized in _PLACEHOLDER_VALUES or normalized.startswith("your_")
+
+
 def _consume_quoted_value(
     lines: list[str],
     start_index: int,
@@ -78,6 +98,10 @@ def cmd_to_cloudrun_yaml(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_is_placeholder(args: argparse.Namespace) -> int:
+    return 0 if is_placeholder_value(args.value) else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Utilities for reading .env-style files.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -100,6 +124,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     yaml_parser.add_argument("output", help="Path to output YAML file.")
     yaml_parser.set_defaults(func=cmd_to_cloudrun_yaml)
+
+    placeholder_parser = subparsers.add_parser(
+        "is-placeholder",
+        help="Exit 0 when the supplied value is still an example placeholder.",
+    )
+    placeholder_parser.add_argument("value", help="Value to inspect.")
+    placeholder_parser.set_defaults(func=cmd_is_placeholder)
 
     return parser
 

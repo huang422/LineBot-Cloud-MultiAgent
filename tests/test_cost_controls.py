@@ -55,6 +55,21 @@ class SettingsValidationTests(unittest.TestCase):
         settings = Settings(_env_file=None)
         self.assertEqual(settings.memory_summary_timeout_seconds, 180)
 
+    def test_settings_default_embedding_model_is_free_nvidia_model(self) -> None:
+        settings = Settings(_env_file=None)
+        self.assertEqual(settings.nvidia_embedding_model, "nvidia/nv-embedqa-e5-v5")
+        self.assertEqual(
+            settings.nvidia_embedding_endpoint,
+            "https://integrate.api.nvidia.com/v1/embeddings",
+        )
+
+    def test_settings_default_image_model_is_nvidia_flux(self) -> None:
+        settings = Settings(_env_file=None)
+        self.assertEqual(
+            settings.image_gen_primary_model,
+            "black-forest-labs/flux.1-dev",
+        )
+
 
 class LineServiceBudgetTests(unittest.IsolatedAsyncioTestCase):
     async def test_send_text_blocks_push_when_disabled(self) -> None:

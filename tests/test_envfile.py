@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from src.config import Settings
-from scripts.envfile import parse_env_file
+from scripts.envfile import is_placeholder_value, parse_env_file
 
 
 class EnvfileParsingTests(unittest.TestCase):
@@ -25,6 +25,23 @@ class EnvfileParsingTests(unittest.TestCase):
         self.assertIn("SCHEDULED_WEEKLY_MESSAGES", values)
         self.assertTrue(values["SCHEDULED_WEEKLY_MESSAGES"].startswith("[\n"))
         self.assertIn("pineapple_workout_reminder", values["SCHEDULED_WEEKLY_MESSAGES"])
+
+    def test_parse_env_file_strips_quotes_from_default_firestore_database(self) -> None:
+        content = 'FIRESTORE_DATABASE="(default)"\nNVIDIA_API_KEY=\n'
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text(content, encoding="utf-8")
+            values = parse_env_file(env_path)
+
+        self.assertEqual(values["FIRESTORE_DATABASE"], "(default)")
+        self.assertEqual(values["NVIDIA_API_KEY"], "")
+
+    def test_placeholder_detection_rejects_example_values(self) -> None:
+        self.assertTrue(is_placeholder_value("your_openrouter_api_key"))
+        self.assertTrue(is_placeholder_value("replace_me"))
+        self.assertFalse(is_placeholder_value(""))
+        self.assertFalse(is_placeholder_value("real-value-123"))
 
     def test_settings_accept_multiline_scheduler_json(self) -> None:
         content = """SCHEDULED_MESSAGES_ENABLED=true

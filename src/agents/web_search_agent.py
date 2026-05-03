@@ -183,8 +183,33 @@ class WebSearchAgent(BaseAgent):
                     topic=topic,
                     country=country,
                 )
+            # Final fallback: drop topic/country filters and use the
+            # ORIGINAL (non-optimized) query at basic depth. Avoids
+            # situations where topic="news"/"finance" or country="taiwan"
+            # over-filters perfectly searchable queries.
+            if not result.has_results and not result.answer and (
+                topic or country or optimized_query
+            ):
+                logger.info(
+                    "Still no results; retrying with original query "
+                    "and no topic/country filters"
+                )
+                original_query = query_without_urls if urls and query_without_urls else query
+                try:
+                    result = await svc.search(
+                        original_query,
+                        include_answer="advanced",
+                        search_depth="basic",
+                        max_results=5,
+                    )
+                except WebSearchError as retry_err:
+                    logger.warning(f"Final fallback search failed: {retry_err}")
             if not result.has_results and not result.answer:
-                logger.warning("Web search returned no useful results")
+                logger.warning(
+                    f"Web search returned no useful results "
+                    f"(query='{search_query[:80]}', topic={topic}, "
+                    f"time_range={time_range}, country={country})"
+                )
                 return None, None, urls, query_without_urls
             return None, result.to_context_text(), urls, query_without_urls
         except WebSearchError as e:

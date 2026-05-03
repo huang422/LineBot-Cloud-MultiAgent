@@ -12,8 +12,6 @@ import re
 
 from src.config import get_settings
 from src.models.agent_request import AgentRequest
-from src.models.conversation import ConversationMessage
-from src.services.conversation_service import get_conversation_service
 from src.services.memory_service import get_memory_service, MemoryServiceError
 from src.services.rate_limit_service import get_rate_limit_service
 from src.utils.logger import logger
@@ -145,22 +143,3 @@ async def enrich_request(request: AgentRequest) -> AgentRequest:
         request.previous_disable_thinking = True
 
     return request
-
-
-def record_conversation(
-    request: AgentRequest,
-    response_text: str,
-    *,
-    assistant_delivered: bool = True,
-) -> None:
-    """Record the bot's assistant response in the legacy conversation cache.
-
-    User messages are recorded separately by ``main.py`` once each event has
-    been handled, so we only add the assistant reply here.
-    """
-    if assistant_delivered and response_text:
-        conv_svc = get_conversation_service()
-        conv_svc.add_message(
-            request.group_id,
-            ConversationMessage(role="assistant", content=response_text),
-        )

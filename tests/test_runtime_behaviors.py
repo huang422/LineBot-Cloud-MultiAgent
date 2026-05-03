@@ -22,7 +22,6 @@ from src.agents.web_search_agent import WebSearchAgent
 from src.config import Settings
 from src.handlers import webhook_handler
 from src.models.agent_request import AgentRequest, InputType
-from src.models.conversation import ConversationMessage
 from src.processors import input_processor as input_processor_module
 from src.processors import output_processor as output_processor_module
 from src.processors import tts_processor as tts_processor_module
@@ -38,7 +37,6 @@ from src.providers.openrouter_provider import (
     RateLimitError,
     parse_openai_response,
 )
-from src.services import conversation_service as conversation_service_module
 from src.services import image_service as image_service_module
 from src.services import message_cache_service as message_cache_service_module
 from src.services import memory_service as memory_service_module
@@ -52,7 +50,7 @@ from PIL import Image
 
 class OpenRouterProviderTests(unittest.IsolatedAsyncioTestCase):
     def test_parse_openai_response_concatenates_multipart_text(self) -> None:
-        text, images, reasoning = parse_openai_response(
+        text, images, reasoning, tool_calls, raw = parse_openai_response(
             {
                 "choices": [
                     {
@@ -71,6 +69,8 @@ class OpenRouterProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text, "第一段第二段")
         self.assertEqual(images, ["https://example.com/image.png"])
         self.assertIsNone(reasoning)
+        self.assertIsNone(tool_calls)
+        self.assertIsInstance(raw, dict)
 
     async def test_generate_includes_reasoning_for_text_requests(self) -> None:
         provider = OpenRouterProvider(
@@ -278,6 +278,54 @@ class NvidiaProviderTests(unittest.IsolatedAsyncioTestCase):
             "hello /think",
         )
 
+    async def test_generate_image_uses_flux_nim_payload(self) -> None:
+        from src.providers.nvidia_provider import NvidiaProvider
+
+        provider = NvidiaProvider("test-key", RateTracker())
+
+        class FakeResponse:
+            status_code = 200
+            text = "ok"
+
+            def json(self):
+                return {
+                    "artifacts": [
+                        {"base64": "abc", "finishReason": "SUCCESS"}
+                    ]
+                }
+
+        fake_post = AsyncMock(return_value=FakeResponse())
+        provider._client = SimpleNamespace(post=fake_post)
+
+        response = await provider.generate_image(
+            "black-forest-labs/flux.1-dev",
+            "a detailed prompt",
+            steps=24,
+            cfg_scale=4,
+            width=1024,
+            height=576,
+        )
+
+        self.assertEqual(
+            fake_post.await_args.args[0],
+            "https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-dev",
+        )
+        self.assertEqual(
+            fake_post.await_args.kwargs["json"],
+            {
+                "prompt": "a detailed prompt",
+                "mode": "base",
+                "width": 1024,
+                "height": 1024,
+                "cfg_scale": 4.0,
+                "steps": 24,
+                "samples": 1,
+                "seed": 0,
+            },
+        )
+        self.assertEqual(response.images, ["data:image/png;base64,abc"])
+        self.assertEqual(response.model, "black-forest-labs/flux.1-dev")
+
     async def test_resolve_model_only_swaps_configured_primary_model(self) -> None:
         from src.providers.nvidia_provider import NvidiaProvider
 
@@ -417,34 +465,6 @@ class WebhookTriggerTests(unittest.TestCase):
             self.assertTrue(webhook_handler.should_handle(event))
 
 
-class ConversationRecordingTests(unittest.TestCase):
-    def test_record_conversation_skips_undelivered_assistant_reply(self) -> None:
-        """record_conversation only records assistant replies (user messages
-        are handled proactively by _record_group_message in main.py)."""
-        recorded: list[tuple[str, str, str]] = []
-
-        class FakeConversationService:
-            def add_message(self, chat_id: str, msg) -> None:
-                recorded.append((chat_id, msg.role, msg.content))
-
-        request = AgentRequest(user_id="U1", group_id="G1", text="hello")
-
-        with patch.object(
-            webhook_handler,
-            "get_conversation_service",
-            return_value=FakeConversationService(),
-        ):
-            webhook_handler.record_conversation(
-                request,
-                "assistant reply",
-                assistant_delivered=False,
-            )
-
-        # No assistant recorded because assistant_delivered=False;
-        # user messages are not recorded here (handled elsewhere).
-        self.assertEqual(recorded, [])
-
-
 class WebhookEnrichmentTests(unittest.IsolatedAsyncioTestCase):
     async def test_enrich_request_copies_previous_route_state_from_memory(self) -> None:
         request = AgentRequest(
@@ -544,12 +564,19 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 chat_id="G1",
             )
 
-        cleared = service._memory_store["group::G1"]
-        self.assertEqual(cleared["summary_text"], "")
-        self.assertEqual(cleared["recent_messages"], [])
-        self.assertEqual(cleared["last_route"]["agent"], "")
+        # !new now deletes the document outright so a fresh load
+        # returns the default empty skeleton (and Firestore evicts the
+        # row instead of leaving a zombie cleared record).
+        self.assertNotIn("group::G1", service._memory_store)
+        reloaded = await service.load_context(
+            source_type="group",
+            chat_scope="multi",
+            chat_id="G1",
+        )
+        self.assertEqual(reloaded.summary_text, "")
+        self.assertEqual(list(reloaded.recent_messages), [])
         log_info.assert_any_call("[group:G1] Memory summary before !new: 舊的長期記憶")
-        log_info.assert_any_call("[group:G1] Memory summary cleared by !new: (empty)")
+        log_info.assert_any_call("[group:G1] Memory summary cleared by !new: (deleted)")
 
     async def test_record_interaction_compacts_existing_summary_and_recent_window(self) -> None:
         nvidia = SimpleNamespace(
@@ -798,6 +825,79 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             "[user:U1] Memory summary timed out after 180s; keeping the latest recent memory window"
         )
         log_error.assert_not_called()
+
+    async def test_summary_retries_when_recent_window_changes_mid_compaction(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        call_count = 0
+
+        async def fake_generate(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                started.set()
+                await release.wait()
+                return ProviderResponse(text="第一次摘要", model="qwen/test")
+            return ProviderResponse(text="第二次摘要", model="qwen/test")
+
+        nvidia = SimpleNamespace(generate=AsyncMock(side_effect=fake_generate))
+        service = memory_service_module.MemoryService(
+            Settings(
+                _env_file=None,
+                memory_recent_message_limit=4,
+                memory_summary_timeout_seconds=180,
+            ),
+            nvidia_provider=nvidia,
+        )
+
+        await service.record_interaction(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+            user_id="U1",
+            user_text="第一句",
+            assistant_text="第二句",
+        )
+        await service.record_interaction(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+            user_id="U1",
+            user_text="第三句",
+            assistant_text="第四句",
+        )
+
+        await started.wait()
+
+        await service.record_interaction(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+            user_id="U1",
+            user_text="第五句",
+            assistant_text="第六句",
+        )
+
+        release.set()
+        # Drain summary tasks robustly: a completed task's done-callback
+        # may still be queued behind the resumption of the awaiting code,
+        # so yield once after each gather to let pending callbacks pop
+        # the dict before the next loop check.
+        for _ in range(20):
+            if not service._summary_tasks:
+                break
+            await asyncio.gather(*list(service._summary_tasks.values()))
+            await asyncio.sleep(0)
+        self.assertFalse(service._summary_tasks, "summary tasks did not drain")
+
+        memory = await service.load_context(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+        )
+        self.assertEqual(memory.summary_text, "第二次摘要")
+        self.assertEqual(memory.recent_count, 0)
+        self.assertEqual(nvidia.generate.await_count, 2)
 
 
 class WebSearchRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -1421,8 +1521,8 @@ class ImageGenPromptRefinementTests(unittest.IsolatedAsyncioTestCase):
         nvidia = SimpleNamespace(
             generate_image=AsyncMock(
                 return_value=ProviderResponse(
-                    images=["data:image/jpeg;base64,abc"],
-                    model="stabilityai/stable-diffusion-3-medium",
+                    images=["data:image/png;base64,abc"],
+                    model="black-forest-labs/flux.1-dev",
                 )
             )
         )
@@ -2242,32 +2342,6 @@ class OrchestratorFastRuleTests(unittest.TestCase):
         self.assertFalse(decision.disable_thinking)
 
 
-class ConversationHistoryExpiryTests(unittest.TestCase):
-    def test_get_history_prunes_expired_messages_from_deque(self) -> None:
-        settings = Settings(_env_file=None, max_conversation_history=3)
-
-        with patch.object(
-            conversation_service_module,
-            "get_settings",
-            return_value=settings,
-        ):
-            service = conversation_service_module.ConversationService()
-
-        service._history["chat"] = deque(
-            [
-                ConversationMessage(role="user", content="old", timestamp=0),
-                ConversationMessage(role="assistant", content="fresh", timestamp=3500),
-            ],
-            maxlen=service._max,
-        )
-
-        with patch.object(conversation_service_module, "time", return_value=3601):
-            history = service.get_history("chat")
-
-        self.assertEqual(history, [{"role": "assistant", "content": "fresh"}])
-        self.assertEqual(len(service._history["chat"]), 1)
-
-
 class MessageCacheBehaviorTests(unittest.TestCase):
     def test_cache_processed_request_prefers_cleaned_text_and_valid_image_fit(self) -> None:
         service = message_cache_service_module.MessageCacheService()
@@ -2584,7 +2658,7 @@ class ImageGenErrorHandlingTests(unittest.IsolatedAsyncioTestCase):
         nvidia = SimpleNamespace(
             generate_image=AsyncMock(
                 side_effect=ProviderError(
-                    "stabilityai/stable-diffusion-3-medium",
+                    "black-forest-labs/flux.1-dev",
                     401,
                     '{"error":"Unauthorized"}',
                 )
@@ -2615,8 +2689,8 @@ class ImageGenErrorHandlingTests(unittest.IsolatedAsyncioTestCase):
         nvidia = SimpleNamespace(
             generate_image=AsyncMock(
                 return_value=ProviderResponse(
-                    images=["data:image/jpeg;base64,abc"],
-                    model="stabilityai/stable-diffusion-3-medium",
+                    images=["data:image/png;base64,abc"],
+                    model="black-forest-labs/flux.1-dev",
                 )
             )
         )
@@ -2630,4 +2704,4 @@ class ImageGenErrorHandlingTests(unittest.IsolatedAsyncioTestCase):
         response = await agent.process(AgentRequest(text="幫我畫一隻柴犬"))
 
         self.assertEqual(response.output_format, "image")
-        self.assertEqual(response.image_base64, "data:image/jpeg;base64,abc")
+        self.assertEqual(response.image_base64, "data:image/png;base64,abc")

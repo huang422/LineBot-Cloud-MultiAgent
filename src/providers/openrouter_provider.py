@@ -6,6 +6,7 @@ client no longer hard-enforces them against a local whitelist.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 
@@ -45,26 +46,46 @@ class ProviderResponse:
     model: str = ""
     usage: dict | None = None
     reasoning_content: str | None = None
+    # OpenAI-compatible tool call directives requested by the model.
+    # Each item has the shape:
+    #   {"id": str, "type": "function",
+    #    "function": {"name": str, "arguments": str (JSON-encoded)}}
+    # ``None`` (or empty list) means the model produced a regular text reply.
+    tool_calls: list[dict] | None = None
+    # Echo of ``message.role`` and ``message.content`` so callers running an
+    # agentic tool loop can append the assistant turn back into ``messages``
+    # verbatim before sending tool results.
+    raw_message: dict | None = None
 
 
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
 
-def parse_openai_response(data: dict) -> tuple[str | None, list[str] | None, str | None]:
-    """Parse an OpenAI-compatible response, returning (text, images, reasoning_content).
+def parse_openai_response(
+    data: dict,
+) -> tuple[str | None, list[str] | None, str | None, list[dict] | None, dict | None]:
+    """Parse an OpenAI-compatible response.
+
+    Returns ``(text, images, reasoning_content, tool_calls, raw_message)``.
 
     Reasoning is extracted from (in priority order):
       1. ``message.reasoning`` — OpenRouter primary field
       2. ``message.reasoning_content`` — alias / NVIDIA field
       3. Content parts with ``type: "thinking"``
       4. ``<think>…</think>`` tags embedded in text (native Qwen3 format)
+
+    Tool calls follow the OpenAI Chat Completions format:
+    ``message.tool_calls = [{"id", "type": "function",
+    "function": {"name", "arguments"}}, ...]``. Returned verbatim so that
+    the agentic loop can echo them back when sending tool results.
     """
     text = None
     images = None
     reasoning_content = None
+    tool_calls: list[dict] | None = None
     choices = data.get("choices") or []
     choice = choices[0] if choices else {}
-    message = choice.get("message", {})
+    message = choice.get("message", {}) or {}
 
     # Extract reasoning from dedicated fields
     # OpenRouter uses "reasoning" as primary, "reasoning_content" as alias
@@ -117,7 +138,37 @@ def parse_openai_response(data: dict) -> tuple[str | None, list[str] | None, str
     if text:
         text = _THINK_TAG_RE.sub("", text).strip() or None
 
-    return text, images, reasoning_content
+    raw_tool_calls = message.get("tool_calls")
+    if isinstance(raw_tool_calls, list) and raw_tool_calls:
+        normalized: list[dict] = []
+        for call in raw_tool_calls:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, dict):
+                # Some providers already deliver parsed args; re-encode so
+                # downstream consumers always see a JSON string.
+                try:
+                    args = json.dumps(args, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    args = ""
+            normalized.append(
+                {
+                    "id": call.get("id") or "",
+                    "type": call.get("type", "function"),
+                    "function": {
+                        "name": fn.get("name", ""),
+                        "arguments": args if isinstance(args, str) else "",
+                    },
+                }
+            )
+        if normalized:
+            tool_calls = normalized
+
+    raw_message = message if isinstance(message, dict) else None
+
+    return text, images, reasoning_content, tool_calls, raw_message
 
 
 class OpenRouterProvider:
@@ -167,6 +218,8 @@ class OpenRouterProvider:
         modalities: list[str] | None = None,
         require_reasoning_tokens: bool = False,
         disable_thinking: bool = False,
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
     ) -> ProviderResponse:
         """Call OpenRouter and return a unified response.
 
@@ -215,6 +268,11 @@ class OpenRouterProvider:
             # Top-level flag to include reasoning output in the response
             payload["include_reasoning"] = True
 
+        if tools:
+            payload["tools"] = tools
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
+
         logger.info(
             f"OpenRouter request → {model} "
             f"(temp={temperature}, max_tok={max_tokens}, reasoning={use_reasoning})"
@@ -252,7 +310,7 @@ class OpenRouterProvider:
         except ValueError as e:
             logger.error(f"OpenRouter returned invalid JSON for {model}: {e}")
             raise ProviderError(model, resp.status_code, "Invalid JSON response", provider="OpenRouter") from e
-        text, images, reasoning_content = parse_openai_response(data)
+        text, images, reasoning_content, tool_calls, raw_message = parse_openai_response(data)
 
         usage = data.get("usage")
         # reasoning_tokens may be top-level or nested under completion_tokens_details
@@ -283,4 +341,6 @@ class OpenRouterProvider:
             model=data.get("model", model),
             usage=usage,
             reasoning_content=reasoning_content,
+            tool_calls=tool_calls,
+            raw_message=raw_message,
         )

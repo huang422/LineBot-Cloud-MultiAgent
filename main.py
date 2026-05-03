@@ -20,8 +20,6 @@ from src.utils.rate_tracker import RateTracker
 
 # Services
 from src.services.line_service import get_line_service, close_line_service
-from src.services.conversation_service import get_conversation_service
-from src.models.conversation import ConversationMessage
 from src.services.message_cache_service import get_message_cache_service
 from src.services.memory_service import (
     configure_memory_service,
@@ -53,7 +51,6 @@ from src.handlers.webhook_handler import (
     should_handle,
     extract_text,
     enrich_request,
-    record_conversation,
 )
 
 # ── Global instances ─────────────────────────────────────────
@@ -73,6 +70,93 @@ image_gen_agent = None
 
 # Background tasks (prevent garbage collection of fire-and-forget tasks)
 _background_tasks: set[asyncio.Task] = set()
+
+
+def _build_recall_memory_executor(memory_service):
+    """Returns a tool executor that pulls episodic memory snippets."""
+
+    async def _executor(args, ctx):
+        query = str(args.get("query") or "").strip()
+        if not query or not ctx.chat_id:
+            return {"status": "noop", "matches": [], "query": query}
+        k = args.get("k")
+        try:
+            k_int = int(k) if k is not None else 3
+        except (TypeError, ValueError):
+            k_int = 3
+        try:
+            episodes = await memory_service.recall_episodes(
+                source_type=ctx.source_type,
+                chat_id=ctx.chat_id,
+                query=query,
+                k=k_int,
+            )
+        except Exception as exc:
+            return {"status": "error", "reason": str(exc), "matches": []}
+
+        matches = []
+        for ep in episodes:
+            matches.append({
+                "summary": (ep.get("summary") or "")[:600],
+                "ts": ep.get("ts"),
+                "score": ep.get("score"),
+            })
+        return {
+            "status": "ok" if matches else "empty",
+            "query": query,
+            "matches": matches,
+        }
+
+    return _executor
+
+
+def _build_update_user_profile_executor(memory_service):
+    async def _executor(args, ctx):
+        if not ctx.user_id:
+            return {"status": "noop", "reason": "no user_id in context"}
+        facts = args.get("facts") or []
+        if not isinstance(facts, list):
+            facts = [facts]
+        confidence = args.get("confidence")
+        try:
+            confidence = float(confidence) if confidence is not None else 0.7
+        except (TypeError, ValueError):
+            confidence = 0.7
+        return await memory_service.update_user_facts(
+            user_id=ctx.user_id,
+            facts=[str(f) for f in facts if f is not None],
+            confidence=confidence,
+        )
+
+    return _executor
+
+
+def _build_web_search_executor(get_web_search_service):
+    async def _executor(args, ctx):
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return {"status": "noop", "reason": "empty query"}
+        svc = get_web_search_service()
+        if svc is None or not svc.is_configured:
+            return {"status": "unavailable", "reason": "web search not configured"}
+        try:
+            result = await svc.search(
+                query,
+                include_answer="advanced",
+                search_depth="advanced",
+                max_results=5,
+            )
+        except Exception as exc:
+            return {"status": "error", "reason": str(exc)}
+        if not result.has_results and not result.answer:
+            return {"status": "empty", "query": query}
+        return {
+            "status": "ok",
+            "query": query,
+            "context": result.to_context_text()[:4000],
+        }
+
+    return _executor
 
 
 def _build_text_agent_targets(settings, openrouter_provider, nvidia_provider):
@@ -303,6 +387,47 @@ async def lifespan(app: FastAPI):
 
     configure_memory_service(settings, nvidia_provider=nvidia_provider)
 
+    # ── Phase B: tool-calling registry with real executors ────
+    # Embedding service powers vector recall; failures degrade to
+    # stub executors so the bot still replies even if NIM is down.
+    from src.services.embedding_service import (
+        configure_embedding_service,
+        close_embedding_service,
+    )
+    from src.agents.tools import build_default_registry
+    from src.services.web_search_service import get_web_search_service
+
+    try:
+        embedding_service = configure_embedding_service(settings)
+        memory_service = get_memory_service()
+        if hasattr(memory_service, "set_embedding_service"):
+            memory_service.set_embedding_service(embedding_service)
+
+        tool_registry = build_default_registry()
+        tool_registry.replace_executor(
+            "recall_memory",
+            _build_recall_memory_executor(memory_service),
+        )
+        tool_registry.replace_executor(
+            "update_user_profile",
+            _build_update_user_profile_executor(memory_service),
+        )
+        tool_registry.replace_executor(
+            "web_search",
+            _build_web_search_executor(get_web_search_service),
+        )
+        if hasattr(chat_agent, "set_tool_registry"):
+            chat_agent.set_tool_registry(tool_registry)
+            logger.info(
+                "ChatAgent tool registry wired: "
+                f"{', '.join(sorted(tool_registry.names()))}"
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            f"Tool registry wiring skipped: {exc}; chat agent will run "
+            "without tool calling"
+        )
+
     logger.info("LineBot-CloudAgent started (Orchestrator + NVIDIA Qwen3.5 architecture)")
     yield
 
@@ -312,6 +437,10 @@ async def lifespan(app: FastAPI):
     await close_web_search_service()
     await close_line_service()
     await close_memory_service()
+    try:
+        await close_embedding_service()
+    except Exception:  # pragma: no cover - shutdown best effort
+        pass
     if openrouter_provider:
         await openrouter_provider.close()
     if nvidia_provider:
@@ -453,7 +582,6 @@ async def health():
         "models_status": rate_tracker.get_status(),
         "agents_stats": agents_stats,
         "fallback_count": fallback_chain.fallback_count if fallback_chain else 0,
-        "conversation": get_conversation_service().get_stats(),
         "memory": memory.get_stats(),
         "scheduler": (
             scheduler.get_stats()
@@ -511,7 +639,11 @@ async def webhook(request: Request):
 
 
 def _record_group_message(event: dict) -> None:
-    """Record incoming messages in the legacy passive conversation cache."""
+    """Buffer a non-triggered group/room message into the passive memory queue.
+
+    Triggered messages bypass this path because ``record_interaction`` already
+    persists the user's text to ``memory.recent_messages``.
+    """
     if event.get("type") != "message":
         return
 
@@ -519,47 +651,42 @@ def _record_group_message(event: dict) -> None:
     msg_type = message.get("type", "")
     source = event.get("source", {})
     user_id = source.get("userId", "")
+    src_type = source.get("type", "")
     group_id = source.get("groupId") or source.get("roomId") or user_id
 
     if not user_id or not group_id:
         return
+    if src_type not in {"group", "room"}:
+        return
 
-    conv_svc = get_conversation_service()
+    try:
+        memory_svc = get_memory_service()
+    except Exception:
+        return
 
+    text = ""
     if msg_type == "text":
         text = message.get("text", "").strip()
-        if text:
-            conv_svc.add_message(
-                group_id,
-                ConversationMessage(
-                    role="user", content=text,
-                    user_id=user_id, message_type="text",
-                ),
-            )
     elif msg_type == "image":
-        conv_svc.add_message(
-            group_id,
-            ConversationMessage(
-                role="user", content="[圖片]",
-                user_id=user_id, message_type="image",
-            ),
-        )
+        text = "[圖片]"
     elif msg_type == "sticker":
-        conv_svc.add_message(
-            group_id,
-            ConversationMessage(
-                role="user", content="[貼圖]",
-                user_id=user_id, message_type="sticker",
-            ),
-        )
+        text = "[貼圖]"
     elif msg_type == "audio":
-        conv_svc.add_message(
-            group_id,
-            ConversationMessage(
-                role="user", content="[語音]",
-                user_id=user_id, message_type="audio",
-            ),
+        text = "[語音]"
+
+    if not text:
+        return
+
+    try:
+        memory_svc.enqueue_passive_message(
+            source_type=src_type,
+            chat_scope="multi",
+            chat_id=group_id,
+            user_id=user_id,
+            text=text,
         )
+    except Exception as exc:
+        logger.debug(f"enqueue_passive_message failed: {exc}")
 
 async def _process_event(event: dict) -> None:
     """Process a single LINE event in the background."""
@@ -584,7 +711,6 @@ async def _process_event(event: dict) -> None:
                 chat_scope=request.chat_scope,
                 chat_id=request.group_id,
             )
-            get_conversation_service().clear_history(request.group_id)
             await line.send_text(
                 request.reply_token,
                 chat_id,
@@ -607,6 +733,12 @@ async def _process_event(event: dict) -> None:
                 block_message,
             )
             return
+
+        # Best-effort: resolve LINE display name + upsert user profile.
+        # Failures here must never block the main reply path. The
+        # SimpleNamespace mocks used in test_api_integration may not
+        # provide these methods, so we swallow AttributeError as well.
+        await _touch_user_profile_safe(line, request)
 
         # Route via Orchestrator
         decision = await orchestrator.route(request)
@@ -658,13 +790,6 @@ async def _process_event(event: dict) -> None:
             except MemoryServiceError as e:
                 logger.error(f"Memory interaction record failed: {e}")
 
-        # Record conversation
-        record_conversation(
-            request,
-            response.text or "",
-            assistant_delivered=sent,
-        )
-
     except AllModelsRateLimitedError:
         logger.error("All models rate limited!")
         await _send_error_message(reply_token, chat_id, "⚠️ AI 模型暫時忙碌中，請稍後再試。")
@@ -676,11 +801,6 @@ async def _process_event(event: dict) -> None:
     except Exception as e:
         logger.error(f"Event processing error: {e}", exc_info=True)
         await _send_error_message(reply_token, chat_id, "❌ 處理請求時發生錯誤，請稍後再試。")
-    finally:
-        # Record handled messages after processing so the current turn is not
-        # duplicated in the prompt history passed to the agent.
-        if not _is_new_chat_command(extract_text(event)):
-            _record_group_message(event)
 
 
 async def _send_error_message(reply_token: str, chat_id: str, text: str) -> None:
@@ -690,6 +810,44 @@ async def _send_error_message(reply_token: str, chat_id: str, text: str) -> None
         await line.send_text(reply_token, chat_id, text)
     except Exception as e:
         logger.error(f"Failed to deliver error message: {e}", exc_info=True)
+
+
+async def _touch_user_profile_safe(line, request) -> None:
+    """Resolve LINE displayName and upsert per-user profile.
+
+    All failures are swallowed: the per-user profile is metadata, not
+    on the critical path for replying to the user. Logs at debug level
+    to keep noise low when the user has not added the bot as a friend.
+    """
+    user_id = (request.user_id or "").strip()
+    if not user_id:
+        return
+
+    display_name = ""
+    try:
+        display_name = await line.fetch_display_name(
+            source_type=request.source_type,
+            chat_id=request.group_id,
+            user_id=user_id,
+        )
+    except AttributeError:
+        # Test doubles may not implement fetch_display_name; that is fine.
+        pass
+    except Exception as exc:
+        logger.debug(f"Display name lookup skipped for {user_id[:8]}…: {exc}")
+
+    try:
+        await get_memory_service().touch_user_profile(
+            user_id=user_id,
+            display_name=display_name,
+            source_type=request.source_type,
+            chat_id=request.group_id,
+        )
+    except AttributeError:
+        # Older mocks without touch_user_profile — skip silently
+        pass
+    except Exception as exc:
+        logger.debug(f"Profile touch skipped for {user_id[:8]}…: {exc}")
 
 
 def _get_agent(name: str):

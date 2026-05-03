@@ -32,6 +32,9 @@ class LineService:
         self._current_month = datetime.now(timezone.utc).strftime("%Y-%m")
         self._reply_fallback_push_count = 0
         self._direct_push_count = 0
+        self._profile_cache_ttl = max(0, settings.line_profile_cache_ttl_seconds)
+        # Maps "{source_type}::{chat_id}::{user_id}" → (cached_at, display_name)
+        self._profile_cache: dict[str, tuple[float, str]] = {}
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10, read=30, write=30, pool=10),
             headers={
@@ -146,6 +149,77 @@ class LineService:
         except Exception as e:
             logger.error(f"Content download error: {e}")
             return None, None
+
+    # ── User profile lookup (display name) ───────────────────
+
+    async def fetch_display_name(
+        self,
+        *,
+        source_type: str,
+        chat_id: str,
+        user_id: str,
+    ) -> str:
+        """Return the LINE displayName for ``user_id``, with TTL cache.
+
+        Uses ``/v2/bot/profile/{userId}`` for 1:1 chats and
+        ``/v2/bot/{group|room}/{chatId}/member/{userId}`` for groups and
+        rooms. The group/room endpoints work even when the user has not
+        added the bot as a friend.
+
+        Returns an empty string on any failure so callers can degrade
+        gracefully (e.g. continue to use the masked ``User_xxxx`` tag).
+        """
+        if not user_id or not self.channel_access_token:
+            return ""
+
+        source = (source_type or "user").strip().lower() or "user"
+        cache_key = f"{source}::{chat_id}::{user_id}"
+        now = datetime.now(timezone.utc).timestamp()
+
+        cached = self._profile_cache.get(cache_key)
+        if cached is not None and self._profile_cache_ttl > 0:
+            cached_at, name = cached
+            if now - cached_at <= self._profile_cache_ttl:
+                return name
+            self._profile_cache.pop(cache_key, None)
+
+        if source == "group" and chat_id:
+            url = f"{LINE_API_BASE}/bot/group/{chat_id}/member/{user_id}"
+        elif source == "room" and chat_id:
+            url = f"{LINE_API_BASE}/bot/room/{chat_id}/member/{user_id}"
+        else:
+            url = f"{LINE_API_BASE}/bot/profile/{user_id}"
+
+        try:
+            resp = await self.client.get(url)
+        except Exception as exc:
+            logger.warning(f"Display name fetch error for {user_id[:8]}…: {exc}")
+            return ""
+
+        if resp.status_code != 200:
+            # 404 is common for users who have not added the bot in DM
+            # context; downgrade to debug-level to avoid log spam.
+            if resp.status_code in (404, 403):
+                logger.debug(
+                    f"Display name unavailable ({resp.status_code}) for "
+                    f"{source}:{user_id[:8]}…"
+                )
+            else:
+                logger.warning(
+                    f"Display name fetch returned {resp.status_code} for "
+                    f"{source}:{user_id[:8]}…"
+                )
+            return ""
+
+        try:
+            payload = resp.json()
+        except Exception:
+            return ""
+
+        name = str(payload.get("displayName", "")).strip()
+        if self._profile_cache_ttl > 0:
+            self._profile_cache[cache_key] = (now, name)
+        return name
 
     async def push_text(
         self, to: str, text: str, notification_disabled: bool = False

@@ -42,13 +42,6 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
                 "remaining": 0,
             }
         )
-        self.fake_conversation = SimpleNamespace(
-            get_stats=lambda: {
-                "groups_tracked": 0,
-                "total_messages": 0,
-            },
-            clear_history=Mock(),
-        )
         self.fake_memory = SimpleNamespace(
             get_stats=lambda: {
                 "backend": "memory",
@@ -93,13 +86,6 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             )
             stack.enter_context(
                 patch.object(main_module, "get_line_service", return_value=self.fake_line)
-            )
-            stack.enter_context(
-                patch.object(
-                    main_module,
-                    "get_conversation_service",
-                    return_value=self.fake_conversation,
-                )
             )
             stack.enter_context(
                 patch.object(main_module, "close_line_service", new=AsyncMock())
@@ -160,7 +146,7 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
         self.assertTrue(payload["providers"]["openrouter"])
         self.assertIn("orchestrator", payload["agents_stats"])
         self.assertIn("chat", payload["agents_stats"])
-        self.assertEqual(payload["conversation"]["groups_tracked"], 0)
+        self.assertNotIn("conversation", payload)
         self.assertEqual(payload["memory"]["backend"], "memory")
         self.assertEqual(payload["memory"]["summary_timeout_seconds"], 180)
         self.assertEqual(payload["scheduler"]["job_count"], 0)
@@ -307,11 +293,7 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             main_module, "get_memory_service", return_value=memory_service
         ), patch.object(
             main_module, "send_response", AsyncMock(return_value=True)
-        ) as send_response, patch.object(
-            main_module, "record_conversation"
-        ) as record_conversation, patch.object(
-            main_module, "_record_group_message"
-        ) as record_group_message:
+        ) as send_response:
             await main_module._process_event(event)
 
         line_service.send_loading_animation.assert_awaited_once_with("G1")
@@ -333,12 +315,6 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             disable_thinking=False,
         )
         line_service.send_text.assert_not_called()
-        record_conversation.assert_called_once_with(
-            request,
-            "這是整理後的回覆",
-            assistant_delivered=True,
-        )
-        record_group_message.assert_called_once_with(event)
         self.assertEqual(request.text, "幫我整理重點")
         self.assertEqual(request.target_agent, "chat")
         self.assertEqual(request.output_format, "text")
@@ -363,7 +339,6 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             send_loading_animation=AsyncMock(),
             send_text=AsyncMock(),
         )
-        conversation_service = SimpleNamespace(clear_history=Mock())
         memory_service = SimpleNamespace(clear_chat=AsyncMock())
         cache_service = SimpleNamespace(cache_processed_request=Mock())
 
@@ -374,8 +349,6 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             main_module, "extract_text", return_value="!new"
         ), patch.object(
-            main_module, "get_conversation_service", return_value=conversation_service
-        ), patch.object(
             main_module, "get_memory_service", return_value=memory_service
         ), patch.object(
             main_module, "get_message_cache_service", return_value=cache_service
@@ -383,11 +356,7 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             main_module, "enrich_request", AsyncMock()
         ) as enrich_request, patch.object(
             main_module, "send_response", AsyncMock()
-        ) as send_response, patch.object(
-            main_module, "record_conversation"
-        ) as record_conversation, patch.object(
-            main_module, "_record_group_message"
-        ) as record_group_message:
+        ) as send_response:
             await main_module._process_event(event)
 
         line_service.send_loading_animation.assert_not_called()
@@ -396,7 +365,6 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             chat_scope="multi",
             chat_id="G1",
         )
-        conversation_service.clear_history.assert_called_once_with("G1")
         line_service.send_text.assert_awaited_once_with(
             "reply-token",
             "G1",
@@ -405,5 +373,3 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         cache_service.cache_processed_request.assert_not_called()
         enrich_request.assert_not_called()
         send_response.assert_not_called()
-        record_conversation.assert_not_called()
-        record_group_message.assert_not_called()

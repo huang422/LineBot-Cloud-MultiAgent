@@ -80,6 +80,8 @@ class Settings(BaseSettings):
     nvidia_thinking_model: str = "google/gemma-4-31b-it"
     nvidia_thinking_enabled: bool = True
     nvidia_thinking_budget: int = 4096
+    nvidia_embedding_model: str = "nvidia/nv-embedqa-e5-v5"
+    nvidia_embedding_endpoint: str = "https://integrate.api.nvidia.com/v1/embeddings"
     thinking_timeout_seconds: int = 180  # 0 disables the timeout retry behavior
 
     # ── Orchestrator (routing / task dispatch) ────────────────
@@ -87,6 +89,12 @@ class Settings(BaseSettings):
     orchestrator_fallback_model: str = "nvidia/nemotron-3-super-120b-a12b"
     orchestrator_temperature: float = 0.0
     orchestrator_max_tokens: int = 384
+
+    # ── Tool calling (Phase C/B) ──────────────────────────────
+    # Hard ceiling on agentic tool-loop iterations per request so a
+    # mis-behaved model cannot pin Cloud Run for the full request
+    # timeout. Internal knob only — not exposed via .env.
+    tool_loop_max_iterations: int = 4
 
     # ── Text agents / Vision fallback ─────────────────────────
     agent_fallback_model: str = "nvidia/nemotron-3-super-120b-a12b:free"
@@ -105,8 +113,8 @@ class Settings(BaseSettings):
     image_gen_temperature: float = 0.7
     image_gen_max_tokens: int = 1024
 
-    # ── Image generation (NVIDIA Stable Diffusion) ────────────
-    image_gen_primary_model: str = "stabilityai/stable-diffusion-3-medium"
+    # ── Image generation (NVIDIA Visual GenAI NIM) ────────────
+    image_gen_primary_model: str = "black-forest-labs/flux.1-dev"
     image_gen_fallback_model: str = ""
     image_gen_steps: int = 50
     image_gen_cfg_scale: int = 5
@@ -138,9 +146,7 @@ class Settings(BaseSettings):
     scheduled_weekly_messages: list[ScheduledWeeklyMessage] = Field(default_factory=list)
     scheduled_yearly_messages: list[ScheduledYearlyMessage] = Field(default_factory=list)
 
-    # ── Conversation & Limits ─────────────────────────────────
-    max_conversation_history: int = 10
-    conversation_ttl_seconds: int = 3600
+    # ── Rate limiting ─────────────────────────────────────────
     rate_limit_max_requests: int = 30
     rate_limit_window_seconds: int = 60
 
@@ -149,6 +155,31 @@ class Settings(BaseSettings):
     memory_summary_timeout_seconds: int = 180
     memory_summary_temperature: float = 0.2
     memory_summary_max_tokens: int = 384
+
+    # ── Passive group recording (Firestore writes for non-triggered group chat) ─
+    # When enabled, every text message in a group/room is buffered and
+    # eventually written to Firestore so the bot can recall the full
+    # conversation thread, not just turns where it was @-mentioned. To
+    # keep Firestore writes bounded, messages are coalesced per chat:
+    # flushed when ``passive_group_flush_threshold`` messages buffer up,
+    # or after ``passive_group_flush_delay_seconds`` since the last
+    # message — whichever comes first.
+    passive_group_recording_enabled: bool = True
+    passive_group_flush_threshold: int = 8
+    passive_group_flush_delay_seconds: int = 30
+
+    # ── Persistent memory backend (Firestore Native) ──────────
+    # When firestore_enabled is False (default), MemoryService keeps using
+    # the in-memory backend, which is wiped on Cloud Run cold start /
+    # redeploy. Setting firestore_enabled=true switches to Firestore.
+    # All other firestore_* fields are only consulted when enabled.
+    firestore_enabled: bool = False
+    firestore_project_id: str = ""
+    firestore_database: str = "(default)"
+    firestore_collection_prefix: str = "linebot"
+    firestore_location: str = ""
+    memory_cache_ttl_seconds: int = 60
+    line_profile_cache_ttl_seconds: int = 86400
 
     # ── Server ────────────────────────────────────────────────
     host: str = "0.0.0.0"
@@ -189,13 +220,16 @@ class Settings(BaseSettings):
         "image_gen_cfg_scale",
         "openrouter_thinking_budget",
         "nvidia_thinking_budget",
-        "max_conversation_history",
-        "conversation_ttl_seconds",
         "rate_limit_max_requests",
+        "tool_loop_max_iterations",
         "rate_limit_window_seconds",
         "memory_recent_message_limit",
         "memory_summary_timeout_seconds",
         "memory_summary_max_tokens",
+        "memory_cache_ttl_seconds",
+        "line_profile_cache_ttl_seconds",
+        "passive_group_flush_threshold",
+        "passive_group_flush_delay_seconds",
         "port",
         "gcs_media_cleanup_delay_seconds",
         "gcs_signed_url_expiry_hours",

@@ -6,11 +6,13 @@ FastAPI entry point with Cloud Run background processing.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 from src.config import get_settings
 from src.models.agent_request import InputType
@@ -345,15 +347,18 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("LINE push fallback is disabled; reply failures cannot fall back to push")
 
-    # Init scheduler
+    # Init scheduler — jobs are registered for /health visibility and
+    # dispatched via /internal/cron by Cloud Scheduler. The in-process
+    # APScheduler timer was removed because Cloud Run scales to zero and
+    # cannot reliably fire timers when hibernated.
     from src.services.scheduler_service import get_scheduler_service, close_scheduler_service
     if settings.scheduled_messages_enabled and settings.scheduled_group_id:
         if not settings.line_push_fallback_enabled:
             logger.warning(
-                "Scheduled messages requested but not started because LINE push is disabled"
+                "Scheduled messages requested but not registered because LINE push is disabled"
             )
         else:
-            scheduler = get_scheduler_service()
+            scheduler = get_scheduler_service(settings.scheduled_messages_timezone)
             gid = settings.scheduled_group_id
             total_configured_jobs = (
                 len(settings.scheduled_weekly_messages)
@@ -381,7 +386,16 @@ async def lifespan(app: FastAPI):
                         f"({total_registered_jobs}/{total_configured_jobs})"
                     )
                 scheduler.start()
-                logger.info(f"Scheduler started with {len(scheduler.list_jobs())} jobs")
+                if not settings.internal_cron_secret:
+                    logger.warning(
+                        "Scheduled jobs registered but INTERNAL_CRON_SECRET is empty; "
+                        "/internal/cron will refuse traffic. Set the secret and "
+                        "provision a Cloud Scheduler job pointing at /internal/cron."
+                    )
+                logger.info(
+                    f"Scheduler ready with {len(scheduler.list_jobs())} job(s); "
+                    "dispatch is triggered by Cloud Scheduler hitting /internal/cron"
+                )
     else:
         logger.info("Scheduler disabled (SCHEDULED_MESSAGES_ENABLED=false or no group ID)")
 
@@ -594,6 +608,59 @@ async def health():
             "storage": storage.get_usage_stats(),
         },
     }
+
+
+# ── Cloud Scheduler trigger ──────────────────────────────────
+
+
+def _parse_cloud_scheduler_time(raw: str) -> datetime | None:
+    """Parse the X-CloudScheduler-ScheduleTime header into a tz-aware datetime."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    # Accept the RFC3339 form Cloud Scheduler sends: ``...Z`` or with offset.
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+@app.post("/internal/cron")
+async def internal_cron(request: Request):
+    """Dispatch any scheduled message jobs that match the current minute.
+
+    Designed to be called by a Cloud Scheduler job every minute. Auth is
+    via shared secret in ``X-Cron-Token`` (set via INTERNAL_CRON_SECRET).
+    Always returns 200 with a structured summary so Cloud Scheduler does
+    not retry on transient send failures.
+    """
+    settings = get_settings()
+    expected = settings.internal_cron_secret
+    if not expected:
+        return Response(status_code=403)
+    provided = request.headers.get("X-Cron-Token", "")
+    if not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
+        return Response(status_code=403)
+
+    reference_time = _parse_cloud_scheduler_time(
+        request.headers.get("X-CloudScheduler-ScheduleTime", "")
+    )
+
+    from src.services.scheduler_service import peek_scheduler_service
+
+    scheduler = peek_scheduler_service()
+    if scheduler is None:
+        return JSONResponse(
+            {"fired": [], "failed": [], "skipped_duplicate": [], "reason": "scheduler_not_initialized"}
+        )
+
+    summary = await scheduler.dispatch_due_jobs(reference_time=reference_time)
+    return JSONResponse(summary)
 
 
 # ── Webhook ──────────────────────────────────────────────────

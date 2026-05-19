@@ -295,16 +295,23 @@ if [[ "$SCHEDULED_MESSAGES_ENABLED_VALUE" == "true" ]] && [[ -n "$SCHEDULED_GROU
   fi
 fi
 
+# Always scale to zero. Scheduled messages no longer rely on an in-process
+# timer; Cloud Scheduler triggers /internal/cron each minute instead, so
+# the Cloud Run service can hibernate between requests and stay inside the
+# request-based free tier.
 if [[ -z "$MIN_INSTANCE_COUNT" ]]; then
-  if [[ "$SCHEDULED_MESSAGES_ENABLED_VALUE" == "true" ]] \
-    && [[ -n "$SCHEDULED_GROUP_ID_VALUE" ]] \
-    && [[ "$HAS_SCHEDULED_JOBS_CONFIG" == "true" ]]; then
-    MIN_INSTANCE_COUNT="1"
-  else
-    MIN_INSTANCE_COUNT="0"
+  MIN_INSTANCE_COUNT="0"
+fi
+validate_non_negative_int "$MIN_INSTANCE_COUNT" "Cloud Run min instances"
+
+INTERNAL_CRON_SECRET_VALUE="$(read_env_key INTERNAL_CRON_SECRET)"
+if [[ "$SCHEDULED_MESSAGES_ENABLED_VALUE" == "true" ]] \
+  && [[ -n "$SCHEDULED_GROUP_ID_VALUE" ]] \
+  && [[ "$HAS_SCHEDULED_JOBS_CONFIG" == "true" ]]; then
+  if [[ -z "$INTERNAL_CRON_SECRET_VALUE" ]]; then
+    fail "SCHEDULED_MESSAGES_ENABLED=true requires INTERNAL_CRON_SECRET in $ENV_FILE (e.g. $(printf 'INTERNAL_CRON_SECRET=%s' "$(openssl rand -hex 32 2>/dev/null || echo 'change-me-to-a-random-string')"))"
   fi
 fi
-validate_non_negative_int "$MIN_INSTANCE_COUNT" "auto-calculated Cloud Run min instances"
 
 gcloud config set project "$PROJECT_ID" >/dev/null
 
@@ -369,6 +376,7 @@ if [[ "$ENABLE_APIS" == "true" ]]; then
     artifactregistry.googleapis.com \
     iamcredentials.googleapis.com \
     cloudresourcemanager.googleapis.com \
+    cloudscheduler.googleapis.com \
     --project "$PROJECT_ID" >/dev/null
 fi
 
@@ -499,6 +507,46 @@ gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
   --region "$REGION" \
   --member="allUsers" \
   --role="roles/run.invoker" >/dev/null
+
+SCHEDULER_JOB_NAME="${SERVICE_NAME}-cron"
+if [[ "$SCHEDULED_MESSAGES_ENABLED_VALUE" == "true" ]] \
+  && [[ -n "$SCHEDULED_GROUP_ID_VALUE" ]] \
+  && [[ "$HAS_SCHEDULED_JOBS_CONFIG" == "true" ]]; then
+  echo "[step] Ensuring Cloud Scheduler job '$SCHEDULER_JOB_NAME' for /internal/cron"
+  scheduler_args=(
+    --project "$PROJECT_ID"
+    --location "$REGION"
+    --schedule="* * * * *"
+    --time-zone="Asia/Taipei"
+    --uri="$SERVICE_URL/internal/cron"
+    --http-method=POST
+    --headers="X-Cron-Token=$INTERNAL_CRON_SECRET_VALUE"
+    --attempt-deadline=60s
+    --max-retry-attempts=0
+    --description="LineBot scheduled message dispatch trigger"
+  )
+  if gcloud scheduler jobs describe "$SCHEDULER_JOB_NAME" \
+    --project "$PROJECT_ID" \
+    --location "$REGION" >/dev/null 2>&1; then
+    gcloud scheduler jobs update http "$SCHEDULER_JOB_NAME" \
+      "${scheduler_args[@]}" >/dev/null
+    echo "       Cloud Scheduler job updated"
+  else
+    gcloud scheduler jobs create http "$SCHEDULER_JOB_NAME" \
+      "${scheduler_args[@]}" >/dev/null
+    echo "       Cloud Scheduler job created"
+  fi
+else
+  if gcloud scheduler jobs describe "$SCHEDULER_JOB_NAME" \
+    --project "$PROJECT_ID" \
+    --location "$REGION" >/dev/null 2>&1; then
+    echo "[step] Removing stale Cloud Scheduler job '$SCHEDULER_JOB_NAME' (scheduler disabled)"
+    gcloud scheduler jobs delete "$SCHEDULER_JOB_NAME" \
+      --project "$PROJECT_ID" \
+      --location "$REGION" \
+      --quiet >/dev/null
+  fi
+fi
 
 if [[ "$SKIP_SMOKE" != "true" ]]; then
   echo "[step] Running post-deploy smoke checks"

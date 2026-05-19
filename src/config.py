@@ -145,6 +145,11 @@ class Settings(BaseSettings):
     scheduled_group_id: str = ""
     scheduled_weekly_messages: list[ScheduledWeeklyMessage] = Field(default_factory=list)
     scheduled_yearly_messages: list[ScheduledYearlyMessage] = Field(default_factory=list)
+    scheduled_messages_timezone: str = "Asia/Taipei"
+    # Shared secret used by /internal/cron. Cloud Scheduler sends this in the
+    # X-Cron-Token header; the endpoint refuses access when the secret is empty
+    # or does not match. Leave blank in dev to disable the endpoint entirely.
+    internal_cron_secret: str = ""
 
     # ── Rate limiting ─────────────────────────────────────────
     rate_limit_max_requests: int = 30

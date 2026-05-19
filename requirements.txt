@@ -31,5 +31,5 @@ google-cloud-storage>=2.14.0
 # Disable via FIRESTORE_ENABLED=false to fall back to in-memory.
 google-cloud-firestore>=2.16.0
 
-# Scheduler (weekly/yearly scheduled messages)
-APScheduler>=3.10.0
+# Timezone database for zoneinfo (Asia/Taipei scheduling under python:3.11-slim)
+tzdata>=2024.1

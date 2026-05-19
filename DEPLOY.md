@@ -78,15 +78,18 @@ cp .env.example .env
 - `LINE_PUSH_FALLBACK_ENABLED=true`
 - `SCHEDULED_GROUP_ID`
 - `SCHEDULED_WEEKLY_MESSAGES` 或 `SCHEDULED_YEARLY_MESSAGES` 至少有一個有內容
+- `INTERNAL_CRON_SECRET`（建議 `openssl rand -hex 32`）— 提供給 Cloud Scheduler 用的共用密鑰
 
 而 `LINE_PUSH_MONTHLY_LIMIT`：
 
 - 設成 `0` = 排程 direct push 不設上限
 - 設成 `>0` = 幫 direct push 加每月上限
 
-部署腳本會自動處理這兩件事：
+部署腳本會自動處理這幾件事：
 
-- `min instances`：只有啟用排程且有實際 job 時才設為 `1`，其他情況 `0`
+- `min-instances` 永遠是 `0`（scale-to-zero，吃 Cloud Run 免費額度）
+- 啟用 `cloudscheduler.googleapis.com`，並建立 / 更新 `<service>-cron` Cloud Scheduler job
+- 該 Cloud Scheduler job 每分鐘 POST `/internal/cron`，由應用程式自行決定哪些 weekly/yearly job 該觸發
 - runtime service account：沿用目前 Cloud Run 設定；第一次部署則使用預設 service account
 
 ---
@@ -122,7 +125,7 @@ cp .env.example .env
 
 - 自動產生唯一 image tag
 - 部署到同一個 Cloud Run service
-- `min-instances` 會依排程需求自動決定（也可手動覆寫）
+- `min-instances` 永遠 `0`（free-tier scale-to-zero）；排程改由 Cloud Scheduler 觸發
 - 將 100% 流量切到最新 revision
 - 在 Cloud Build 內跑 `pytest` 和 `compileall`
 - 部署後跑 smoke check
@@ -175,7 +178,7 @@ cp .env.example .env
 
 1. 讀 `.env`
 2. 驗證必要 env key 是否存在
-3. 自動確保 `cloudbuild.googleapis.com`、`run.googleapis.com`、`artifactregistry.googleapis.com`、`iamcredentials.googleapis.com`、`cloudresourcemanager.googleapis.com` 已啟用
+3. 自動確保 `cloudbuild.googleapis.com`、`run.googleapis.com`、`artifactregistry.googleapis.com`、`iamcredentials.googleapis.com`、`cloudresourcemanager.googleapis.com`、`cloudscheduler.googleapis.com` 已啟用
 4. 產生暫時的 Cloud Run env-vars YAML
 5. 送出 `cloudbuild.yaml`
 6. Cloud Build 內執行測試與語法檢查
@@ -228,11 +231,64 @@ curl -fsS "$SERVICE_URL/health" | python -m json.tool
 
 ### 查看部署後目前設定的排程 push 訊息內容
 
+排程從舊版的 in-process APScheduler 改成 Cloud Scheduler 每分鐘觸發 `/internal/cron`。有三個角度可以查：
+
+**A. 看「線上 app 實際載入的排程」（最直觀，含每筆 next_run 自動換算到 Asia/Taipei）**
+
+```bash
+PROJECT_ID="$(python3 scripts/envfile.py get --file .env GCP_PROJECT_ID)"
+SERVICE_NAME="$(python3 scripts/envfile.py get --file .env CLOUD_RUN_SERVICE_NAME)"
+REGION="$(python3 scripts/envfile.py get --file .env CLOUD_RUN_REGION)"
+SERVICE_URL="$(gcloud run services describe "$SERVICE_NAME" \
+  --project "$PROJECT_ID" --region "$REGION" \
+  --format='value(status.url)')"
+
+curl -fsS "$SERVICE_URL/health" | python3 -c "
+import json, sys
+jobs = sorted(json.load(sys.stdin)['scheduler']['jobs'], key=lambda j: j['next_run'])
+print('{:<28} {:<32} {}'.format('NEXT RUN (Asia/Taipei)', 'ID', 'MESSAGE'))
+print('-' * 100)
+for j in jobs:
+    name = j['name']
+    msg = name.split(': ', 1)[1] if ': ' in name else name
+    print('{:<28} {:<32} {}'.format(j['next_run'], j['id'], msg))
+"
+```
+
+**B. 看「Cloud Run 上實際的 env JSON」（看原始 SCHEDULED_WEEKLY_MESSAGES / SCHEDULED_YEARLY_MESSAGES 字串內容）**
+
 ```bash
 gcloud run services describe "$SERVICE_NAME" \
   --project "$PROJECT_ID" \
   --region "$REGION" \
-  --format=json | python -c 'import json,sys; svc=json.load(sys.stdin); env={e["name"]: e.get("value","") for e in svc["spec"]["template"]["spec"]["containers"][0].get("env", [])}; out={"SCHEDULED_MESSAGES_ENABLED": env.get("SCHEDULED_MESSAGES_ENABLED"), "SCHEDULED_GROUP_ID": env.get("SCHEDULED_GROUP_ID"), "SCHEDULED_WEEKLY_MESSAGES": json.loads(env.get("SCHEDULED_WEEKLY_MESSAGES", "[]") or "[]"), "SCHEDULED_YEARLY_MESSAGES": json.loads(env.get("SCHEDULED_YEARLY_MESSAGES", "[]") or "[]")}; print(json.dumps(out, ensure_ascii=False, indent=2))'
+  --format=json | python -c 'import json,sys; svc=json.load(sys.stdin); env={e["name"]: e.get("value","") for e in svc["spec"]["template"]["spec"]["containers"][0].get("env", [])}; out={"SCHEDULED_MESSAGES_ENABLED": env.get("SCHEDULED_MESSAGES_ENABLED"), "SCHEDULED_GROUP_ID": env.get("SCHEDULED_GROUP_ID"), "SCHEDULED_MESSAGES_TIMEZONE": env.get("SCHEDULED_MESSAGES_TIMEZONE"), "SCHEDULED_WEEKLY_MESSAGES": json.loads(env.get("SCHEDULED_WEEKLY_MESSAGES", "[]") or "[]"), "SCHEDULED_YEARLY_MESSAGES": json.loads(env.get("SCHEDULED_YEARLY_MESSAGES", "[]") or "[]")}; print(json.dumps(out, ensure_ascii=False, indent=2))'
+```
+
+**C. 看「Cloud Scheduler 觸發器本身」（只含每分鐘 HTTP POST 設定，不含訊息內容）**
+
+```bash
+gcloud scheduler jobs describe "${SERVICE_NAME}-cron" \
+  --project "$PROJECT_ID" \
+  --location "$REGION" \
+  --format='yaml(schedule,timeZone,state,httpTarget.uri,httpTarget.httpMethod,attemptDeadline,lastAttemptTime)'
+```
+
+**D. 查最近 cron 是否真的有觸發 `/internal/cron`（10 分鐘內每分鐘應該都有一筆 200）**
+
+```bash
+gcloud logging read \
+  'resource.type=cloud_run_revision AND resource.labels.service_name="'"$SERVICE_NAME"'" AND textPayload:"POST /internal/cron"' \
+  --project "$PROJECT_ID" --limit 10 --freshness=10m \
+  --format='value(timestamp,textPayload)'
+```
+
+**E. 查 app 端有沒有真的 fire 過任何排程（每週一 21:00 之後可看）**
+
+```bash
+gcloud logging read \
+  'resource.type=cloud_run_revision AND resource.labels.service_name="'"$SERVICE_NAME"'" AND textPayload:"Scheduled send"' \
+  --project "$PROJECT_ID" --limit 20 --freshness=7d \
+  --format='value(timestamp,textPayload)'
 ```
 
 ### 查看最新 revision
@@ -373,6 +429,7 @@ gcloud logging read \
 | --- | --- | --- |
 | `/health` | `GET` | Readiness、provider 狀態、成本控制狀態、agent 呼叫計數 |
 | `/webhook` | `POST` | LINE webhook（HMAC-SHA256 驗簽） |
+| `/internal/cron` | `POST` | Cloud Scheduler 每分鐘觸發排程訊息；`X-Cron-Token` 共用密鑰驗證（`INTERNAL_CRON_SECRET`） |
 
 ---
 
@@ -385,7 +442,7 @@ gcloud logging read \
 | 網路搜尋 | 不做 app 內配額限制；實際額度以 Tavily free plan / API 回應為準（`WEB_SEARCH_MONTHLY_QUOTA` 僅保留相容舊設定） |
 | GCS 媒體 | Signed URL 48 小時過期，app 2 天後清理，部署腳本驗證 3 天 lifecycle 保底 |
 | 使用者請求 | 每人滑動視窗 rate limit |
-| Cloud Run | `max-instances=1`，`min-instances` 自動判斷（一般 `0`，有排程時 `1`） |
+| Cloud Run | `max-instances=1`、`min-instances=0`（scale-to-zero），request-based billing 走免費額度 |
 
 ---
 
@@ -400,7 +457,7 @@ gcloud logging read \
 - 引用訊息快取、LINE push 計數與模型 rate state 仍是 **in-memory / per-instance**；重部署後會重置，多 instance 之間也不共享。
 - 網路搜尋目前不做 app 內配額限制；真正可用額度以 Tavily free plan / API 回應為準。
 - Tavily 搜尋查詢會自動帶入目前日期時間，幫助「今天 / 最近 / 現在 / 最新」這類相對時間詞對齊到當下時點。
-- 排程訊息需要同時設定 `SCHEDULED_MESSAGES_ENABLED=true`、`LINE_PUSH_FALLBACK_ENABLED=true`、`SCHEDULED_GROUP_ID`、以及至少一個排程 job。
+- 排程訊息需要同時設定 `SCHEDULED_MESSAGES_ENABLED=true`、`LINE_PUSH_FALLBACK_ENABLED=true`、`SCHEDULED_GROUP_ID`、`INTERNAL_CRON_SECRET`，以及至少一個排程 job。觸發機制：Cloud Run 不再用 in-process timer，改由 Cloud Scheduler 每分鐘 POST `/internal/cron`，因此 Cloud Run 可以維持 `min-instances=0`、走免費額度。
 - Prompts 從 `prompts/*.md` 載入，調整路由或語氣不需要改 Python 程式碼。
 
 ---

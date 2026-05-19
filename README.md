@@ -86,7 +86,7 @@ System prompts live in `prompts/*.md`, and most runtime tuning lives in `.env`. 
 | Image generation | Prompt refinement and description generation run in parallel, then NVIDIA FLUX.1-dev generates the image; both image and text description are delivered together |
 | Voice reply | `edge-tts` produces audio, uploads it to GCS, and sends a LINE audio reply |
 | Quoted context | Reply to an earlier text or image and recover the original content from local cache |
-| Scheduled messages | APScheduler can send recurring group reminders and yearly birthday messages |
+| Scheduled messages | Cloud Scheduler pings `/internal/cron` every minute; the app fires any weekly / yearly LINE push reminders whose cron expression matches the current Asia/Taipei minute |
 | Simplified-to-traditional conversion | All LLM output is normalized through OpenCC before being sent back to LINE |
 | Prompt-injection blocking | Regex-based screening rejects common jailbreak patterns before dispatch |
 | Health dashboard | `/health` exposes readiness, provider status, cost-control state, and agent call counters |
@@ -147,7 +147,7 @@ The rate tracker skips exhausted models before sending a request, so a `429` can
 | Web search | Tavily |
 | Voice | `edge-tts` |
 | Object storage | Google Cloud Storage |
-| Scheduling | APScheduler |
+| Scheduling | Cloud Scheduler → `/internal/cron` |
 | Text conversion | OpenCC |
 | Image processing | Pillow |
 | Delivery pipeline | Cloud Build -> Artifact Registry -> Cloud Run |

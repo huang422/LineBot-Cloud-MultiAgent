@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 from contextlib import ExitStack, contextmanager
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -373,3 +374,249 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         cache_service.cache_processed_request.assert_not_called()
         enrich_request.assert_not_called()
         send_response.assert_not_called()
+
+
+class InternalCronEndpointTests(unittest.TestCase):
+    """Cover /internal/cron auth, time parsing, and dispatch wiring."""
+
+    def setUp(self) -> None:
+        main_module._background_tasks.clear()
+        self.addCleanup(main_module._background_tasks.clear)
+        self.settings = Settings(
+            _env_file=None,
+            line_channel_secret="secret",
+            line_channel_access_token="token",
+            openrouter_api_key="key",
+            internal_cron_secret="super-secret",
+            log_level="ERROR",
+        )
+
+    @contextmanager
+    def _client_with_scheduler(self, scheduler):
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(main_module, "get_settings", return_value=self.settings)
+            )
+            stack.enter_context(
+                patch("src.services.scheduler_service.peek_scheduler_service", return_value=scheduler)
+            )
+            client = stack.enter_context(TestClient(main_module.app))
+            yield client
+
+    def test_internal_cron_rejects_missing_token(self) -> None:
+        scheduler = SimpleNamespace(
+            dispatch_due_jobs=AsyncMock(return_value={"fired": [], "failed": [], "skipped_duplicate": []})
+        )
+        with self._client_with_scheduler(scheduler) as client:
+            response = client.post("/internal/cron")
+        self.assertEqual(response.status_code, 403)
+        scheduler.dispatch_due_jobs.assert_not_called()
+
+    def test_internal_cron_rejects_wrong_token(self) -> None:
+        scheduler = SimpleNamespace(
+            dispatch_due_jobs=AsyncMock(return_value={"fired": [], "failed": [], "skipped_duplicate": []})
+        )
+        with self._client_with_scheduler(scheduler) as client:
+            response = client.post("/internal/cron", headers={"X-Cron-Token": "wrong"})
+        self.assertEqual(response.status_code, 403)
+        scheduler.dispatch_due_jobs.assert_not_called()
+
+    def test_internal_cron_rejects_when_secret_empty(self) -> None:
+        empty_settings = Settings(
+            _env_file=None,
+            line_channel_secret="secret",
+            line_channel_access_token="token",
+            openrouter_api_key="key",
+            internal_cron_secret="",
+            log_level="ERROR",
+        )
+        scheduler = SimpleNamespace(
+            dispatch_due_jobs=AsyncMock(return_value={"fired": [], "failed": [], "skipped_duplicate": []})
+        )
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(main_module, "get_settings", return_value=empty_settings)
+            )
+            stack.enter_context(
+                patch("src.services.scheduler_service.peek_scheduler_service", return_value=scheduler)
+            )
+            client = stack.enter_context(TestClient(main_module.app))
+            response = client.post("/internal/cron", headers={"X-Cron-Token": "anything"})
+        self.assertEqual(response.status_code, 403)
+        scheduler.dispatch_due_jobs.assert_not_called()
+
+    def test_internal_cron_dispatches_with_schedule_time_header(self) -> None:
+        dispatched = {}
+
+        async def fake_dispatch(*, reference_time=None, sender=None):
+            dispatched["ref"] = reference_time
+            dispatched["sender"] = sender
+            return {"fired": ["weekly1"], "failed": [], "skipped_duplicate": []}
+
+        scheduler = SimpleNamespace(dispatch_due_jobs=fake_dispatch)
+        with self._client_with_scheduler(scheduler) as client:
+            response = client.post(
+                "/internal/cron",
+                headers={
+                    "X-Cron-Token": "super-secret",
+                    "X-CloudScheduler-ScheduleTime": "2026-05-25T13:00:00Z",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["fired"], ["weekly1"])
+        # The reference time must be tz-aware and equal to 2026-05-25T13:00:00 UTC.
+        ref = dispatched["ref"]
+        self.assertIsNotNone(ref)
+        self.assertEqual(ref.tzinfo.utcoffset(ref), timedelta(0))
+        self.assertEqual(ref.year, 2026)
+        self.assertEqual(ref.month, 5)
+        self.assertEqual(ref.day, 25)
+        self.assertEqual(ref.hour, 13)
+        self.assertEqual(ref.minute, 0)
+
+    def test_internal_cron_handles_missing_schedule_time(self) -> None:
+        async def fake_dispatch(*, reference_time=None, sender=None):
+            return {
+                "reference_time": "ignored",
+                "fired": [],
+                "failed": [],
+                "skipped_duplicate": [],
+                "reference_passed_as_none": reference_time is None,
+            }
+
+        scheduler = SimpleNamespace(dispatch_due_jobs=fake_dispatch)
+        with self._client_with_scheduler(scheduler) as client:
+            response = client.post(
+                "/internal/cron",
+                headers={"X-Cron-Token": "super-secret"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        # When no schedule-time header is provided, endpoint passes
+        # reference_time=None so SchedulerService falls back to wall-clock.
+        self.assertTrue(response.json()["reference_passed_as_none"])
+
+    def test_internal_cron_returns_200_when_scheduler_not_initialized(self) -> None:
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(main_module, "get_settings", return_value=self.settings)
+            )
+            stack.enter_context(
+                patch("src.services.scheduler_service.peek_scheduler_service", return_value=None)
+            )
+            client = stack.enter_context(TestClient(main_module.app))
+            response = client.post(
+                "/internal/cron",
+                headers={"X-Cron-Token": "super-secret"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["reason"], "scheduler_not_initialized")
+
+
+class SchedulerServiceDispatchTests(unittest.IsolatedAsyncioTestCase):
+    """Verify the new pull-style SchedulerService logic that replaces APScheduler."""
+
+    def _build(self):
+        from src.services.scheduler_service import SchedulerService
+
+        return SchedulerService(timezone_name="Asia/Taipei")
+
+    async def test_weekly_job_fires_when_minute_matches_in_local_timezone(self) -> None:
+        scheduler = self._build()
+        scheduler.add_weekly_message("weekly1", "mon", 21, 0, "G", "msg")
+
+        sent: list[tuple[str, str]] = []
+
+        async def sender(g, m):
+            sent.append((g, m))
+            return True
+
+        # 2026-05-25 Mon 21:00 Asia/Taipei == 13:00 UTC
+        ref = datetime(2026, 5, 25, 13, 0, tzinfo=timezone.utc)
+        result = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
+
+        self.assertEqual(result["fired"], ["weekly1"])
+        self.assertEqual(sent, [("G", "msg")])
+
+    async def test_weekly_job_skipped_when_minute_does_not_match(self) -> None:
+        scheduler = self._build()
+        scheduler.add_weekly_message("weekly1", "mon", 21, 0, "G", "msg")
+
+        async def sender(g, m):
+            return True
+
+        # Mon 21:01 Asia/Taipei == 13:01 UTC -- not matching :00
+        ref = datetime(2026, 5, 25, 13, 1, tzinfo=timezone.utc)
+        result = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
+        self.assertEqual(result["fired"], [])
+
+    async def test_dedupe_within_same_minute(self) -> None:
+        scheduler = self._build()
+        scheduler.add_weekly_message("weekly1", "mon", 21, 0, "G", "msg")
+
+        async def sender(g, m):
+            return True
+
+        ref = datetime(2026, 5, 25, 13, 0, tzinfo=timezone.utc)
+        first = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
+        second = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
+        self.assertEqual(first["fired"], ["weekly1"])
+        self.assertEqual(second["fired"], [])
+        self.assertEqual(second["skipped_duplicate"], ["weekly1"])
+
+    async def test_yearly_job_matches_in_local_timezone(self) -> None:
+        scheduler = self._build()
+        scheduler.add_yearly_message("bday", 4, 22, 9, 0, "G", "happy bday")
+
+        sent: list[tuple[str, str]] = []
+
+        async def sender(g, m):
+            sent.append((g, m))
+            return True
+
+        # 2027-04-22 09:00 Asia/Taipei == 01:00 UTC
+        ref = datetime(2027, 4, 22, 1, 0, tzinfo=timezone.utc)
+        result = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
+        self.assertEqual(result["fired"], ["bday"])
+        self.assertEqual(sent, [("G", "happy bday")])
+
+    async def test_failed_sender_reported_but_does_not_raise(self) -> None:
+        scheduler = self._build()
+        scheduler.add_weekly_message("weekly1", "mon", 21, 0, "G", "msg")
+
+        async def sender(g, m):
+            return False
+
+        ref = datetime(2026, 5, 25, 13, 0, tzinfo=timezone.utc)
+        result = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
+        self.assertEqual(result["fired"], [])
+        self.assertEqual(result["failed"], ["weekly1"])
+
+    async def test_remove_job_excludes_from_dispatch(self) -> None:
+        scheduler = self._build()
+        scheduler.add_weekly_message("weekly1", "mon", 21, 0, "G", "msg")
+        self.assertTrue(scheduler.remove_job("weekly1"))
+
+        async def sender(g, m):
+            return True
+
+        ref = datetime(2026, 5, 25, 13, 0, tzinfo=timezone.utc)
+        result = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
+        self.assertEqual(result["fired"], [])
+
+    async def test_get_stats_shape_preserves_health_dashboard_contract(self) -> None:
+        scheduler = self._build()
+        scheduler.add_weekly_message("weekly1", "mon", 21, 0, "G", "msg")
+        scheduler.add_yearly_message("bday", 4, 22, 9, 0, "G", "happy")
+        stats = scheduler.get_stats()
+        self.assertIn("running", stats)
+        self.assertEqual(stats["job_count"], 2)
+        self.assertEqual(len(stats["jobs"]), 2)
+        for job in stats["jobs"]:
+            self.assertIn("id", job)
+            self.assertIn("name", job)
+            self.assertIn("next_run", job)
+            self.assertIn("trigger", job)

@@ -120,7 +120,7 @@ steps:
           --region "${_REGION}"
           --platform managed
           --allow-unauthenticated
-          --no-cpu-throttling
+          --cpu-throttling
           --min-instances "${_MIN_INSTANCES}"
           --max-instances 1
           --timeout 300

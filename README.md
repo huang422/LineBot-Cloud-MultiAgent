@@ -133,6 +133,329 @@ The rate tracker skips exhausted models before sending a request, so a `429` can
 
 ---
 
+## System design
+
+This section is the deep-dive companion to the quick overview above. It is intended to be read top-to-bottom as a walkthrough of how a single LINE message becomes a reply, including every model, fallback hop, and storage touchpoint.
+
+### 1. System architecture overview
+
+A serverless, event-driven design. Cloud Run hosts a single FastAPI app that fans out to external AI providers and stateless storage. Nothing runs when no traffic arrives (scale-to-zero), which keeps the system inside free-tier budgets.
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│ CLIENT  -  LINE user · group · room                            │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓  text / image / quoted message / voice request
+┌────────────────────────────────────────────────────────────────┐
+│ LINE MESSAGING API                                             │
+│ webhook delivery  +  reply (free) / push (fallback)            │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓  POST /webhook   (+ X-Line-Signature)
+┌────────────────────────────────────────────────────────────────┐
+│ GCP CLOUD RUN  -  FastAPI app (main.py)   [scale-to-zero]      │
+├────────────────────────────────────────────────────────────────┤
+│ Endpoints:  /webhook    /health    /internal/cron              │
+│                                                                │
+│ Async pipeline (HTTP returns 200 OK before any model call):    │
+│   Input -> Enrich -> Orchestrator -> Agent x4 -> Output        │
+│   proc.   rate+mem   (router)                   proc.          │
+│                                                                │
+│ Core engine:  FallbackChain + RateTracker                      │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓  fan-out to external services
+┌────────────────────────────────────────────────────────────────┐
+│ EXTERNAL AI PROVIDERS                                          │
+├────────────────────────────────────────────────────────────────┤
+│ NVIDIA API      LLM · vision · image gen · embeddings          │
+│ OpenRouter API  LLM + vision fallback                          │
+│ Tavily          web search + URL extract                       │
+│ edge-tts        voice synthesis (TTS)                          │
+└────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│ STATE & STORAGE                                                │
+├────────────────────────────────────────────────────────────────┤
+│ Firestore Native  chat memory · profile · episodes             │
+│ Cloud Storage     images · audio (signed URLs)                 │
+│ In-memory/inst.   quoted msgs · rate state · push count        │
+└────────────────────────────────────────────────────────────────┘
+
+Cloud Scheduler ──(1 call / min · X-Cron-Token)──→ POST /internal/cron
+```
+
+| Component | Responsibility | Key implementation |
+| --- | --- | --- |
+| FastAPI endpoints | Webhook intake, health, cron trigger | [main.py](main.py) |
+| Input processor | Decode event, download image, sanitize, anti-injection, recover quoted context | [src/processors/input_processor.py](src/processors/input_processor.py) |
+| Webhook handler | Trigger detection (`!hej` / @mention / DM), memory enrichment, rate limit | [src/handlers/webhook_handler.py](src/handlers/webhook_handler.py) |
+| Orchestrator | Choose agent + output format + thinking flag | [src/agents/orchestrator.py](src/agents/orchestrator.py) |
+| Specialist agents | `chat`, `vision`, `web_search`, `image_gen` | [src/agents/](src/agents/) |
+| Fallback chain | Rate-limit-aware multi-provider retry | [src/providers/fallback_chain.py](src/providers/fallback_chain.py) |
+| Providers | NVIDIA + OpenRouter OpenAI-compatible clients | [src/providers/](src/providers/) |
+| Output processor | Text/voice/image delivery + OpenCC s2t | [src/processors/output_processor.py](src/processors/output_processor.py) |
+| Memory service | Layered chat memory, episodic recall, user profile | [src/services/memory_service.py](src/services/memory_service.py) |
+
+### 2. End-to-end request lifecycle
+
+The webhook returns `200 OK` **before** any model is called. All heavy work happens in a fire-and-forget background task, so LINE never sees a slow response and never retries.
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│ 1-2  User  ->  LINE platform  ->  POST /webhook                │
+│              (+ X-Line-Signature)                              │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ 3  FastAPI /webhook                                            │
+├────────────────────────────────────────────────────────────────┤
+│ validate HMAC-SHA256 signature                                 │
+│ return 200 OK immediately  ->  LINE   (never retries)          │
+│ create_task(_process_event)   (fire-and-forget)                │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓  background task
+┌────────────────────────────────────────────────────────────────┐
+│ 4  Input processor                                             │
+├────────────────────────────────────────────────────────────────┤
+│ download image · sanitize · block injection · recover quote    │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ 5  Enrich                                                      │
+├────────────────────────────────────────────────────────────────┤
+│ rate-limit check  +  load memory                               │
+│ -> history + summary + previous routing state                  │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ 6  Orchestrator.route()                                        │
+├────────────────────────────────────────────────────────────────┤
+│ fast rule hit          ->  RouterDecision                      │
+│ else LLM classify      ->  Nemotron 3 Super 120B (JSON)        │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ 7  Agent.process()  ->  FallbackChain.generate()               │
+├────────────────────────────────────────────────────────────────┤
+│ try model 1 -> 2 -> 3  (skip rate-limited; thinking on/off)    │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ 8  Output processor   (OpenCC simplified -> traditional)       │
+├────────────────────────────────────────────────────────────────┤
+│ reply_token (free)  ->  push (fallback)                        │
+│ text · voice (TTS -> GCS) · image (GCS signed URL)             │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓  deliver
+┌────────────────────────────────────────────────────────────────┐
+│ 9-10  LINE delivers reply -> user                              │
+├────────────────────────────────────────────────────────────────┤
+│ record_interaction; rotate summary if window full (async)      │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 3. Orchestrator routing & adaptive thinking
+
+Routing is a two-tier funnel. Cheap deterministic regex rules resolve the obvious cases with **zero LLM calls**; only genuinely ambiguous text reaches the LLM classifier. Independently, the orchestrator decides whether the downstream model should reason ("thinking"). The orchestrator's own JSON classification always stays non-thinking for output stability.
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│ AgentRequest                                                   │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ FAST RULES   (regex · zero LLM call)                           │
+├────────────────────────────────────────────────────────────────┤
+│ image + gen keywords      ->  image_gen                        │
+│ image (only / question)   ->  vision                           │
+│ URL detected              ->  web_search                       │
+│ time-sensitive / lookup   ->  web_search                       │
+│ draw / generate keywords  ->  image_gen                        │
+│ follow-up to last turn    ->  continue previous agent          │
+│ no rule matched           ->  LLM classifier (below)           │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓  only ambiguous text
+┌────────────────────────────────────────────────────────────────┐
+│ LLM CLASSIFIER   Nemotron 3 Super 120B · temp 0 · 384 tok      │
+├────────────────────────────────────────────────────────────────┤
+│ outputs single-line JSON:                                      │
+│   agent · output_format · needs_thinking · task · reason       │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ ROUTER DECISION  ->  adaptive thinking control                 │
+├────────────────────────────────────────────────────────────────┤
+│ reasoning-heavy   (debug · traceback · proof · planning ·      │
+│ long-form)        ->  THINKING ON   · Gemma 4 31B              │
+│                                                                │
+│ default / short   (greeting · simple Q)                        │
+│                   ->  THINKING OFF  · Qwen3.5 397B             │
+└────────────────────────────────────────────────────────────────┘
+```
+
+- **Fast-rule signals:** image-generation verbs, attached images, URLs, time-sensitive / lookup keywords (news, weather, prices, addresses), and follow-up indicators that anchor to the previous routed agent.
+- **Output format** (`text` / `voice` / `image`) is decided in the same pass — voice keywords trigger TTS, negation keywords force text, image-gen always returns an image.
+- **Thinking is opt-in:** the default path runs the larger Qwen3.5 397B without reasoning for speed; only clearly reasoning-heavy requests switch to the dedicated thinking model.
+
+### 4. Multi-agent dispatch & model matrix
+
+Four specialist agents share one rate-limit-aware fallback chain but carry their own system prompt, temperature, token budget, and model order.
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│ SPECIALIST AGENTS   (own prompt · temperature · max tokens)    │
+├────────────────────────────────────────────────────────────────┤
+│ chat        0.7 / 2048   (+ agentic tool loop)                 │
+│ vision      0.5 / 1024                                         │
+│ web_search  0.2 / 3072                                         │
+│ image_gen   0.7 / 1024   (two-stage pipeline)                  │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓  each agent picks a fallback chain
+┌────────────────────────────────────────────────────────────────┐
+│ TEXT FALLBACK CHAIN   (chat · web_search · img stage 1)        │
+├────────────────────────────────────────────────────────────────┤
+│ 1  NVIDIA Qwen3.5 397B   (Gemma 4 31B when thinking)           │
+│ 2  OpenRouter Nemotron 3 Super 120B  (free)                    │
+│ 3  openrouter/free       (auto router)                         │
+└────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│ VISION FALLBACK CHAIN                                          │
+├────────────────────────────────────────────────────────────────┤
+│ 1  NVIDIA Qwen3.5 397B VLM  (Gemma 4 31B when thinking)        │
+│ 2  OpenRouter Gemma 4 31B   (free)                             │
+└────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│ IMAGE GENERATION   (NVIDIA Visual GenAI NIM)                   │
+├────────────────────────────────────────────────────────────────┤
+│ Stage 1 (text):  refine prompt + describe   (parallel)         │
+│ Stage 2 (NIM) :  FLUX.1-dev · 50 steps · cfg 5                 │
+└────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│ chat AGENTIC TOOL LOOP   (max 4 iterations)                    │
+├────────────────────────────────────────────────────────────────┤
+│ recall_memory(query, k)     vector recall of episodes          │
+│ update_user_profile(facts)  durable cross-chat facts           │
+│ web_search(query)           Tavily fallback                    │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Model inventory (all roles & specs):**
+
+| Role | Model | Provider | Params / context | Capabilities |
+| --- | --- | --- | --- | --- |
+| Text default (non-thinking) | Qwen3.5 397B (`qwen/qwen3.5-397b-a17b`) | NVIDIA | 397B MoE / 17B active · 262K | vision, reasoning |
+| Text reasoning (thinking) | Gemma 4 31B (`google/gemma-4-31b-it`) | NVIDIA | 31B · 262K | vision, tools, reasoning |
+| Text fallback #1 | Nemotron 3 Super 120B (`nvidia/nemotron-3-super-120b-a12b:free`) | OpenRouter | 120B MoE · 262K | tools, reasoning |
+| Text fallback #2 | Free auto router (`openrouter/free`) | OpenRouter | auto · 200K | vision, tools |
+| Orchestrator primary | Nemotron 3 Super 120B (`:free`) | OpenRouter | 120B MoE · 262K | tools, reasoning |
+| Orchestrator fallback | Nemotron 3 Super 120B (`nvidia/nemotron-3-super-120b-a12b`) | NVIDIA | 120B MoE · 1M | tools, reasoning |
+| Vision primary | Qwen3.5 397B | NVIDIA | 397B MoE · 262K | vision, reasoning |
+| Vision fallback | Gemma 4 31B (`google/gemma-4-31b-it:free`) | OpenRouter | 31B · 262K | vision, tools |
+| Image generation | FLUX.1-dev (`black-forest-labs/flux.1-dev`) | NVIDIA Visual GenAI NIM | diffusion · 50 steps | image_gen |
+| Episodic embeddings | `nvidia/nv-embedqa-e5-v5` | NVIDIA | 1024-dim | multilingual embeddings |
+| Memory compaction | Qwen3.5 397B | NVIDIA | 397B MoE · 262K | background summary |
+
+### 5. Provider fallback chain & thinking timeout
+
+The fallback chain is where resilience lives. It pre-skips rate-limited models, falls through on `429` / provider errors, and protects latency with a thinking-mode timeout that retries once with reasoning disabled.
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│ agent.generate(targets, messages)                              │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ thinking_timeout set AND thinking ON ?                         │
+├────────────────────────────────────────────────────────────────┤
+│ yes ->  run chain in reasoning mode (deadline 180s);           │
+│         on timeout, retry whole chain with thinking OFF        │
+│ no  ->  go straight to the target loop below                   │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ FOR EACH (provider, model) target — in priority order          │
+├────────────────────────────────────────────────────────────────┤
+│ RateTracker: is model available ?                              │
+│   no   ->  skip (pre-empt 429)  ->  next target                │
+│   yes  ->  provider.generate()                                 │
+│              429            ->  next target                    │
+│              ProviderError  ->  next target                    │
+│              success        ->  return ProviderResponse        │
+│                                                                │
+│ all targets exhausted  ->  AllModelsRateLimitedError /         │
+│                            AllProvidersFailedError             │
+└────────────────────────────────────────────────────────────────┘
+```
+
+NVIDIA reasoning activation is model-family specific and handled inside `NvidiaProvider`: Qwen3.5 uses the `/think` soft switch plus `chat_template_kwargs`; Gemma 4 and Nemotron 3 use `chat_template_kwargs.enable_thinking`; the provider's `resolve_model()` transparently swaps the primary `NVIDIA_MODEL` to `NVIDIA_THINKING_MODEL` when reasoning is requested.
+
+### 6. Layered memory & episodic recall
+
+Each chat scope keeps a small rolling window plus one long-term summary. When the window fills, a background job compacts it into the next summary and writes an embedded episode for later vector recall. A cross-chat user profile lives independently and survives `!new`.
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│ New interaction recorded                                       │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ PER-CHAT MEMORY   (user / group / room scope)                  │
+├────────────────────────────────────────────────────────────────┤
+│ Recent window (6 msgs)  ──full──>  Long-term summary           │
+│                                    (1 paragraph)               │
+│ window full  ->  background compaction (Qwen3.5 397B)          │
+│              ->  rewrites summary + writes one episode         │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓  embed snapshot
+┌────────────────────────────────────────────────────────────────┐
+│ EPISODIC MEMORY                                                │
+├────────────────────────────────────────────────────────────────┤
+│ episode snapshots + nv-embedqa-e5-v5 (1024-dim vectors)        │
+│ queried on demand by chat tool: recall_memory(query, k)        │
+└────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│ CROSS-CHAT PROFILE   user_profile/{user_id}                    │
+├────────────────────────────────────────────────────────────────┤
+│ durable facts shared across DMs & groups                       │
+│ written by tool: update_user_profile() · survives !new         │
+└────────────────────────────────────────────────────────────────┘
+
+Backend:  InMemoryBackend (default, resets on cold start)  |  FirestoreBackend (opt-in)
+```
+
+- **Recent window:** last `MEMORY_RECENT_MESSAGE_LIMIT` (default 6) text turns, fed verbatim into the prompt.
+- **Long-term summary:** one compact paragraph biased toward preserving still-valid facts; regenerated in the background so it never blocks a reply.
+- **Episodic recall:** every summary rotation writes an embedded snapshot; the chat agent can vector-search older context on demand via `recall_memory`.
+- **User profile:** durable facts (nickname, hobbies, location) shared across all chats; intentionally **not** cleared by `!new`.
+- **Backends:** `InMemoryBackend` for free/local runs, `FirestoreBackend` for persistence across Cloud Run cold starts and multiple instances.
+
+### 7. Deployment & delivery pipeline
+
+```text
+┌────────────────────────────────────────────────────────────────┐
+│ Developer   -   ./scripts/deploy_cloud_run.sh                  │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ Cloud Build   (no local Docker build needed)                   │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ Artifact Registry   (container image)                          │
+└────────────────────────────────────────────────────────────────┘
+                                 ↓
+┌────────────────────────────────────────────────────────────────┐
+│ Cloud Run revision                                             │
+├────────────────────────────────────────────────────────────────┤
+│ smoke check  ->  route traffic  ->  prune old images           │
+│ signed URLs -> Cloud Storage  ·  optional -> Firestore         │
+└────────────────────────────────────────────────────────────────┘
+
+Cloud Scheduler ──(1 / min · X-Cron-Token)──→ POST /internal/cron
+```
+
+One command (`./scripts/deploy_cloud_run.sh`) enables APIs, submits the build, runs smoke checks, routes traffic to the new revision, and prunes old revisions/images — no local Docker build required.
+
+---
+
 ## Tech stack
 
 | Layer | Technology |

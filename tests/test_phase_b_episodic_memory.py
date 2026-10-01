@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -333,3 +332,82 @@ class ChatAgentToolLoopTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PassiveGroupRecordingRetentionTests(unittest.IsolatedAsyncioTestCase):
+    """Regression: a passive flush must not silently discard messages.
+
+    Defaults ship with passive_group_flush_threshold=8 and
+    memory_recent_message_limit=6, so every flush used to truncate the
+    window down to 6 *before* the summary task snapshotted it. The
+    overflow was dropped without ever reaching long-term memory, which
+    contradicts the documented intent of passive recording.
+    """
+
+    def _service(self, backend, **overrides):
+        from src.config import Settings
+        from src.services.memory_service import MemoryService
+
+        settings = Settings(
+            _env_file=None,
+            memory_recent_message_limit=6,
+            passive_group_flush_threshold=8,
+            passive_group_recording_enabled=True,
+            **overrides,
+        )
+        return MemoryService(settings, backend=backend)
+
+    async def test_passive_flush_does_not_drop_overflow_messages(self) -> None:
+        from src.services.memory_backends import InMemoryBackend
+
+        backend = InMemoryBackend()
+        service = self._service(backend)
+
+        # Buffer a full threshold's worth of group messages (8) against a
+        # recent-window limit of 6.
+        for i in range(8):
+            service.enqueue_passive_message(
+                source_type="group",
+                chat_scope="multi",
+                chat_id="G1",
+                user_id="U1",
+                text=f"msg-{i}",
+            )
+
+        await service._flush_passive_buffer("group::G1")
+
+        stored = backend.store["group::G1"]
+        contents = [m["content"] for m in stored["recent_messages"]]
+
+        # Every buffered message must still be reachable -- none silently lost.
+        self.assertEqual(
+            contents,
+            [f"msg-{i}" for i in range(8)],
+            "passive flush dropped messages before they were summarized",
+        )
+
+    async def test_record_interaction_does_not_drop_unsummarized_overflow(self) -> None:
+        from src.services.memory_backends import InMemoryBackend
+
+        backend = InMemoryBackend()
+        service = self._service(backend)
+
+        # Drive the window past the limit without a provider to compact it.
+        for i in range(5):
+            await service.record_interaction(
+                source_type="user",
+                chat_scope="user",
+                chat_id="U1",
+                user_id="U1",
+                user_text=f"q{i}",
+                assistant_text=f"a{i}",
+            )
+
+        stored = backend.store["user::U1"]
+        contents = [m["content"] for m in stored["recent_messages"]]
+        expected = [x for i in range(5) for x in (f"q{i}", f"a{i}")]
+        self.assertEqual(
+            contents,
+            expected,
+            "record_interaction dropped turns before they were summarized",
+        )

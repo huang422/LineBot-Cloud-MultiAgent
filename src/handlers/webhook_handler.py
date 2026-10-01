@@ -12,7 +12,7 @@ import re
 
 from src.config import get_settings
 from src.models.agent_request import AgentRequest
-from src.services.memory_service import get_memory_service, MemoryServiceError
+from src.services.memory_service import MemoryServiceError, get_memory_service
 from src.services.rate_limit_service import get_rate_limit_service
 from src.utils.logger import logger
 from src.utils.validators import sanitize_input

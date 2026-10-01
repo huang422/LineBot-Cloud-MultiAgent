@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections import deque
-from datetime import datetime
+import tempfile
+import unittest
 from io import BytesIO
 from pathlib import Path
-import tempfile
 from types import SimpleNamespace
-import unittest
 from unittest.mock import AsyncMock, Mock, patch
+
+from PIL import Image
 
 import main as main_module
 from src.agents import orchestrator as orchestrator_module
@@ -38,14 +38,13 @@ from src.providers.openrouter_provider import (
     parse_openai_response,
 )
 from src.services import image_service as image_service_module
-from src.services import message_cache_service as message_cache_service_module
 from src.services import memory_service as memory_service_module
-from src.services.storage_service import UploadedMedia
-from src.services.message_cache_service import CachedMessage
+from src.services import message_cache_service as message_cache_service_module
 from src.services import rate_limit_service as rate_limit_service_module
 from src.services import web_search_service as web_search_service_module
+from src.services.message_cache_service import CachedMessage
+from src.services.storage_service import UploadedMedia
 from src.utils.rate_tracker import RateTracker
-from PIL import Image
 
 
 class OpenRouterProviderTests(unittest.IsolatedAsyncioTestCase):
@@ -517,7 +516,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             chat_id="U1",
         )
         doc["summary_text"] = "這是目前的長期記憶"
-        service._memory_store["user::U1"] = doc
+        service.backend_instance.store["user::U1"] = doc
 
         with patch.object(memory_service_module.logger, "info") as log_info:
             memory = await service.load_context(
@@ -555,7 +554,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             "reasoning": "舊理由",
             "disable_thinking": True,
         }
-        service._memory_store["group::G1"] = doc
+        service.backend_instance.store["group::G1"] = doc
 
         with patch.object(memory_service_module.logger, "info") as log_info:
             await service.clear_chat(
@@ -567,7 +566,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         # !new now deletes the document outright so a fresh load
         # returns the default empty skeleton (and Firestore evicts the
         # row instead of leaving a zombie cleared record).
-        self.assertNotIn("group::G1", service._memory_store)
+        self.assertNotIn("group::G1", service.backend_instance.store)
         reloaded = await service.load_context(
             source_type="group",
             chat_scope="multi",
@@ -598,7 +597,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             chat_id="G1",
         )
         doc["summary_text"] = "既有摘要"
-        service._memory_store["group::G1"] = doc
+        service.backend_instance.store["group::G1"] = doc
 
         await service.record_interaction(
             source_type="group",
@@ -696,7 +695,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             },
         ]
         doc["recent_count"] = 2
-        service._memory_store["group::G1"] = doc
+        service.backend_instance.store["group::G1"] = doc
 
         memory = await service.load_context(
             source_type="group",
@@ -756,14 +755,37 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             chat_id="U1",
         )
 
-        self.assertEqual(memory.recent_count, 6)
+        # Crossing memory_recent_message_limit schedules compaction; it does
+        # NOT truncate. With no provider to compact, every turn is retained
+        # up to the hard cap rather than silently dropped before it could
+        # reach long-term memory.
+        self.assertEqual(memory.recent_count, 8)
         self.assertEqual(
             [message.content for message in memory.recent_messages],
-            ["三", "四", "五", "六", "七", "八"],
+            ["一", "二", "三", "四", "五", "六", "七", "八"],
         )
 
+        # Boundedness still holds -- at the hard cap, which is what stops an
+        # unavailable summarizer from growing the document without bound.
+        cap = service._recent_hard_cap
+        for i in range(cap):
+            await service.record_interaction(
+                source_type="user",
+                chat_scope="user",
+                chat_id="U1",
+                user_id="U1",
+                user_text=f"x{i}",
+                assistant_text=f"y{i}",
+            )
+        memory = await service.load_context(
+            source_type="user",
+            chat_scope="user",
+            chat_id="U1",
+        )
+        self.assertEqual(memory.recent_count, cap)
+
     async def test_summary_timeout_logs_once_and_keeps_recent_memory_capped(self) -> None:
-        nvidia = SimpleNamespace(generate=AsyncMock(side_effect=asyncio.TimeoutError()))
+        nvidia = SimpleNamespace(generate=AsyncMock(side_effect=TimeoutError()))
         service = memory_service_module.MemoryService(
             Settings(
                 _env_file=None,
@@ -816,10 +838,13 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             chat_scope="user",
             chat_id="U1",
         )
-        self.assertEqual(memory.recent_count, 6)
+        # A timed-out summary must not cost us the messages it failed to
+        # summarize -- they stay in the window for the next attempt.
+        self.assertEqual(memory.recent_count, 8)
         self.assertEqual(
             [message.content for message in memory.recent_messages],
-            ["第三句", "第四句", "第五句", "第六句", "第七句", "第八句"],
+            ["第一句", "第二句", "第三句", "第四句",
+             "第五句", "第六句", "第七句", "第八句"],
         )
         log_warning.assert_any_call(
             "[user:U1] Memory summary timed out after 180s; keeping the latest recent memory window"
@@ -895,8 +920,80 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             chat_scope="user",
             chat_id="U1",
         )
-        self.assertEqual(memory.summary_text, "第二次摘要")
-        self.assertEqual(memory.recent_count, 0)
+        # Messages that arrived mid-compaction are pure appends, so the
+        # snapshot is still a prefix of the current window and the first
+        # summary commits directly -- no discarded work, no second LLM
+        # call. (Before the truncation fix this path always missed,
+        # because truncation shifted the window out from under the
+        # prefix check and forced a redundant re-summarization.)
+        self.assertEqual(memory.summary_text, "第一次摘要")
+        self.assertEqual(
+            [m.content for m in memory.recent_messages], ["第五句", "第六句"]
+        )
+        self.assertEqual(nvidia.generate.await_count, 1)
+
+    async def test_summary_commit_skipped_when_version_changes_mid_compaction(self) -> None:
+        """The concurrent-commit guard must still discard stale summaries.
+
+        Retry is no longer triggered by truncation, so exercise the guard
+        the way it can actually fire: another writer commits a summary
+        (bumping summary_version) while this one is still generating.
+        """
+        started = asyncio.Event()
+        release = asyncio.Event()
+        call_count = 0
+
+        async def fake_generate(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                started.set()
+                await release.wait()
+                return ProviderResponse(text="陳舊摘要", model="qwen/test")
+            return ProviderResponse(text="重新產生的摘要", model="qwen/test")
+
+        nvidia = SimpleNamespace(generate=AsyncMock(side_effect=fake_generate))
+        service = memory_service_module.MemoryService(
+            Settings(
+                _env_file=None,
+                memory_recent_message_limit=4,
+                memory_summary_timeout_seconds=180,
+            ),
+            nvidia_provider=nvidia,
+        )
+
+        await service.record_interaction(
+            source_type="user", chat_scope="user", chat_id="U1", user_id="U1",
+            user_text="第一句", assistant_text="第二句",
+        )
+        await service.record_interaction(
+            source_type="user", chat_scope="user", chat_id="U1", user_id="U1",
+            user_text="第三句", assistant_text="第四句",
+        )
+
+        await started.wait()
+
+        # Simulate a competing writer committing its own summary.
+        doc = await service._backend.load_chat("user::U1")
+        doc["summary_version"] = int(doc.get("summary_version", 0)) + 1
+        doc["summary_text"] = "別人的摘要"
+        await service._backend.save_chat("user::U1", doc)
+        service._read_cache.pop("user::U1", None)
+
+        release.set()
+        for _ in range(20):
+            if not service._summary_tasks:
+                break
+            await asyncio.gather(*list(service._summary_tasks.values()))
+            await asyncio.sleep(0)
+
+        memory = await service.load_context(
+            source_type="user", chat_scope="user", chat_id="U1",
+        )
+        # The stale summary must never be committed on top of the newer
+        # version; the task re-summarizes from current state instead.
+        self.assertNotEqual(memory.summary_text, "陳舊摘要")
+        self.assertEqual(memory.summary_text, "重新產生的摘要")
         self.assertEqual(nvidia.generate.await_count, 2)
 
 
@@ -1856,14 +1953,14 @@ class LifespanInitTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(main_module, "get_settings", return_value=settings), patch.object(
             main_module, "setup_logger"
-        ), patch.object(
-            main_module, "OpenRouterProvider", return_value=fake_openrouter
-        ) as openrouter_cls, patch.object(
-            main_module, "FallbackChain", return_value=object()
-        ), patch.object(
-            main_module, "Orchestrator", return_value=object()
-        ), patch.object(
-            main_module, "ChatAgent", return_value=object()
+        ), patch(
+            "src.runtime.composition.OpenRouterProvider", return_value=fake_openrouter
+        ) as openrouter_cls, patch(
+            "src.runtime.composition.FallbackChain", return_value=object()
+        ), patch(
+            "src.runtime.composition.Orchestrator", return_value=object()
+        ), patch(
+            "src.runtime.composition.ChatAgent", return_value=object()
         ), patch(
             "src.agents.vision_agent.VisionAgent", return_value=object()
         ), patch(
@@ -1901,16 +1998,16 @@ class LifespanInitTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(main_module, "get_settings", return_value=settings), patch.object(
             main_module, "setup_logger"
-        ), patch.object(
-            main_module, "OpenRouterProvider", return_value=fake_openrouter
-        ), patch.object(
-            main_module, "NvidiaProvider", return_value=fake_nvidia
-        ) as nvidia_cls, patch.object(
-            main_module, "FallbackChain", return_value=object()
-        ), patch.object(
-            main_module, "Orchestrator", return_value=object()
-        ), patch.object(
-            main_module, "ChatAgent", return_value=object()
+        ), patch(
+            "src.runtime.composition.OpenRouterProvider", return_value=fake_openrouter
+        ), patch(
+            "src.runtime.composition.NvidiaProvider", return_value=fake_nvidia
+        ) as nvidia_cls, patch(
+            "src.runtime.composition.FallbackChain", return_value=object()
+        ), patch(
+            "src.runtime.composition.Orchestrator", return_value=object()
+        ), patch(
+            "src.runtime.composition.ChatAgent", return_value=object()
         ), patch(
             "src.agents.vision_agent.VisionAgent", return_value=object()
         ), patch(

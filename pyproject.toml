@@ -1,0 +1,31 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [".venv", "venv", "__pycache__", ".pytest_cache"]
+
+[tool.ruff.lint]
+# Start deliberately narrow: correctness-flavoured rules that catch real
+# defects (undefined names, unused imports, shadowed builtins, mutable
+# defaults) without churning the existing style. Widen once this is clean.
+select = ["E4", "E7", "E9", "F", "B", "UP", "I"]
+ignore = [
+    "E501",   # line length is handled by the formatter, not the linter
+    "B008",   # FastAPI's Depends() in defaults is idiomatic
+    # MemoryBackend deliberately ships no-op defaults for optional
+    # capabilities (delete/episodes) so backends degrade gracefully.
+    "B027",
+    # InputType stays (str, Enum): switching to StrEnum changes what
+    # str() returns, which leaks into logs and cached payloads.
+    "UP042",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-exported for backwards compatibility with existing import paths.
+"main.py" = ["F401"]
+"src/agents/orchestrator.py" = ["F401", "E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "main"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

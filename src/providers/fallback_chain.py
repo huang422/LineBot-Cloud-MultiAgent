@@ -16,9 +16,9 @@ import asyncio
 from typing import Protocol
 
 from src.providers.openrouter_provider import (
+    ProviderError,
     ProviderResponse,
     RateLimitError,
-    ProviderError,
 )
 from src.utils.logger import logger
 from src.utils.rate_tracker import RateTracker
@@ -108,7 +108,7 @@ class FallbackChain:
                     self._run_chain(targets, messages, **kwargs),
                     timeout=thinking_timeout,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     f"Thinking mode timed out after {thinking_timeout}s — "
                     "retrying with thinking disabled"
@@ -159,6 +159,19 @@ class FallbackChain:
                 continue
             except ProviderError as e:
                 logger.warning(f"Fallback: {model} error {e.status}, trying next")
+                saw_provider_error = True
+                last_error = e
+                continue
+            except Exception as e:
+                # Defence in depth: both shipped providers normalise their
+                # failures into ProviderError/RateLimitError, but a provider
+                # that breaks that contract must not take the whole chain
+                # down with it -- falling through is the entire point here.
+                # CancelledError derives from BaseException and is not caught.
+                logger.warning(
+                    f"Fallback: {model} raised unexpected {type(e).__name__}: {e}; "
+                    "trying next"
+                )
                 saw_provider_error = True
                 last_error = e
                 continue

@@ -17,33 +17,44 @@ work.
 from __future__ import annotations
 
 import asyncio
+import calendar
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Optional
+from datetime import UTC, datetime, timedelta
 
 try:
-    from zoneinfo import ZoneInfo
-    from zoneinfo import ZoneInfoNotFoundError
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 except ImportError:  # pragma: no cover - py<3.9 only
     ZoneInfo = None  # type: ignore[assignment]
     ZoneInfoNotFoundError = Exception  # type: ignore[assignment]
 
 from src.utils.logger import logger
 
-
 _DAY_NAME_TO_NUM = {
     "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
 }
 
 
+def _effective_day(year: int, month: int, day: int) -> int:
+    """Clamp a configured day to the last real day of that month/year.
+
+    Only 02-29 is affected in practice: on non-leap years the job is
+    pulled back to 02-28 so a yearly reminder still fires every year
+    rather than every fourth year. Without this, ``datetime.replace``
+    raises ValueError and takes down ``list_jobs`` -> ``/health`` ->
+    application startup. See ADR-0002.
+    """
+    return min(day, calendar.monthrange(year, month)[1])
+
+
 def _resolve_timezone(name: str):
     if ZoneInfo is None:
-        return timezone.utc
+        return UTC
     try:
         return ZoneInfo(name)
     except ZoneInfoNotFoundError:
         logger.warning(f"Timezone {name!r} not available; falling back to UTC")
-        return timezone.utc
+        return UTC
 
 
 @dataclass
@@ -107,29 +118,27 @@ class _YearlyJob:
     def matches(self, dt: datetime) -> bool:
         return (
             dt.month == self.month
-            and dt.day == self.day
+            and dt.day == _effective_day(dt.year, self.month, self.day)
             and dt.hour == self.hour
             and dt.minute == self.minute
         )
 
     def next_run(self, ref: datetime) -> datetime:
-        try:
+        # Resolve the occurrence separately per candidate year: the day
+        # is clamped to that year's calendar, so a 02-29 job yields
+        # 02-29 in leap years and 02-28 otherwise. Checking this year
+        # then next year is always enough because the job is annual.
+        for year in (ref.year, ref.year + 1):
             candidate = ref.replace(
-                month=self.month, day=self.day,
+                year=year,
+                month=self.month,
+                day=_effective_day(year, self.month, self.day),
                 hour=self.hour, minute=self.minute,
                 second=0, microsecond=0,
             )
-        except ValueError:
-            # Handles 02-29 leap-day rollovers by snapping to the next valid year.
-            candidate = ref.replace(year=ref.year + 1)
-            candidate = candidate.replace(
-                month=self.month, day=self.day,
-                hour=self.hour, minute=self.minute,
-                second=0, microsecond=0,
-            )
-        if candidate <= ref:
-            candidate = candidate.replace(year=ref.year + 1)
-        return candidate
+            if candidate > ref:
+                return candidate
+        raise AssertionError("unreachable: an annual job always recurs")
 
 
 class SchedulerService:
@@ -258,8 +267,8 @@ class SchedulerService:
     async def dispatch_due_jobs(
         self,
         *,
-        reference_time: Optional[datetime] = None,
-        sender: Optional[Callable[[str, str], Awaitable[bool]]] = None,
+        reference_time: datetime | None = None,
+        sender: Callable[[str, str], Awaitable[bool]] | None = None,
     ) -> dict:
         if reference_time is None:
             reference_time = datetime.now(self._tz)
@@ -334,7 +343,7 @@ class SchedulerService:
 
 
 # Global singleton
-_scheduler_service: Optional[SchedulerService] = None
+_scheduler_service: SchedulerService | None = None
 
 
 def get_scheduler_service(timezone_name: str = "Asia/Taipei") -> SchedulerService:

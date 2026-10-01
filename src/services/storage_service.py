@@ -10,14 +10,14 @@ import asyncio
 import base64
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from functools import partial
-from urllib.request import Request as UrlRequest, urlopen
+from urllib.request import Request as UrlRequest
+from urllib.request import urlopen
 from uuid import uuid4
 
-from google.auth import iam
 from google.auth import credentials as google_auth_credentials
+from google.auth import iam
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account as google_service_account
 
@@ -47,7 +47,7 @@ class StorageService:
         self._bucket_name = settings.gcs_bucket_name
         self._expiry_hours = settings.gcs_signed_url_expiry_hours
         self._cleanup_delay_seconds = settings.gcs_media_cleanup_delay_seconds
-        self._current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        self._current_month = datetime.now(UTC).strftime("%Y-%m")
         self._month_upload_count = 0
         self._month_upload_bytes = 0
         self._month_delete_count = 0
@@ -118,7 +118,7 @@ class StorageService:
         return self._bucket is not None
 
     def _check_and_reset_month(self) -> None:
-        current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        current_month = datetime.now(UTC).strftime("%Y-%m")
         if current_month != self._current_month:
             logger.info(
                 f"GCS usage stats reset: {self._current_month} -> {current_month}, "

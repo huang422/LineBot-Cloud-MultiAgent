@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from time import time
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +32,7 @@ from src.services.memory_backends import (
     MemoryBackendError,
     build_backend,
 )
+from src.services.passive_buffer import PassiveMessageBuffer
 from src.utils.logger import logger
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -223,7 +224,7 @@ class MemoryService:
         *,
         nvidia_provider: NvidiaProvider | None = None,
         backend: MemoryBackend | None = None,
-        embedding_service: "EmbeddingService | None" = None,
+        embedding_service: EmbeddingService | None = None,
     ) -> None:
         self._settings = settings
         self._recent_limit = settings.memory_recent_message_limit
@@ -249,8 +250,25 @@ class MemoryService:
         self._passive_delay = max(
             1, int(getattr(settings, "passive_group_flush_delay_seconds", 30))
         )
-        self._passive_buffers: dict[str, dict[str, Any]] = {}
-        self._passive_flush_tasks: dict[str, asyncio.Task] = {}
+        self._passive = PassiveMessageBuffer(
+            enabled=self._passive_recording_enabled,
+            threshold=self._passive_threshold,
+            delay=self._passive_delay,
+            flush=self._persist_passive_batch,
+        )
+
+        # Hard safety cap on the recent window. The window is allowed to
+        # grow past ``_recent_limit`` on purpose -- crossing that limit is
+        # what schedules summary compaction, and the compaction task
+        # summarizes whatever it snapshots. Trimming at the limit would
+        # discard messages before they ever reached long-term memory.
+        # This cap only exists so a stuck / unavailable summarizer cannot
+        # grow the document without bound; reaching it does lose data and
+        # is logged as such.
+        self._recent_hard_cap = max(
+            self._recent_limit * 4,
+            (self._recent_limit + self._passive_threshold) * 2,
+        )
 
         logger.info(
             f"MemoryService initialized with backend={self._backend.name} "
@@ -273,36 +291,10 @@ class MemoryService:
     def backend_instance(self) -> MemoryBackend:
         return self._backend
 
-    @property
-    def _memory_store(self) -> dict[str, dict[str, Any]]:
-        """Backwards-compatible accessor used by the test suite.
-
-        Returns the in-memory backend's underlying dict so tests that
-        assign ``service._memory_store["user::U1"] = doc`` keep working.
-        For non-memory backends this returns an empty proxy and warns.
-        """
-        backend = self._backend
-        if isinstance(backend, InMemoryBackend):
-            return backend.store
-        logger.warning(
-            "_memory_store accessed on non in-memory backend "
-            f"({backend.name}); returning empty dict"
-        )
-        return {}
-
     async def close(self) -> None:
         # Flush any pending passive buffers so we don't lose group
         # messages on shutdown / Cloud Run cold-stop.
-        pending_keys = list(self._passive_buffers.keys())
-        for key in pending_keys:
-            task = self._passive_flush_tasks.pop(key, None)
-            if task and not task.done():
-                task.cancel()
-            try:
-                await self._flush_passive_buffer(key)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning(f"Passive flush during close failed for {key}: {exc}")
-        self._passive_flush_tasks.clear()
+        await self._passive.close()
 
         for task in list(self._summary_tasks.values()):
             task.cancel()
@@ -378,9 +370,12 @@ class MemoryService:
                     chat_id=chat_id,
                 )
                 recent_messages = _parse_recent_messages(doc.get("recent_messages"))
-                recent_messages.extend(messages_to_append)
-                if len(recent_messages) > self._recent_limit:
-                    recent_messages = recent_messages[-self._recent_limit:]
+                recent_messages = self._merge_recent(
+                    recent_messages,
+                    messages_to_append,
+                    source_type=source_type,
+                    chat_id=chat_id,
+                )
                 doc["recent_messages"] = [asdict(message) for message in recent_messages]
                 doc["recent_count"] = len(recent_messages)
                 if agent_name.strip() or task_description.strip() or routing_reasoning.strip():
@@ -430,7 +425,7 @@ class MemoryService:
         == "user"``) chats are ignored because they are already fully
         recorded by :meth:`record_interaction`.
         """
-        if not self._passive_recording_enabled:
+        if not self._passive.enabled:
             return
         if not text or not text.strip() or not chat_id:
             return
@@ -440,60 +435,34 @@ class MemoryService:
         chat_scope = chat_scope or _normalize_chat_scope(normalized)
         key = _chat_key(normalized, chat_id)
 
-        buf = self._passive_buffers.setdefault(
+        self._passive.enqueue(
             key,
-            {
-                "source_type": normalized,
-                "chat_scope": chat_scope,
-                "chat_id": chat_id,
-                "messages": [],
-            },
-        )
-        buf["messages"].append(
             MemoryMessage(
                 role="user",
                 content=text.strip()[:500],
                 user_id=user_id,
-            )
+            ),
+            context={
+                "source_type": normalized,
+                "chat_scope": chat_scope,
+                "chat_id": chat_id,
+            },
         )
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return  # no event loop — caller is sync; skip scheduling
-
-        if len(buf["messages"]) >= self._passive_threshold:
-            existing = self._passive_flush_tasks.pop(key, None)
-            if existing and not existing.done():
-                existing.cancel()
-            self._passive_flush_tasks[key] = loop.create_task(
-                self._flush_passive_buffer(key)
-            )
-            return
-
-        if key in self._passive_flush_tasks:
-            return  # debounce timer already scheduled
-
-        async def _delayed_flush() -> None:
-            try:
-                await asyncio.sleep(self._passive_delay)
-                await self._flush_passive_buffer(key)
-            except asyncio.CancelledError:
-                pass
-
-        self._passive_flush_tasks[key] = loop.create_task(_delayed_flush())
-
     async def _flush_passive_buffer(self, key: str) -> None:
-        """Persist all buffered passive messages for a chat in one write."""
-        buf = self._passive_buffers.pop(key, None)
-        self._passive_flush_tasks.pop(key, None)
-        if not buf or not buf["messages"]:
-            return
+        """Flush one chat's pending passive messages now."""
+        await self._passive.flush(key)
 
-        source_type = buf["source_type"]
-        chat_scope = buf["chat_scope"]
-        chat_id = buf["chat_id"]
-        messages = buf["messages"]
+    async def _persist_passive_batch(
+        self,
+        key: str,
+        context: dict[str, Any],
+        messages: list[MemoryMessage],
+    ) -> None:
+        """Persist a coalesced batch of passive messages in one write."""
+        source_type = context["source_type"]
+        chat_scope = context["chat_scope"]
+        chat_id = context["chat_id"]
 
         try:
             async with self._lock_for(key):
@@ -503,9 +472,12 @@ class MemoryService:
                     chat_id=chat_id,
                 )
                 recent_messages = _parse_recent_messages(doc.get("recent_messages"))
-                recent_messages.extend(messages)
-                if len(recent_messages) > self._recent_limit:
-                    recent_messages = recent_messages[-self._recent_limit:]
+                recent_messages = self._merge_recent(
+                    recent_messages,
+                    messages,
+                    source_type=source_type,
+                    chat_id=chat_id,
+                )
                 doc["recent_messages"] = [asdict(m) for m in recent_messages]
                 doc["recent_count"] = len(recent_messages)
                 doc["updated_at"] = time()
@@ -550,10 +522,7 @@ class MemoryService:
 
         # Drop any pending passive buffer / flush task — !new should
         # also erase un-flushed group messages.
-        self._passive_buffers.pop(key, None)
-        passive_task = self._passive_flush_tasks.pop(key, None)
-        if passive_task and not passive_task.done():
-            passive_task.cancel()
+        self._passive.discard(key)
 
         old_summary = ""
         try:
@@ -585,6 +554,14 @@ class MemoryService:
             raise
         except Exception as e:
             raise MemoryServiceError(f"Failed to clear memory context for {key}: {e}") from e
+
+        # The lock dict is keyed per chat and otherwise grows for the
+        # lifetime of the instance. Safe to drop only when the lock is
+        # free: a waiter can exist only while it is held, and no await
+        # separates the check from the pop on a single-threaded loop.
+        lock = self._locks.get(key)
+        if lock is not None and not lock.locked():
+            self._locks.pop(key, None)
 
         logger.info(
             f"[{source_type}:{chat_id}] Memory summary before !new: "
@@ -664,7 +641,7 @@ class MemoryService:
     # ── Phase B: episodic recall + profile fact updates ───────
 
     def set_embedding_service(
-        self, embedding_service: "EmbeddingService | None"
+        self, embedding_service: EmbeddingService | None
     ) -> None:
         """Inject the embedding client after construction.
 
@@ -701,7 +678,7 @@ class MemoryService:
         episode: dict[str, Any] = {
             "summary": summary_text,
             "ts": time(),
-            "expires_at": datetime.now(timezone.utc)
+            "expires_at": datetime.now(UTC)
             + timedelta(days=_EPISODE_TTL_DAYS),
             "summary_version": summary_version,
             "source_type": source_type,
@@ -915,7 +892,9 @@ class MemoryService:
                 recent_snapshot=recent_snapshot,
             )
         except Exception:
-            return
+            # Summarization failed; the recent window is left intact so the
+            # next trigger retries with the same messages.
+            return False
 
         async with self._lock_for(key):
             current_doc = await self._load_document(
@@ -1019,7 +998,7 @@ class MemoryService:
                 ),
                 timeout=self._summary_timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 f"[{source_type}:{chat_id}] Memory summary timed out after "
                 f"{self._summary_timeout}s; keeping the latest recent memory window"
@@ -1050,6 +1029,31 @@ class MemoryService:
                 speaker = "Assistant"
             parts.append(f"{speaker}: {message.content}")
         return "\n".join(parts) if parts else "(empty)"
+
+    def _merge_recent(
+        self,
+        recent: list[MemoryMessage],
+        incoming: list[MemoryMessage],
+        *,
+        source_type: str,
+        chat_id: str,
+    ) -> list[MemoryMessage]:
+        """Append new messages, trimming only at the hard safety cap.
+
+        Deliberately does NOT trim to ``_recent_limit``: that is the
+        compaction trigger, not the retention bound. Trimming there
+        dropped messages before the summary task could snapshot them.
+        """
+        recent.extend(incoming)
+        overflow = len(recent) - self._recent_hard_cap
+        if overflow > 0:
+            logger.warning(
+                f"[{source_type}:{chat_id}] Recent window exceeded hard cap "
+                f"({self._recent_hard_cap}); dropping {overflow} unsummarized "
+                "message(s) — summary compaction is not keeping up"
+            )
+            recent = recent[-self._recent_hard_cap:]
+        return recent
 
     def _lock_for(self, key: str) -> asyncio.Lock:
         lock = self._locks.get(key)
@@ -1193,7 +1197,7 @@ def configure_memory_service(
     *,
     nvidia_provider: NvidiaProvider | None = None,
     backend: MemoryBackend | None = None,
-    embedding_service: "EmbeddingService | None" = None,
+    embedding_service: EmbeddingService | None = None,
 ) -> MemoryService:
     global _instance
     settings = settings or get_settings()

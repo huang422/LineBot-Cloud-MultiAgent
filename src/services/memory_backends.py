@@ -95,8 +95,7 @@ class InMemoryBackend(MemoryBackend):
     """Process-local backend kept for backward compatibility and tests.
 
     Tests in ``tests/test_runtime_behaviors.py`` directly poke
-    ``backend.store`` (and historically ``MemoryService._memory_store``)
-    to seed fixtures. The ``store`` attribute is intentionally a plain
+    ``backend.store`` to seed fixtures. The ``store`` attribute is intentionally a plain
     dict to keep that contract.
     """
 

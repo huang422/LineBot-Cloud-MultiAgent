@@ -12,13 +12,12 @@ mirror the pattern used by the other long-lived services in this app.
 from __future__ import annotations
 
 import asyncio
-from typing import Iterable
+from collections.abc import Iterable
 
 import httpx
 
 from src.config import Settings
 from src.utils.logger import logger
-
 
 _DEFAULT_ENDPOINT = "https://integrate.api.nvidia.com/v1/embeddings"
 _DEFAULT_MODEL = "nvidia/nv-embedqa-e5-v5"
@@ -119,7 +118,7 @@ class EmbeddingService:
         }
         try:
             resp = await self._client.post(self._endpoint, json=payload)
-        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, httpx.HTTPError) as exc:
             logger.warning(f"Embedding request failed (transport): {exc}")
             return []
 

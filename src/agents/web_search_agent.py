@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 from src.agents.base_agent import BaseAgent
 from src.models.agent_request import AgentRequest
 from src.models.agent_response import AgentResponse
 from src.providers.fallback_chain import AllModelsRateLimitedError, AllProvidersFailedError
-from src.services.web_search_service import get_web_search_service, WebSearchError
+from src.services.web_search_service import WebSearchError, get_web_search_service
 from src.utils.logger import logger
 
 _URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)

@@ -9,9 +9,8 @@ Normal reply-fallback push is separate from proactive direct push
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from io import BytesIO
-from typing import Optional
 
 import httpx
 
@@ -29,7 +28,7 @@ class LineService:
         self.channel_access_token = settings.line_channel_access_token
         self.push_fallback_enabled = settings.line_push_fallback_enabled
         self._push_monthly_limit = settings.line_push_monthly_limit
-        self._current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        self._current_month = datetime.now(UTC).strftime("%Y-%m")
         self._reply_fallback_push_count = 0
         self._direct_push_count = 0
         self._profile_cache_ttl = max(0, settings.line_profile_cache_ttl_seconds)
@@ -174,7 +173,7 @@ class LineService:
 
         source = (source_type or "user").strip().lower() or "user"
         cache_key = f"{source}::{chat_id}::{user_id}"
-        now = datetime.now(timezone.utc).timestamp()
+        now = datetime.now(UTC).timestamp()
 
         cached = self._profile_cache.get(cache_key)
         if cached is not None and self._profile_cache_ttl > 0:
@@ -236,7 +235,7 @@ class LineService:
     # ── Internal ─────────────────────────────────────────────
 
     def _check_and_reset_push_budget(self) -> None:
-        current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        current_month = datetime.now(UTC).strftime("%Y-%m")
         if current_month != self._current_month:
             logger.info(
                 f"LINE push budget reset: {self._current_month} -> {current_month}, "
@@ -353,7 +352,9 @@ class LineService:
         from src.services.message_cache_service import get_message_cache_service
 
         cache = get_message_cache_service()
-        for message_payload, sent_meta in zip(messages, sent_messages):
+        # strict=False on purpose: LINE may return fewer sentMessages
+        # than we sent, and this is a best-effort cache update.
+        for message_payload, sent_meta in zip(messages, sent_messages, strict=False):
             if not isinstance(message_payload, dict) or not isinstance(sent_meta, dict):
                 continue
 
@@ -372,7 +373,7 @@ class LineService:
 
 # ── Singleton ────────────────────────────────────────────────
 
-_instance: Optional[LineService] = None
+_instance: LineService | None = None
 
 
 def get_line_service() -> LineService:

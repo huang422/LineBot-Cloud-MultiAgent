@@ -14,8 +14,8 @@ JSON-decode error, hits ``max_iterations``) we fall back to the plain
 from __future__ import annotations
 
 from src.agents.base_agent import BaseAgent
-from src.agents.tools import ToolContext, ToolRegistry
 from src.agents.tool_runner import ToolLoopError, run_tool_loop
+from src.agents.tools import ToolContext, ToolRegistry
 from src.models.agent_request import AgentRequest
 from src.models.agent_response import AgentResponse
 from src.utils.logger import logger

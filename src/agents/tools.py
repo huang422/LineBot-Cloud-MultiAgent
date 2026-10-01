@@ -25,8 +25,9 @@ Firestore-backed implementations.
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 ToolExecutor = Callable[[dict, "ToolContext"], Awaitable[Any]]
 

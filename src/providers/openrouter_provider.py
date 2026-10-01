@@ -33,7 +33,7 @@ class ProviderError(Exception):
         self.status = status
         self.detail = detail
         self.provider = provider
-        label = f"{provider} error" if provider else f"Provider error"
+        label = f"{provider} error" if provider else "Provider error"
         super().__init__(f"{label} {status} for {model}: {detail}")
 
 

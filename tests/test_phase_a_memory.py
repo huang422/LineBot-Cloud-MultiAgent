@@ -231,14 +231,14 @@ class MemoryServiceBackendIntegrationTests(unittest.TestCase):
         self.assertEqual(stats["backend"], "memory")
         self.assertFalse(stats.get("persistent", True))
 
-    def test_legacy_memory_store_property_proxies_in_memory(self) -> None:
+    def test_backend_instance_exposes_the_backing_store(self) -> None:
         backend = InMemoryBackend()
         service = _make_memory_service(backend)
-        # Legacy tests poke `_memory_store` directly; ensure it round-trips
-        service._memory_store["user::U1"] = {"summary_text": "legacy"}
-        self.assertEqual(
-            backend.store["user::U1"]["summary_text"], "legacy"
-        )
+        # Fixtures seed through the backend's real surface, not a
+        # test-only back door on the service.
+        self.assertIs(service.backend_instance, backend)
+        service.backend_instance.store["user::U1"] = {"summary_text": "seeded"}
+        self.assertEqual(backend.store["user::U1"]["summary_text"], "seeded")
 
 
 if __name__ == "__main__":

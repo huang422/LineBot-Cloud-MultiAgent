@@ -10,7 +10,6 @@ under ``tests/`` without being collected during the normal automated suite.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 
@@ -95,7 +94,7 @@ async def run_nvidia_thinking():
     model = os.getenv("NVIDIA_THINKING_MODEL", "google/gemma-4-31b-it")
     print(f"\n{'='*60}")
     print(f"[NVIDIA] Testing thinking with {model}")
-    print(f"  (fixed: chat_template_kwargs as top-level param)")
+    print("  (fixed: chat_template_kwargs as top-level param)")
     print(f"{'='*60}")
 
     payload = {
@@ -142,7 +141,7 @@ async def run_nvidia_thinking():
         if think_match:
             print(f"  <think> tags     : YES ({len(think_match.group(1).strip())} chars)")
     else:
-        print(f"  <think> tags     : NO")
+        print("  <think> tags     : NO")
 
     print(f"  reasoning field  : {_preview(reasoning, 100)}")
     print(f"  reasoning_content: {_preview(reasoning_content, 100)}")
@@ -161,11 +160,11 @@ async def run_nvidia_provider_class():
         return
 
     print(f"\n{'='*60}")
-    print(f"[NVIDIA Provider Class] End-to-end test")
+    print("[NVIDIA Provider Class] End-to-end test")
     print(f"{'='*60}")
 
-    from src.utils.rate_tracker import RateTracker
     from src.providers.nvidia_provider import NvidiaProvider
+    from src.utils.rate_tracker import RateTracker
 
     model = os.getenv("NVIDIA_MODEL", "qwen/qwen3.5-397b-a17b")
     provider = NvidiaProvider(

@@ -61,7 +61,7 @@ async def text_to_speech(text: str, voice: str | None = None) -> UploadedMedia |
 
         if uploaded:
             uploaded.duration_ms = duration_ms
-            logger.info(f"TTS uploaded to GCS")
+            logger.info("TTS uploaded to GCS")
             return uploaded
         else:
             logger.warning("TTS upload failed, GCS may not be configured")

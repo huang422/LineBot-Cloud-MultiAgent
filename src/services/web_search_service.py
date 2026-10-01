@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Optional
 
 from src.config import get_settings
 from src.utils.logger import logger
@@ -48,7 +47,7 @@ class WebSearchResponse:
     """Response from web search."""
     query: str
     results: list[SearchResult]
-    answer: Optional[str] = None
+    answer: str | None = None
 
     @property
     def has_results(self) -> bool:
@@ -97,7 +96,7 @@ class WebSearchService:
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         max_results: int = 3,
     ):
         settings = get_settings()
@@ -142,8 +141,8 @@ class WebSearchService:
             try:
                 from tavily import TavilyClient
                 self._client = TavilyClient(api_key=self.api_key)
-            except ImportError:
-                raise WebSearchError("tavily-python package not installed")
+            except ImportError as exc:
+                raise WebSearchError("tavily-python package not installed") from exc
         return self._client
 
     async def close(self) -> None:
@@ -152,15 +151,15 @@ class WebSearchService:
     async def search(
         self,
         query: str,
-        max_results: Optional[int] = None,
+        max_results: int | None = None,
         include_answer: bool | str = True,
         search_depth: str = "advanced",
-        topic: Optional[str] = None,
-        time_range: Optional[str] = None,
-        include_domains: Optional[list[str]] = None,
-        exclude_domains: Optional[list[str]] = None,
+        topic: str | None = None,
+        time_range: str | None = None,
+        include_domains: list[str] | None = None,
+        exclude_domains: list[str] | None = None,
         include_raw_content: bool | str = False,
-        country: Optional[str] = None,
+        country: str | None = None,
     ) -> WebSearchResponse:
         """Execute a Tavily search.
 
@@ -242,9 +241,9 @@ class WebSearchService:
         except Exception as e:
             error_str = str(e)
             if "429" in error_str or "limit" in error_str.lower():
-                raise WebSearchError(f"搜尋 API 額度已用完: {error_str}")
+                raise WebSearchError(f"搜尋 API 額度已用完: {error_str}") from e
             logger.error(f"Tavily search error: {e}", exc_info=True)
-            raise WebSearchError(f"Search failed: {error_str}")
+            raise WebSearchError(f"Search failed: {error_str}") from e
 
     async def extract(self, urls: list[str]) -> ExtractResponse:
         """Extract raw webpage content from URLs using Tavily."""
@@ -288,13 +287,13 @@ class WebSearchService:
         except Exception as e:
             error_str = str(e)
             if "429" in error_str or "432" in error_str or "limit" in error_str.lower():
-                raise WebSearchError(f"搜尋 API 額度已用完: {error_str}")
+                raise WebSearchError(f"搜尋 API 額度已用完: {error_str}") from e
             logger.error(f"Tavily extract error: {e}", exc_info=True)
-            raise WebSearchError(f"Extract failed: {error_str}")
+            raise WebSearchError(f"Extract failed: {error_str}") from e
 
 
 # Global singleton
-_web_search_service: Optional[WebSearchService] = None
+_web_search_service: WebSearchService | None = None
 
 
 def get_web_search_service() -> WebSearchService:

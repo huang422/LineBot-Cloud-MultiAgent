@@ -10,9 +10,9 @@ from __future__ import annotations
 import httpx
 
 from src.providers.openrouter_provider import (
+    ProviderError,
     ProviderResponse,
     RateLimitError,
-    ProviderError,
     parse_openai_response,
 )
 from src.utils.logger import logger

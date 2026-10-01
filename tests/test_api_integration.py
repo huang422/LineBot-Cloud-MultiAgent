@@ -4,10 +4,10 @@ import base64
 import hashlib
 import hmac
 import json
-from contextlib import ExitStack, contextmanager
-from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 import unittest
+from contextlib import ExitStack, contextmanager
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
@@ -16,6 +16,7 @@ import main as main_module
 from src.config import Settings
 from src.models.agent_request import AgentRequest
 from src.models.agent_response import AgentResponse
+from src.pipeline.event_pipeline import PipelineDeps, process_event
 
 
 def _sign_body(secret: str, body: bytes) -> str:
@@ -258,6 +259,7 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         line_service = SimpleNamespace(
             send_loading_animation=AsyncMock(),
             send_text=AsyncMock(),
+            fetch_display_name=AsyncMock(return_value="Tom"),
         )
         cache_service = SimpleNamespace(cache_processed_request=Mock())
         decision = SimpleNamespace(
@@ -274,28 +276,23 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         agent = SimpleNamespace(process=AsyncMock(return_value=response))
         orchestrator = SimpleNamespace(route=AsyncMock(return_value=decision))
-        memory_service = SimpleNamespace(record_interaction=AsyncMock())
+        memory_service = SimpleNamespace(
+            record_interaction=AsyncMock(), touch_user_profile=AsyncMock()
+        )
 
-        with patch.object(
-            main_module, "get_line_service", return_value=line_service
-        ), patch.object(
-            main_module, "process_input", AsyncMock(return_value=request)
-        ), patch.object(
-            main_module, "extract_text", return_value="幫我整理重點"
-        ), patch.object(
-            main_module, "get_message_cache_service", return_value=cache_service
-        ), patch.object(
-            main_module, "enrich_request", AsyncMock(return_value=request)
-        ), patch.object(
-            main_module, "orchestrator", orchestrator
-        ), patch.object(
-            main_module, "_get_agent", return_value=agent
-        ), patch.object(
-            main_module, "get_memory_service", return_value=memory_service
-        ), patch.object(
-            main_module, "send_response", AsyncMock(return_value=True)
-        ) as send_response:
-            await main_module._process_event(event)
+        send_response = AsyncMock(return_value=True)
+        deps = PipelineDeps(
+            line=line_service,
+            memory=memory_service,
+            message_cache=cache_service,
+            orchestrator=orchestrator,
+            get_agent=lambda name: agent,
+            process_input=AsyncMock(return_value=request),
+            enrich_request=AsyncMock(return_value=request),
+            extract_text=Mock(return_value="幫我整理重點"),
+            send_response=send_response,
+        )
+        await process_event(event, deps)
 
         line_service.send_loading_animation.assert_awaited_once_with("G1")
         cache_service.cache_processed_request.assert_called_once_with(event, request)
@@ -343,22 +340,20 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         memory_service = SimpleNamespace(clear_chat=AsyncMock())
         cache_service = SimpleNamespace(cache_processed_request=Mock())
 
-        with patch.object(
-            main_module, "get_line_service", return_value=line_service
-        ), patch.object(
-            main_module, "process_input", AsyncMock(return_value=request)
-        ), patch.object(
-            main_module, "extract_text", return_value="!new"
-        ), patch.object(
-            main_module, "get_memory_service", return_value=memory_service
-        ), patch.object(
-            main_module, "get_message_cache_service", return_value=cache_service
-        ), patch.object(
-            main_module, "enrich_request", AsyncMock()
-        ) as enrich_request, patch.object(
-            main_module, "send_response", AsyncMock()
-        ) as send_response:
-            await main_module._process_event(event)
+        enrich_request = AsyncMock()
+        send_response = AsyncMock()
+        deps = PipelineDeps(
+            line=line_service,
+            memory=memory_service,
+            message_cache=cache_service,
+            orchestrator=SimpleNamespace(route=AsyncMock()),
+            get_agent=lambda name: None,
+            process_input=AsyncMock(return_value=request),
+            enrich_request=enrich_request,
+            extract_text=Mock(return_value="!new"),
+            send_response=send_response,
+        )
+        await process_event(event, deps)
 
         line_service.send_loading_animation.assert_not_called()
         memory_service.clear_chat.assert_awaited_once_with(
@@ -535,7 +530,7 @@ class SchedulerServiceDispatchTests(unittest.IsolatedAsyncioTestCase):
             return True
 
         # 2026-05-25 Mon 21:00 Asia/Taipei == 13:00 UTC
-        ref = datetime(2026, 5, 25, 13, 0, tzinfo=timezone.utc)
+        ref = datetime(2026, 5, 25, 13, 0, tzinfo=UTC)
         result = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
 
         self.assertEqual(result["fired"], ["weekly1"])
@@ -549,7 +544,7 @@ class SchedulerServiceDispatchTests(unittest.IsolatedAsyncioTestCase):
             return True
 
         # Mon 21:01 Asia/Taipei == 13:01 UTC -- not matching :00
-        ref = datetime(2026, 5, 25, 13, 1, tzinfo=timezone.utc)
+        ref = datetime(2026, 5, 25, 13, 1, tzinfo=UTC)
         result = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
         self.assertEqual(result["fired"], [])
 
@@ -560,7 +555,7 @@ class SchedulerServiceDispatchTests(unittest.IsolatedAsyncioTestCase):
         async def sender(g, m):
             return True
 
-        ref = datetime(2026, 5, 25, 13, 0, tzinfo=timezone.utc)
+        ref = datetime(2026, 5, 25, 13, 0, tzinfo=UTC)
         first = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
         second = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
         self.assertEqual(first["fired"], ["weekly1"])
@@ -578,10 +573,77 @@ class SchedulerServiceDispatchTests(unittest.IsolatedAsyncioTestCase):
             return True
 
         # 2027-04-22 09:00 Asia/Taipei == 01:00 UTC
-        ref = datetime(2027, 4, 22, 1, 0, tzinfo=timezone.utc)
+        ref = datetime(2027, 4, 22, 1, 0, tzinfo=UTC)
         result = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
         self.assertEqual(result["fired"], ["bday"])
         self.assertEqual(sent, [("G", "happy bday")])
+
+    # ── Leap-day (Feb 29) yearly jobs ────────────────────────
+    # Policy: on non-leap years a 02-29 job is clamped to 02-28 so the
+    # reminder still fires every year. See ADR-0002.
+
+    def _leap_job(self):
+        from src.services.scheduler_service import _YearlyJob
+
+        return _YearlyJob(
+            id="leap", month=2, day=29, hour=9, minute=0,
+            group_id="G", message="leap bday",
+        )
+
+    def test_leap_day_next_run_does_not_raise_in_non_leap_years(self) -> None:
+        """Regression: next_run used to raise ValueError when ref.year + 1
+        was also a non-leap year, which crashed lifespan startup."""
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("Asia/Taipei")
+        job = self._leap_job()
+        # Every year in a full leap cycle must be safe.
+        for year in range(2024, 2034):
+            for month, day in ((1, 1), (3, 1), (12, 31)):
+                ref = datetime(year, month, day, 0, 0, tzinfo=tz)
+                with self.subTest(ref=ref.isoformat()):
+                    nxt = job.next_run(ref)  # must not raise
+                    self.assertGreater(nxt, ref)
+                    self.assertEqual(nxt.month, 2)
+                    self.assertIn(nxt.day, (28, 29))
+
+    def test_leap_day_next_run_clamps_to_feb_28_on_non_leap_years(self) -> None:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("Asia/Taipei")
+        job = self._leap_job()
+
+        # 2026 is not a leap year -> clamp to 02-28
+        nxt = job.next_run(datetime(2026, 1, 1, 0, 0, tzinfo=tz))
+        self.assertEqual((nxt.year, nxt.month, nxt.day), (2026, 2, 28))
+
+        # 2028 IS a leap year -> real 02-29
+        nxt = job.next_run(datetime(2028, 1, 1, 0, 0, tzinfo=tz))
+        self.assertEqual((nxt.year, nxt.month, nxt.day), (2028, 2, 29))
+
+        # Already past this year's occurrence -> roll to next year
+        nxt = job.next_run(datetime(2028, 3, 1, 0, 0, tzinfo=tz))
+        self.assertEqual((nxt.year, nxt.month, nxt.day), (2029, 2, 28))
+
+    def test_leap_day_job_fires_on_feb_28_in_non_leap_year(self) -> None:
+        """A 02-29 reminder must still be delivered in non-leap years."""
+        job = self._leap_job()
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("Asia/Taipei")
+        # 2026 is not a leap year: the job should match 02-28.
+        self.assertTrue(job.matches(datetime(2026, 2, 28, 9, 0, tzinfo=tz)))
+        # 2028 is a leap year: it must match the real 02-29, not 02-28.
+        self.assertTrue(job.matches(datetime(2028, 2, 29, 9, 0, tzinfo=tz)))
+        self.assertFalse(job.matches(datetime(2028, 2, 28, 9, 0, tzinfo=tz)))
+
+    def test_get_stats_with_leap_day_job_does_not_raise(self) -> None:
+        """/health and lifespan both call list_jobs(); it must never raise."""
+        scheduler = self._build()
+        scheduler.add_yearly_message("leap", 2, 29, 9, 0, "G", "leap bday")
+        stats = scheduler.get_stats()  # must not raise
+        self.assertEqual(stats["job_count"], 1)
+        self.assertIn("next_run", stats["jobs"][0])
 
     async def test_failed_sender_reported_but_does_not_raise(self) -> None:
         scheduler = self._build()
@@ -590,7 +652,7 @@ class SchedulerServiceDispatchTests(unittest.IsolatedAsyncioTestCase):
         async def sender(g, m):
             return False
 
-        ref = datetime(2026, 5, 25, 13, 0, tzinfo=timezone.utc)
+        ref = datetime(2026, 5, 25, 13, 0, tzinfo=UTC)
         result = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
         self.assertEqual(result["fired"], [])
         self.assertEqual(result["failed"], ["weekly1"])
@@ -603,7 +665,7 @@ class SchedulerServiceDispatchTests(unittest.IsolatedAsyncioTestCase):
         async def sender(g, m):
             return True
 
-        ref = datetime(2026, 5, 25, 13, 0, tzinfo=timezone.utc)
+        ref = datetime(2026, 5, 25, 13, 0, tzinfo=UTC)
         result = await scheduler.dispatch_due_jobs(reference_time=ref, sender=sender)
         self.assertEqual(result["fired"], [])
 

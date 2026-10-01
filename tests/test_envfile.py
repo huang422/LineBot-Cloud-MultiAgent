@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.config import Settings
 from scripts.envfile import is_placeholder_value, parse_env_file
+from src.config import Settings
 
 
 class EnvfileParsingTests(unittest.TestCase):

@@ -4,7 +4,6 @@ import argparse
 import json
 from pathlib import Path
 
-
 _PLACEHOLDER_VALUES = {
     "your_channel_secret",
     "your_access_token",

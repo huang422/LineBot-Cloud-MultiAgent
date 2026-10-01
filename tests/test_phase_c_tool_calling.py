@@ -20,12 +20,11 @@ import asyncio
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from src.agents.tool_runner import ToolLoopError, run_tool_loop
 from src.agents.tools import (
     ToolContext,
-    ToolDefinition,
     ToolRegistry,
     build_default_registry,
     parse_tool_arguments,

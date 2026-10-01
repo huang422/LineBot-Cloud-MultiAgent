@@ -520,7 +520,6 @@ if [[ "$SCHEDULED_MESSAGES_ENABLED_VALUE" == "true" ]] \
     --time-zone="Asia/Taipei"
     --uri="$SERVICE_URL/internal/cron"
     --http-method=POST
-    --headers="X-Cron-Token=$INTERNAL_CRON_SECRET_VALUE"
     --attempt-deadline=60s
     --max-retry-attempts=0
     --description="LineBot scheduled message dispatch trigger"
@@ -529,11 +528,13 @@ if [[ "$SCHEDULED_MESSAGES_ENABLED_VALUE" == "true" ]] \
     --project "$PROJECT_ID" \
     --location "$REGION" >/dev/null 2>&1; then
     gcloud scheduler jobs update http "$SCHEDULER_JOB_NAME" \
-      "${scheduler_args[@]}" >/dev/null
+      "${scheduler_args[@]}" \
+      --update-headers="X-Cron-Token=$INTERNAL_CRON_SECRET_VALUE" >/dev/null
     echo "       Cloud Scheduler job updated"
   else
     gcloud scheduler jobs create http "$SCHEDULER_JOB_NAME" \
-      "${scheduler_args[@]}" >/dev/null
+      "${scheduler_args[@]}" \
+      --headers="X-Cron-Token=$INTERNAL_CRON_SECRET_VALUE" >/dev/null
     echo "       Cloud Scheduler job created"
   fi
 else

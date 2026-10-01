@@ -9,7 +9,7 @@ from src.services.image_service import process_image
 from src.services.line_service import get_line_service
 from src.services.message_cache_service import get_message_cache_service
 from src.utils.logger import logger
-from src.utils.validators import sanitize_input, check_prompt_injection
+from src.utils.validators import check_prompt_injection, sanitize_input
 
 
 async def process_input(event: dict) -> AgentRequest | None:

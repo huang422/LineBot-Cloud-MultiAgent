@@ -93,8 +93,32 @@ class MessageCacheService:
             )
         )
 
+    def cache_event_text(self, event: dict) -> bool:
+        """Cache a text message event synchronously; False if it is not text.
+
+        Cheap and local, so the webhook calls it inline instead of queueing
+        a task for it.
+        """
+        message = event.get("message", {})
+        message_id = message.get("id", "")
+        if not message_id or message.get("type", "") != "text":
+            return False
+
+        self.remember(
+            CachedMessage(
+                message_id=message_id,
+                message_type="text",
+                text=sanitize_input(message.get("text", "")),
+            )
+        )
+        return True
+
     async def cache_event_message(self, event: dict) -> None:
-        """Cache a message event that won't go through the normal processing path."""
+        """Cache a message event that won't go through the normal processing path.
+
+        Images are downloaded from LINE, so this runs as a ``cache_image``
+        task rather than inside the webhook request.
+        """
         message = event.get("message", {})
         message_id = message.get("id", "")
         msg_type = message.get("type", "")
@@ -102,14 +126,7 @@ class MessageCacheService:
         if not message_id or msg_type not in {"text", "image"}:
             return
 
-        if msg_type == "text":
-            self.remember(
-                CachedMessage(
-                    message_id=message_id,
-                    message_type="text",
-                    text=sanitize_input(message.get("text", "")),
-                )
-            )
+        if self.cache_event_text(event):
             return
 
         try:

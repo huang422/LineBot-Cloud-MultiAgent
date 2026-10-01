@@ -1,22 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
+import time
 import unittest
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 import main as main_module
 from src.config import Settings
 from src.models.agent_request import AgentRequest
 from src.models.agent_response import AgentResponse
+from src.pipeline import event_pipeline as event_pipeline_module
 from src.pipeline.event_pipeline import PipelineDeps, process_event
+from src.services.line_service import LineService
 
 
 def _sign_body(secret: str, body: bytes) -> str:
@@ -24,10 +29,42 @@ def _sign_body(secret: str, body: bytes) -> str:
     return base64.b64encode(digest).decode("utf-8")
 
 
+def _reset_event_dedupe(test: unittest.TestCase) -> None:
+    """The webhook / task dedupe sets are process-wide; isolate each test."""
+    for seen in (main_module._webhook_seen, main_module._task_seen):
+        seen.clear()
+        test.addCleanup(seen.clear)
+
+
+def _skip_startup_env_scan(test: unittest.TestCase) -> None:
+    """Keep the app hermetic: no developer .env, no live lifecycle check.
+
+    Lifespan's legacy-config check scans .env, and ``get_line_service()``
+    builds LineService from the cached ``src.config.get_settings()``, which
+    reads .env too (a broken local .env used to fail these tests). Tests
+    that need a specific LINE fake patch ``get_line_service`` again inside.
+    The first ``/internal/cron`` of a day queues the model end-of-life
+    check, which the inline queue would run against the live catalogs;
+    ``ModelLifecycle.run`` is stubbed (tests/test_eol_checker.py covers it
+    with a MockTransport).
+    """
+    for name, replacement in (
+        ("legacy_config_warnings", Mock(return_value=[])),
+        ("get_line_service", Mock(return_value=SimpleNamespace())),
+        ("close_line_service", AsyncMock()),
+    ):
+        patcher = patch.object(main_module, name, new=replacement)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+    patcher = patch("src.services.model_lifecycle.ModelLifecycle.run", new=AsyncMock(return_value={}))
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 class ApiEndpointIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
-        main_module._background_tasks.clear()
-        self.addCleanup(main_module._background_tasks.clear)
+        _reset_event_dedupe(self)
+        _skip_startup_env_scan(self)
 
         self.settings = Settings(
             _env_file=None,
@@ -36,14 +73,7 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             openrouter_api_key="key",
             log_level="ERROR",
         )
-        self.fake_line = SimpleNamespace(
-            get_push_stats=lambda: {
-                "enabled": True,
-                "monthly_limit": 0,
-                "used": 0,
-                "remaining": 0,
-            }
-        )
+        self.fake_line = SimpleNamespace()
         self.fake_memory = SimpleNamespace(
             get_stats=lambda: {
                 "backend": "memory",
@@ -66,17 +96,6 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
                 "configured": False,
                 "monthly_uploads": 0,
                 "monthly_limit": 0,
-            }
-        )
-        self.fake_web_search = SimpleNamespace(
-            get_quota_stats=lambda: {
-                "configured": False,
-                "used": None,
-                "quota": None,
-                "remaining": None,
-                "scope": "provider-side",
-                "enforced": False,
-                "configured_app_quota": 1000,
             }
         )
 
@@ -113,18 +132,6 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
                     return_value=self.fake_storage,
                 )
             )
-            stack.enter_context(
-                patch(
-                    "src.services.web_search_service.get_web_search_service",
-                    return_value=self.fake_web_search,
-                )
-            )
-            stack.enter_context(
-                patch(
-                    "src.services.web_search_service.close_web_search_service",
-                    new=AsyncMock(),
-                )
-            )
             client = stack.enter_context(TestClient(main_module.app))
             yield client
 
@@ -134,25 +141,35 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             "X-Line-Signature": _sign_body(self.settings.line_channel_secret, body),
         }
 
-    def test_health_endpoint_returns_structured_status(self) -> None:
-        with self._client() as client:
+    def test_health_endpoint_returns_the_minimal_public_status(self) -> None:
+        with self._client() as client, patch.dict("os.environ", {"APP_VERSION": "v3-test"}):
             response = client.get("/health")
 
         self.assertEqual(response.status_code, 200)
-        payload = response.json()
+        # Everything else moved to the authenticated /health/detail.
+        self.assertEqual(
+            response.json(), {"status": "healthy", "ready_for_webhook": True, "version": "v3-test"}
+        )
 
-        self.assertEqual(payload["status"], "healthy")
-        self.assertTrue(payload["ready_for_webhook"])
+    def test_health_detail_reports_the_running_app(self) -> None:
+        self.settings = self.settings.model_copy(update={"internal_cron_secret": "cron-secret"})
+        with self._client() as client:
+            response = client.get("/health/detail", headers={"X-Cron-Token": "cron-secret"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual((payload["status"], payload["ready_for_webhook"]), ("healthy", True))
         self.assertEqual(payload["warnings"], [])
-        self.assertTrue(payload["providers"]["line"])
-        self.assertTrue(payload["providers"]["openrouter"])
         self.assertIn("orchestrator", payload["agents_stats"])
         self.assertIn("chat", payload["agents_stats"])
         self.assertNotIn("conversation", payload)
         self.assertEqual(payload["memory"]["backend"], "memory")
         self.assertEqual(payload["memory"]["summary_timeout_seconds"], 180)
-        self.assertEqual(payload["scheduler"]["job_count"], 0)
-        self.assertTrue(payload["cost_controls"]["line_push"]["enabled"])
+        self.assertEqual(payload["scheduler"], {"running": False, "jobs": []})
+        self.assertNotIn("push", payload)
+        self.assertEqual(payload["roles"]["chat"][2]["model"], "qwen/qwen3.8-27b:free")
+        # Off Cloud Run (no K_SERVICE) post-webhook work runs inline.
+        self.assertEqual(payload["tasks_mode"], "inline")
 
     def test_webhook_rejects_invalid_signature(self) -> None:
         body = b'{"events":[]}'
@@ -164,6 +181,46 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
                 headers={
                     "Content-Type": "application/json",
                     "X-Line-Signature": "invalid-signature",
+                },
+            )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_webhook_rejects_everything_when_channel_secret_is_empty(self) -> None:
+        # An empty secret makes the HMAC key public: anyone could sign.
+        self.settings = Settings(
+            _env_file=None,
+            line_channel_secret="",
+            line_channel_access_token="token",
+            openrouter_api_key="key",
+            log_level="ERROR",
+        )
+        body = b'{"events":[]}'
+
+        with self._client() as client:
+            response = client.post(
+                "/webhook",
+                content=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Line-Signature": _sign_body("", body),
+                },
+            )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_webhook_rejects_non_ascii_signature_with_403(self) -> None:
+        body = b'{"events":[]}'
+
+        with self._client() as client:
+            response = client.post(
+                "/webhook",
+                content=body,
+                headers={
+                    "Content-Type": "application/json",
+                    # Raw UTF-8 bytes; the server sees them as non-ASCII
+                    # latin-1 text, which used to crash compare_digest (500).
+                    "X-Line-Signature": "簽章".encode(),
                 },
             )
 
@@ -189,16 +246,18 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             "message": {"type": "text", "id": "M1", "text": "只是路過"},
         }
         body = json.dumps({"events": [event]}).encode("utf-8")
-        cache_service = SimpleNamespace(cache_event_message=AsyncMock())
+        cache_service = SimpleNamespace(
+            cache_event_text=Mock(return_value=True), cache_event_message=AsyncMock()
+        )
 
         with self._client() as client, patch.object(
             main_module, "should_handle", return_value=False
         ), patch.object(
             main_module, "get_message_cache_service", return_value=cache_service
         ), patch.object(
-            main_module, "_process_event", AsyncMock()
-        ) as process_event, patch.object(
-            main_module, "_record_group_message"
+            main_module, "_submit_task", AsyncMock()
+        ) as submit_task, patch.object(
+            main_module, "_record_group_message", return_value=None
         ) as record_group_message:
             response = client.post(
                 "/webhook",
@@ -207,11 +266,13 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        cache_service.cache_event_message.assert_called_once_with(event)
-        process_event.assert_not_called()
+        # Text is cached inline and synchronously; nothing is queued for it.
+        cache_service.cache_event_text.assert_called_once_with(event)
+        cache_service.cache_event_message.assert_not_called()
+        submit_task.assert_not_called()
         record_group_message.assert_called_once_with(event)
 
-    def test_webhook_schedules_background_processing_for_triggered_events(self) -> None:
+    def test_webhook_submits_triggered_events_as_event_tasks(self) -> None:
         event = {
             "type": "message",
             "replyToken": "reply-token",
@@ -219,15 +280,17 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             "message": {"type": "text", "id": "M2", "text": "!hej 幫我整理"},
         }
         body = json.dumps({"events": [event]}).encode("utf-8")
-        cache_service = SimpleNamespace(cache_event_message=AsyncMock())
+        cache_service = SimpleNamespace(
+            cache_event_text=Mock(), cache_event_message=AsyncMock()
+        )
 
         with self._client() as client, patch.object(
             main_module, "should_handle", return_value=True
         ), patch.object(
             main_module, "get_message_cache_service", return_value=cache_service
         ), patch.object(
-            main_module, "_process_event", AsyncMock()
-        ) as process_event, patch.object(
+            main_module, "_submit_task", AsyncMock()
+        ) as submit_task, patch.object(
             main_module, "_record_group_message"
         ) as record_group_message:
             response = client.post(
@@ -237,12 +300,14 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        process_event.assert_called_once_with(event)
+        # The webhook awaits the submission instead of fire-and-forget.
+        submit_task.assert_awaited_once_with("event", {"event": event})
+        cache_service.cache_event_text.assert_not_called()
         cache_service.cache_event_message.assert_not_called()
         record_group_message.assert_not_called()
 
 
-class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
+class EventPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_process_event_routes_and_sends_response(self) -> None:
         event = {
             "type": "message",
@@ -277,10 +342,15 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         agent = SimpleNamespace(process=AsyncMock(return_value=response))
         orchestrator = SimpleNamespace(route=AsyncMock(return_value=decision))
         memory_service = SimpleNamespace(
-            record_interaction=AsyncMock(), touch_user_profile=AsyncMock()
+            record_interaction=AsyncMock(),
+            touch_user_profile=AsyncMock(),
+            load_profile_facts=AsyncMock(return_value=["住台北"]),
         )
+        order: list[str] = []
+        memory_service.touch_user_profile.side_effect = lambda **kwargs: order.append("touch")
 
         send_response = AsyncMock(return_value=True)
+        send_response.side_effect = lambda *args: order.append("send") or True
         deps = PipelineDeps(
             line=line_service,
             memory=memory_service,
@@ -311,12 +381,251 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             task_description="整理使用者需求後回覆",
             routing_reasoning="一般文字任務",
             disable_thinking=False,
+            user_created_at=request.received_at,
         )
+        # The sender's facts reach the agent; the profile touch waits for the reply.
+        memory_service.load_profile_facts.assert_awaited_once_with("U1")
+        self.assertEqual(request.user_profile_facts, ["住台北"])
+        memory_service.touch_user_profile.assert_awaited_once_with(
+            user_id="U1", display_name="Tom", source_type="user", chat_id="G1"
+        )
+        self.assertEqual(order, ["send", "touch"])
         line_service.send_text.assert_not_called()
         self.assertEqual(request.text, "幫我整理重點")
         self.assertEqual(request.target_agent, "chat")
         self.assertEqual(request.output_format, "text")
         self.assertFalse(request.disable_thinking)
+
+    async def test_slow_answers_go_ahead_without_asking_for_a_push_budget(self) -> None:
+        # A thinking answer or an image may outlive the reply token in any
+        # chat: it then goes out by push, which nothing counts or refuses.
+        for source_type, disable_thinking, output_format in (
+            ("user", False, "text"),
+            ("group", False, "text"),
+            ("room", False, "text"),
+            ("user", True, "image"),
+            ("group", True, "image"),
+        ):
+            with self.subTest(source_type=source_type, output_format=output_format):
+                request = AgentRequest(
+                    user_id="U1", group_id="U1", reply_token="r", text="分析", source_type=source_type
+                )
+                agent_process = AsyncMock(
+                    return_value=AgentResponse(text="答", agent_name="chat", output_format="text")
+                )
+                decision = SimpleNamespace(
+                    agent="image_gen" if output_format == "image" else "chat",
+                    output_format=output_format,
+                    task_description="",
+                    reasoning="",
+                    disable_thinking=disable_thinking,
+                )
+                # No can_push: the pipeline must not need one.
+                line = SimpleNamespace(
+                    send_loading_animation=AsyncMock(),
+                    send_text=AsyncMock(),
+                    fetch_display_name=AsyncMock(return_value=""),
+                )
+                send_response = AsyncMock(return_value=True)
+                deps = PipelineDeps(
+                    line=line,
+                    memory=SimpleNamespace(
+                        record_interaction=AsyncMock(),
+                        touch_user_profile=AsyncMock(),
+                        load_profile_facts=AsyncMock(return_value=[]),
+                        flush_passive=AsyncMock(),
+                    ),
+                    message_cache=SimpleNamespace(cache_processed_request=Mock()),
+                    orchestrator=SimpleNamespace(route=AsyncMock(return_value=decision)),
+                    get_agent=lambda name, process=agent_process: SimpleNamespace(process=process),
+                    process_input=AsyncMock(return_value=request),
+                    enrich_request=AsyncMock(return_value=request),
+                    extract_text=Mock(return_value="分析"),
+                    send_response=send_response,
+                )
+                event = {"type": "message", "replyToken": "r", "source": {"type": "user", "userId": "U1"}}
+
+                await process_event(event, deps)
+
+                agent_process.assert_awaited_once_with(request)
+                send_response.assert_awaited_once()
+                line.send_text.assert_not_called()
+
+    async def test_an_answer_80_s_after_the_event_still_tries_the_reply_first(self) -> None:
+        # Delivery never skips the reply because time has passed: only LINE
+        # knows whether the token still works. Here it refuses it (400), so
+        # the answer goes out by push, once.
+        calls: list[str] = []
+
+        def line_api(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            if request.url.path == "/v2/bot/message/reply":
+                return httpx.Response(400, json={"message": "Invalid reply token"})
+            return httpx.Response(200, json={"sentMessages": []})
+
+        line = LineService(
+            Settings(_env_file=None, line_channel_access_token="token"),
+            transport=httpx.MockTransport(line_api),
+        )
+        self.addAsyncCleanup(line.close)
+        received_at = time.time() - 80
+        request = AgentRequest(
+            user_id="U1", group_id="U1", reply_token="r", text="你好", received_at=received_at
+        )
+        decision = SimpleNamespace(
+            agent="chat", output_format="text", task_description="", reasoning="", disable_thinking=True
+        )
+        answer = AgentResponse(text="答案", agent_name="chat", output_format="text")
+        memory = SimpleNamespace(
+            record_interaction=AsyncMock(),
+            touch_user_profile=AsyncMock(),
+            load_profile_facts=AsyncMock(return_value=[]),
+        )
+        deps = PipelineDeps(
+            line=SimpleNamespace(
+                send_loading_animation=AsyncMock(),
+                send_text=AsyncMock(),
+                fetch_display_name=AsyncMock(return_value=""),
+            ),
+            memory=memory,
+            message_cache=SimpleNamespace(cache_processed_request=Mock()),
+            orchestrator=SimpleNamespace(route=AsyncMock(return_value=decision)),
+            get_agent=lambda name: SimpleNamespace(process=AsyncMock(return_value=answer)),
+            process_input=AsyncMock(return_value=request),
+            enrich_request=AsyncMock(return_value=request),
+            extract_text=Mock(return_value="你好"),
+        )
+        event = {
+            "type": "message",
+            "replyToken": "r",
+            "timestamp": int(received_at * 1000),
+            "source": {"type": "user", "userId": "U1"},
+        }
+
+        with patch("src.processors.output_processor.get_line_service", return_value=line):
+            await process_event(event, deps)
+
+        self.assertEqual(calls, ["/v2/bot/message/reply", "/v2/bot/message/push"])
+        memory.record_interaction.assert_awaited_once()
+
+    def _profile_deps(self, *, sent: bool, load_profile_facts) -> tuple[PipelineDeps, SimpleNamespace, AsyncMock]:
+        request = AgentRequest(user_id="U1", group_id="U1", reply_token="r", text="你好")
+        memory = SimpleNamespace(
+            record_interaction=AsyncMock(),
+            touch_user_profile=AsyncMock(),
+            load_profile_facts=load_profile_facts,
+        )
+        agent_process = AsyncMock(
+            return_value=AgentResponse(text="哈囉", agent_name="chat", output_format="text")
+        )
+        decision = SimpleNamespace(
+            agent="chat", output_format="text", task_description="", reasoning="", disable_thinking=True
+        )
+        deps = PipelineDeps(
+            line=SimpleNamespace(
+                send_loading_animation=AsyncMock(),
+                send_text=AsyncMock(),
+                fetch_display_name=AsyncMock(return_value="Tom"),
+            ),
+            memory=memory,
+            message_cache=SimpleNamespace(cache_processed_request=Mock()),
+            orchestrator=SimpleNamespace(route=AsyncMock(return_value=decision)),
+            get_agent=lambda name: SimpleNamespace(process=agent_process),
+            process_input=AsyncMock(return_value=request),
+            enrich_request=AsyncMock(return_value=request),
+            extract_text=Mock(return_value="你好"),
+            send_response=AsyncMock(return_value=sent),
+        )
+        return deps, memory, agent_process
+
+    async def test_an_undelivered_reply_leaves_the_profile_untouched(self) -> None:
+        deps, memory, _ = self._profile_deps(sent=False, load_profile_facts=AsyncMock(return_value=[]))
+        event = {"type": "message", "replyToken": "r", "source": {"type": "user", "userId": "U1"}}
+
+        await process_event(event, deps)
+
+        memory.record_interaction.assert_not_called()
+        memory.touch_user_profile.assert_not_called()
+        deps.line.fetch_display_name.assert_not_called()
+
+    async def test_the_agent_sees_the_facts_and_a_failed_load_does_not_stop_the_reply(self) -> None:
+        event = {"type": "message", "replyToken": "r", "source": {"type": "user", "userId": "U1"}}
+        seen: list[list[str]] = []
+
+        deps, memory, agent_process = self._profile_deps(
+            sent=True, load_profile_facts=AsyncMock(return_value=["住台北"])
+        )
+        agent_process.side_effect = lambda request: seen.append(list(request.user_profile_facts)) or (
+            AgentResponse(text="哈囉", agent_name="chat", output_format="text")
+        )
+        await process_event(event, deps)
+        self.assertEqual(seen, [["住台北"]])
+
+        deps, memory, agent_process = self._profile_deps(
+            sent=True, load_profile_facts=AsyncMock(side_effect=RuntimeError("firestore down"))
+        )
+        with patch.object(event_pipeline_module.logger, "warning") as log_warning:
+            await process_event(event, deps)
+        self.assertIn("Profile facts not loaded", log_warning.call_args.args[0])
+        deps.send_response.assert_awaited_once()
+        memory.touch_user_profile.assert_awaited_once()
+
+    async def test_the_facts_load_while_the_router_classifies(self) -> None:
+        # Each side waits until the other has started: this only finishes
+        # (with the facts) when the two run at the same time.
+        event = {"type": "message", "replyToken": "r", "source": {"type": "user", "userId": "U1"}}
+        load_started, route_started = asyncio.Event(), asyncio.Event()
+        seen: list[list[str]] = []
+
+        async def load(user_id):
+            load_started.set()
+            await asyncio.wait_for(route_started.wait(), 1)
+            return ["住台北"]
+
+        deps, memory, agent_process = self._profile_deps(sent=True, load_profile_facts=AsyncMock(side_effect=load))
+        decision = deps.orchestrator.route.return_value
+
+        async def route(request):
+            route_started.set()
+            await asyncio.wait_for(load_started.wait(), 1)
+            return decision
+
+        deps.orchestrator.route.side_effect = route
+        agent_process.side_effect = lambda request: seen.append(list(request.user_profile_facts)) or (
+            AgentResponse(text="哈囉", agent_name="chat", output_format="text")
+        )
+
+        await process_event(event, deps)
+
+        self.assertEqual(seen, [["住台北"]])
+
+    async def test_a_failed_route_cancels_the_facts_load(self) -> None:
+        event = {"type": "message", "replyToken": "r", "source": {"type": "user", "userId": "U1"}}
+        blocked = asyncio.Event()
+        cancelled: list[bool] = []
+
+        async def load(user_id):
+            try:
+                await asyncio.wait_for(blocked.wait(), 1)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+            return []
+
+        async def route(request):
+            await asyncio.sleep(0)  # the load is under way
+            raise RuntimeError("router down")
+
+        deps, memory, agent_process = self._profile_deps(sent=True, load_profile_facts=AsyncMock(side_effect=load))
+        deps.orchestrator.route.side_effect = route
+
+        with patch.object(event_pipeline_module.logger, "error"):
+            await process_event(event, deps)
+        await asyncio.sleep(0)
+
+        self.assertEqual(cancelled, [True])
+        agent_process.assert_not_called()
+        deps.line.send_text.assert_awaited_once_with("r", "U1", "❌ 處理請求時發生錯誤，請稍後再試。")
 
     async def test_process_event_handles_new_chat_without_routing(self) -> None:
         event = {
@@ -356,10 +665,12 @@ class BackgroundProcessingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await process_event(event, deps)
 
         line_service.send_loading_animation.assert_not_called()
+        # Messages sent after !new (by its event time) are kept.
         memory_service.clear_chat.assert_awaited_once_with(
             source_type="group",
             chat_scope="multi",
             chat_id="G1",
+            up_to=request.received_at,
         )
         line_service.send_text.assert_awaited_once_with(
             "reply-token",
@@ -375,8 +686,8 @@ class InternalCronEndpointTests(unittest.TestCase):
     """Cover /internal/cron auth, time parsing, and dispatch wiring."""
 
     def setUp(self) -> None:
-        main_module._background_tasks.clear()
-        self.addCleanup(main_module._background_tasks.clear)
+        _reset_event_dedupe(self)
+        _skip_startup_env_scan(self)
         self.settings = Settings(
             _env_file=None,
             line_channel_secret="secret",
@@ -397,6 +708,25 @@ class InternalCronEndpointTests(unittest.TestCase):
             )
             client = stack.enter_context(TestClient(main_module.app))
             yield client
+
+    def test_lifespan_never_loads_settings_from_the_local_env(self) -> None:
+        # Every cached get_settings() outside main reads the real .env.
+        reads_env = AssertionError("get_settings() would read the local .env")
+        scheduler = SimpleNamespace(
+            dispatch_due_jobs=AsyncMock(return_value={"fired": [], "failed": [], "skipped_duplicate": []})
+        )
+        with ExitStack() as stack:
+            for module in (
+                "src.services.line_service",
+                "src.services.memory_service",
+                "src.services.rate_limit_service",
+                "src.services.storage_service",
+            ):
+                stack.enter_context(patch(f"{module}.get_settings", side_effect=reads_env))
+            client = stack.enter_context(self._client_with_scheduler(scheduler))
+            response = client.post("/internal/cron", headers={"X-Cron-Token": "super-secret"})
+
+        self.assertEqual(response.status_code, 200)
 
     def test_internal_cron_rejects_missing_token(self) -> None:
         scheduler = SimpleNamespace(

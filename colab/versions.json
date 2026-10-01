@@ -1,0 +1,30 @@
+{
+  "ollama": {
+    "version": "0.35.0",
+    "url": "https://github.com/ollama/ollama/releases/download/v0.35.0/ollama-linux-amd64.tar.zst",
+    "sha256": "1c114a6b220c5efca2ef2b1e5f01d1e535e26f6cd6d1678c8489325d2835e525",
+    "size": 1427765407
+  },
+  "cloudflared": {
+    "version": "2026.9.3",
+    "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-linux-amd64",
+    "sha256": "77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2",
+    "size": 40122749
+  },
+  "models": {
+    "qwen3.8:27b-mtp-q4_K_M": {
+      "role": "chat",
+      "digest": "22130167c4c20e20c7b71454612966ca8e8171e9b3cc8ab6ce8aa6cbfec79643",
+      "thinking": [false, "low", "medium", "xhigh"]
+    },
+    "nimble:9b": {
+      "role": "router",
+      "digest": "24e550a16a7081881be2f1f0d91e8cc13a597472735c04119f035a0a85c67e0c",
+      "num_ctx": 8194
+    }
+  },
+  "gpu": {
+    "min_vram_mib": 38000,
+    "min_driver_major": 550
+  }
+}

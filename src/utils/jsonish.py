@@ -70,13 +70,24 @@ def iter_json_candidates(text: str):
 
 
 def load_jsonish_dict(candidate: str) -> dict | None:
-    normalized = candidate.strip().translate(_JSONISH_TRANSLATION)
+    """The dict in *candidate*, or None.
 
-    try:
-        parsed = json.loads(normalized)
-        return parsed if isinstance(parsed, dict) else None
-    except json.JSONDecodeError:
-        pass
+    The candidate is parsed as it is first: valid JSON whose Chinese values
+    contain curly quotes or full-width commas must come back unchanged.
+    Only when that fails are curly and full-width punctuation replaced by
+    their ASCII forms, and then Python literals (``True``/``None``, single
+    quotes) accepted.
+    """
+    raw = candidate.strip()
+    parsed = _loads(raw)
+    if parsed is not None:
+        return parsed
+
+    normalized = raw.translate(_JSONISH_TRANSLATION)
+    if normalized != raw:
+        parsed = _loads(normalized)
+        if parsed is not None:
+            return parsed
 
     pythonish = re.sub(r"\btrue\b", "True", normalized, flags=re.IGNORECASE)
     pythonish = re.sub(r"\bfalse\b", "False", pythonish, flags=re.IGNORECASE)
@@ -85,5 +96,13 @@ def load_jsonish_dict(candidate: str) -> dict | None:
     try:
         parsed = ast.literal_eval(pythonish)
         return parsed if isinstance(parsed, dict) else None
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, TypeError, RecursionError):
         return None
+
+
+def _loads(text: str) -> dict | None:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None

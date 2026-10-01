@@ -1,7 +1,18 @@
 """Output processor: send agent response to LINE in the correct format.
 
-Strategy: ALWAYS try reply_token first (free), fall back to push.
+Strategy: every send goes through LineService, which tries the free
+reply token first and pushes only when the reply certainly failed (an
+expired or invalid token); no push is counted, capped or refused.
 Handles text, voice (TTS → GCS → LINE audio), and image (GCS → LINE image).
+Uploaded media expires through the bucket lifecycle rule; an object is only
+deleted here, inline, when delivering it failed.
+
+Every text that goes out (a reply, an image caption, the text read aloud,
+a fallback) is plain text first (:func:`~src.utils.line_text.to_line_text`
+drops Markdown and LaTeX, which LINE would show raw), then Traditional
+Chinese (OpenCC s2t). A reply that is blank once its markup is gone (an
+empty code fence) is never sent as is, since LINE rejects an empty text
+message: the default text goes out instead.
 """
 
 from __future__ import annotations
@@ -9,8 +20,12 @@ from __future__ import annotations
 from src.models.agent_request import AgentRequest
 from src.models.agent_response import AgentResponse
 from src.services.line_service import get_line_service
-from src.services.storage_service import get_storage_service
+from src.services.storage_service import UploadedMedia, get_storage_service
+from src.utils import request_trace
+from src.utils.line_text import to_line_text
 from src.utils.logger import logger
+
+NO_REPLY_TEXT = "抱歉，無法產生回覆。"
 
 # Simplified → Traditional Chinese converter (lazy init for safety)
 _s2t = None
@@ -60,7 +75,7 @@ async def send_response(request: AgentRequest, response: AgentResponse) -> bool:
 
         if not image_url:
             if uploaded_image:
-                storage.schedule_cleanup(uploaded_image, delay_seconds=0)
+                await _delete_undelivered(storage, uploaded_image)
             return await _send_text_fallback(
                 line, request, to, response.text,
                 default_text="圖片生成完成，但暫時無法傳送。",
@@ -71,12 +86,10 @@ async def send_response(request: AgentRequest, response: AgentResponse) -> bool:
             line, request, to, image_url, response.text
         )
         if sent:
-            if uploaded_image:
-                storage.schedule_cleanup(uploaded_image)
             return True
 
         if uploaded_image:
-            storage.schedule_cleanup(uploaded_image, delay_seconds=0)
+            await _delete_undelivered(storage, uploaded_image)
         logger.warning("Image delivery failed, falling back to text output")
 
         return await _send_text_fallback(
@@ -99,10 +112,10 @@ async def send_response(request: AgentRequest, response: AgentResponse) -> bool:
             default_text="語音生成完成，但暫時無法傳送。",
         )
 
-    if output == "voice" and response.text:
+    text = _line_text(response.text)
+    if output == "voice" and text:
         from src.processors.tts_processor import text_to_speech
 
-        text = _convert_s2t(response.text)
         uploaded_audio = await text_to_speech(text)
         if uploaded_audio:
             storage = get_storage_service()
@@ -111,21 +124,34 @@ async def send_response(request: AgentRequest, response: AgentResponse) -> bool:
                 request.reply_token, to, uploaded_audio.public_url, duration_ms=duration
             )
             if sent:
-                storage.schedule_cleanup(uploaded_audio)
+                request_trace.note_tts("edge-tts")
                 return True
 
-            storage.schedule_cleanup(uploaded_audio, delay_seconds=0)
+            request_trace.note_tts("edge-tts(send failed->text)")
+            await _delete_undelivered(storage, uploaded_audio)
             logger.warning("Audio delivery failed, falling back to text output")
         else:
+            request_trace.note_tts("edge-tts(failed->text)")
             logger.warning("TTS failed, falling back to text output")
         return await line.send_text(request.reply_token, to, text)
 
     # ── Default: text ─────────────────────────────────────────
-    if response.text:
-        text = _convert_s2t(response.text)
-        return await line.send_text(request.reply_token, to, text)
+    return await line.send_text(request.reply_token, to, text or NO_REPLY_TEXT)
 
-    return await line.send_text(request.reply_token, to, "抱歉，無法產生回覆。")
+
+async def _delete_undelivered(storage, media: UploadedMedia) -> None:
+    """Delete an upload LINE never received; the lifecycle rule covers the rest."""
+    if media.blob_name:
+        await storage.delete_blob(media.blob_name)
+
+
+def _line_text(text: str | None) -> str:
+    """*text* as a LINE message: plain text, then Traditional Chinese.
+
+    Empty when nothing but markup and whitespace was left.
+    """
+    converted = _convert_s2t(to_line_text(text or ""))
+    return converted if converted.strip() else ""
 
 
 def _convert_s2t(text: str) -> str:
@@ -156,10 +182,11 @@ async def _send_image_with_text(
 
     # Append text description if available and meaningful
     if text and text.strip() and text.strip() != "已根據你的需求生成圖片。":
-        converted = _convert_s2t(text)
+        converted = _line_text(text)
         if len(converted) > 5000:
             converted = converted[:4997] + "..."
-        messages.append({"type": "text", "text": converted})
+        if converted:
+            messages.append({"type": "text", "text": converted})
 
     return await line.send_messages(request.reply_token, to, messages)
 
@@ -172,5 +199,5 @@ async def _send_text_fallback(
     *,
     default_text: str,
 ) -> bool:
-    fallback_text = _convert_s2t(text) if text else default_text
+    fallback_text = _line_text(text) or default_text
     return await line.send_text(request.reply_token, to, fallback_text)

@@ -1,209 +1,144 @@
 """OpenRouter API provider using the OpenAI-compatible chat completions endpoint.
 
-The project defaults still point at free-tier-friendly model IDs, but the
-client no longer hard-enforces them against a local whitelist.
+Only free model ids (``*:free`` and the ``openrouter/free`` router) are
+called unless the deployment opts into paid ids: a stray paid id would
+otherwise bill account credits without anyone noticing.
+
+Reasoning and JSON mode follow the model's profile
+(:mod:`src.providers.model_profiles`) and the tier options: thinking on
+sends ``reasoning.effort`` (the tier's effort, else medium); thinking off
+sends ``effort: "none"`` to models that reason by default (qwen3.8 would
+think at xhigh otherwise) and nothing to the rest.
 """
 
 from __future__ import annotations
 
-import json
-import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from src.providers.base import (
+    PayloadError,
+    ProviderResponse,
+    SkipTierError,
+    parse_openai_response,
+    require_output,
+)
+from src.providers.messages import normalize_messages
+from src.providers.model_profiles import (
+    DEFAULT_THINKING_BUDGET,
+    clamp_temperature,
+    generic_profile,
+    get_profile,
+    response_format_for,
+    tier_sampling,
+)
+from src.providers.openai_compat import post_chat_completion
 from src.utils.logger import logger
-from src.utils.rate_tracker import RateTracker
+
+if TYPE_CHECKING:
+    from src.services.model_health import ModelHealth
+
+# The free auto-router is billed like a ":free" id.
+FREE_ROUTER_MODEL = "openrouter/free"
+# Upper bound for one request; the fallback chain's per-tier limit is
+# normally much shorter.
+_REQUEST_TIMEOUT_SECONDS = 120.0
 
 
-class RateLimitError(Exception):
-    """Raised when OpenRouter returns 429."""
-
-    def __init__(self, model: str, retry_after: int | None = None):
-        self.model = model
-        self.retry_after = retry_after
-        super().__init__(f"Rate limited: {model}")
+# Effort a thinking tier gets when it names none.
+_DEFAULT_EFFORT = "medium"
 
 
-class ProviderError(Exception):
-    """Raised on non-rate-limit API errors."""
-
-    def __init__(self, model: str, status: int, detail: str, *, provider: str = ""):
-        self.model = model
-        self.status = status
-        self.detail = detail
-        self.provider = provider
-        label = f"{provider} error" if provider else "Provider error"
-        super().__init__(f"{label} {status} for {model}: {detail}")
+def is_free_model_id(model: str) -> bool:
+    """True for OpenRouter ids that never bill credits."""
+    return model.endswith(":free") or model == FREE_ROUTER_MODEL
 
 
-@dataclass
-class ProviderResponse:
-    """Unified response from any LLM provider."""
+def build_chat_payload(
+    model: str,
+    messages: list[dict],
+    *,
+    temperature: float,
+    max_tokens: int,
+    thinking: bool,
+    options: Mapping[str, Any] | None = None,
+    thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict | None = None,
+    json_schema: dict | None = None,
+) -> dict:
+    """The chat completions body for *model* with these tier *options*.
 
-    text: str | None = None
-    images: list[str] | None = None  # base64 data URLs
-    model: str = ""
-    usage: dict | None = None
-    reasoning_content: str | None = None
-    # OpenAI-compatible tool call directives requested by the model.
-    # Each item has the shape:
-    #   {"id": str, "type": "function",
-    #    "function": {"name": str, "arguments": str (JSON-encoded)}}
-    # ``None`` (or empty list) means the model produced a regular text reply.
-    tool_calls: list[dict] | None = None
-    # Echo of ``message.role`` and ``message.content`` so callers running an
-    # agentic tool loop can append the assistant turn back into ``messages``
-    # verbatim before sending tool results.
-    raw_message: dict | None = None
-
-
-_THINK_TAG_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
-
-
-def parse_openai_response(
-    data: dict,
-) -> tuple[str | None, list[str] | None, str | None, list[dict] | None, dict | None]:
-    """Parse an OpenAI-compatible response.
-
-    Returns ``(text, images, reasoning_content, tool_calls, raw_message)``.
-
-    Reasoning is extracted from (in priority order):
-      1. ``message.reasoning`` — OpenRouter primary field
-      2. ``message.reasoning_content`` — alias / NVIDIA field
-      3. Content parts with ``type: "thinking"``
-      4. ``<think>…</think>`` tags embedded in text (native Qwen3 format)
-
-    Tool calls follow the OpenAI Chat Completions format:
-    ``message.tool_calls = [{"id", "type": "function",
-    "function": {"name", "arguments"}}, ...]``. Returned verbatim so that
-    the agentic loop can echo them back when sending tool results.
+    Reasoning tokens count against max_tokens on OpenRouter, so thinking
+    adds the budget (``options["reasoning_budget"]`` or *thinking_budget*).
+    Sampling follows :func:`~src.providers.model_profiles.tier_sampling`
+    (tier, then the profile's default, then the call).
+    ``json_schema`` becomes a ``response_format`` only when the tier's
+    ``json_mode`` asks for one (json_schema or json_object).
     """
-    text = None
-    images = None
-    reasoning_content = None
-    tool_calls: list[dict] | None = None
-    choices = data.get("choices") or []
-    choice = choices[0] if choices else {}
-    message = choice.get("message", {}) or {}
+    options = options or {}
+    profile = get_profile("openrouter", model) or generic_profile("openrouter", model)
+    assert profile is not None  # OpenRouter always has a generic chat protocol
+    temperature, max_tokens = tier_sampling(
+        options, temperature=temperature, max_tokens=max_tokens, profile=profile
+    )
 
-    # Extract reasoning from dedicated fields
-    # OpenRouter uses "reasoning" as primary, "reasoning_content" as alias
-    for field in ("reasoning", "reasoning_content"):
-        val = message.get(field)
-        if isinstance(val, str) and val.strip():
-            reasoning_content = val.strip()
-            break
+    payload: dict = {"model": model, "messages": messages}
+    if thinking and profile.can_think:
+        effort = options.get("effort")
+        payload["reasoning"] = {"effort": effort if effort not in (None, "none") else _DEFAULT_EFFORT}
+        max_tokens += int(options.get("reasoning_budget") or thinking_budget)
+    elif profile.thinking_default:
+        # Omitting the object is not "off" for these: say so.
+        payload["reasoning"] = {"effort": "none"}
+    payload["max_tokens"] = max_tokens
+    payload["temperature"] = clamp_temperature(profile, temperature)
+    if profile.default_top_p is not None:
+        payload["top_p"] = profile.default_top_p
 
-    if isinstance(message.get("content"), str):
-        text = message["content"]
-    elif isinstance(message.get("content"), list):
-        text_parts: list[str] = []
-        for part in message["content"]:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "text":
-                part_text = part.get("text")
-                if isinstance(part_text, str):
-                    text_parts.append(part_text)
-            elif part.get("type") == "image_url":
-                if images is None:
-                    images = []
-                images.append(part["image_url"]["url"])
-            elif part.get("type") == "thinking" and isinstance(part.get("thinking"), str):
-                reasoning_content = reasoning_content or part["thinking"].strip()
-        if text_parts:
-            text = "".join(text_parts)
-
-    # Some image models return images in a separate field
-    if message.get("images"):
-        images = images or []
-        for img in message["images"]:
-            if isinstance(img, dict) and "image_url" in img:
-                val = img["image_url"]
-                images.append(val["url"] if isinstance(val, dict) else val)
-            elif isinstance(img, str):
-                images.append(img)
-
-    # Extract <think> content before stripping (native Qwen3 reasoning on NVIDIA)
-    if text and not reasoning_content:
-        think_match = _THINK_TAG_RE.search(text)
-        if think_match:
-            extracted = think_match.group(0)
-            reasoning_content = re.sub(
-                r"</?think>", "", extracted
-            ).strip() or None
-
-    # Strip leaked <think> tags from final user-facing text
-    if text:
-        text = _THINK_TAG_RE.sub("", text).strip() or None
-
-    raw_tool_calls = message.get("tool_calls")
-    if isinstance(raw_tool_calls, list) and raw_tool_calls:
-        normalized: list[dict] = []
-        for call in raw_tool_calls:
-            if not isinstance(call, dict):
-                continue
-            fn = call.get("function") or {}
-            args = fn.get("arguments")
-            if isinstance(args, dict):
-                # Some providers already deliver parsed args; re-encode so
-                # downstream consumers always see a JSON string.
-                try:
-                    args = json.dumps(args, ensure_ascii=False)
-                except (TypeError, ValueError):
-                    args = ""
-            normalized.append(
-                {
-                    "id": call.get("id") or "",
-                    "type": call.get("type", "function"),
-                    "function": {
-                        "name": fn.get("name", ""),
-                        "arguments": args if isinstance(args, str) else "",
-                    },
-                }
-            )
-        if normalized:
-            tool_calls = normalized
-
-    raw_message = message if isinstance(message, dict) else None
-
-    return text, images, reasoning_content, tool_calls, raw_message
+    if tools and profile.tools:
+        payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+    response_format = response_format_for(options.get("json_mode"), json_schema)
+    if response_format is not None:
+        payload["response_format"] = response_format
+    return payload
 
 
 class OpenRouterProvider:
     """Async client for the OpenRouter chat completions API."""
 
+    name = "openrouter"
     BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
     def __init__(
         self,
         api_key: str,
-        rate_tracker: RateTracker,
+        health: ModelHealth,
         *,
-        reasoning_enabled: bool = False,
-        reasoning_effort: str = "high",
-        reasoning_exclude: bool = True,
-        thinking_budget: int = 4096,
+        thinking_budget: int = DEFAULT_THINKING_BUDGET,
+        allow_paid: bool = False,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.api_key = api_key.strip()
-        self.rate_tracker = rate_tracker
-        self._reasoning_enabled = reasoning_enabled
+        self.health = health
         self._thinking_budget = thinking_budget
-        self._reasoning_config = None
-        if reasoning_enabled:
-            self._reasoning_config = {
-                "enabled": True,
-                "effort": reasoning_effort,
-                "exclude": reasoning_exclude,
-            }
+        self._allow_paid = allow_paid
+        self._blocked_paid_models: set[str] = set()
         self._headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://github.com/linebot-cloud-agent",
             "X-OpenRouter-Title": "LineBot-CloudAgent",
         }
-        self._client = httpx.AsyncClient(timeout=120, headers=self._headers)
+        # ``transport`` lets scripts/live_gate.py carry the exact requests
+        # this class builds; production always uses httpx's default.
+        self._client = httpx.AsyncClient(
+            timeout=_REQUEST_TIMEOUT_SECONDS, headers=self._headers, transport=transport
+        )
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -215,132 +150,83 @@ class OpenRouterProvider:
         *,
         temperature: float = 0.7,
         max_tokens: int = 2048,
-        modalities: list[str] | None = None,
-        require_reasoning_tokens: bool = False,
         disable_thinking: bool = False,
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        json_schema: dict | None = None,
+        options: Mapping[str, Any] | None = None,
     ) -> ProviderResponse:
         """Call OpenRouter and return a unified response.
 
         Args:
-            model: Model ID (e.g. "nvidia/nemotron-3-super-120b-a12b:free")
+            model: Model ID (e.g. "qwen/qwen3.8-27b:free")
             messages: OpenAI-format message list
             temperature: Sampling temperature
             max_tokens: Maximum completion tokens
-            modalities: Set to ["image", "text"] for image generation
-        """
-        from src.providers.model_registry import supports_reasoning as _supports_reasoning
+            json_schema: Sent in the tier's ``json_mode`` (see
+                :func:`build_chat_payload`); without one the prompt alone
+                asks for JSON.
+            options: The tier's options; the chain has already folded
+                ``options["thinking"]`` into ``disable_thinking``.
 
+        Raises:
+            SkipTierError: Paid model id without ``allow_paid`` (no request
+                is sent).
+            ProviderError: A subclass per failure, see src/providers/base.py;
+                EmptyCompletionError when a 200 carries nothing usable.
+        """
         model = model.strip()
         if not model:
-            raise ProviderError("<empty>", 400, "Model ID must not be empty", provider="OpenRouter")
+            raise PayloadError("<empty>", 400, "Model ID must not be empty", self.name)
 
-        # Only attach reasoning for models known to support it
-        use_reasoning = (
-            self._reasoning_enabled
-            and self._reasoning_config
-            and not modalities
-            and _supports_reasoning(model)
-            and not disable_thinking
+        if not self._allow_paid and not is_free_model_id(model):
+            if model not in self._blocked_paid_models:
+                self._blocked_paid_models.add(model)
+                logger.warning(
+                    f"OpenRouter: refusing paid model {model}; use a ':free' id "
+                    "or set OPENROUTER_ALLOW_PAID=true"
+                )
+            raise SkipTierError(
+                model,
+                "paid OpenRouter model blocked (OPENROUTER_ALLOW_PAID=false)",
+                self.name,
+            )
+
+        payload = build_chat_payload(
+            model,
+            normalize_messages(messages),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            thinking=not disable_thinking,
+            options=options,
+            thinking_budget=self._thinking_budget,
+            tools=tools,
+            tool_choice=tool_choice,
+            json_schema=json_schema,
         )
-        if disable_thinking and self._reasoning_enabled:
-            logger.info(f"OpenRouter: thinking OFF for {model} (disable_thinking=True)")
-        elif use_reasoning:
-            logger.info(f"OpenRouter: thinking ON for {model}")
-
-        # Reasoning tokens count against max_tokens on OpenRouter,
-        # so add the thinking budget to ensure actual output has room.
-        effective_max_tokens = max_tokens
-        if use_reasoning:
-            effective_max_tokens = self._thinking_budget + max_tokens
-
-        payload: dict = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": effective_max_tokens,
-            "temperature": temperature,
-        }
-        if modalities:
-            payload["modalities"] = modalities
-        elif use_reasoning:
-            payload["reasoning"] = dict(self._reasoning_config)
-            # Top-level flag to include reasoning output in the response
-            payload["include_reasoning"] = True
-
-        if tools:
-            payload["tools"] = tools
-            if tool_choice is not None:
-                payload["tool_choice"] = tool_choice
+        reasoning = payload.get("reasoning", {}).get("effort", "default")
 
         logger.info(
             f"OpenRouter request → {model} "
-            f"(temp={temperature}, max_tok={max_tokens}, reasoning={use_reasoning})"
+            f"(temp={payload['temperature']}, max_tok={payload['max_tokens']}, reasoning={reasoning})"
         )
-
-        try:
-            resp = await self._client.post(self.BASE_URL, json=payload)
-        except httpx.HTTPError as e:
-            detail = str(e)
-            logger.error(f"OpenRouter request failed for {model}: {detail}")
-            raise ProviderError(model, 0, detail, provider="OpenRouter") from e
-
-        # Update rate-limit tracking from headers
-        self.rate_tracker.update_from_headers(model, dict(resp.headers))
-        self.rate_tracker.record_request(model)
-
-        if resp.status_code == 429:
-            retry_after = resp.headers.get("retry-after")
-            ra = int(retry_after) if retry_after else None
-            self.rate_tracker.record_limit_hit(model, ra)
-            raise RateLimitError(model, ra)
-
-        if resp.status_code != 200:
-            detail = resp.text[:500]
-            if resp.status_code in (401, 403):
-                logger.error(
-                    f"OpenRouter auth error {resp.status_code} for {model}: {detail}. "
-                    "Check OPENROUTER_API_KEY and model access."
-                )
-            else:
-                logger.error(f"OpenRouter error {resp.status_code}: {detail}")
-            raise ProviderError(model, resp.status_code, detail, provider="OpenRouter")
-        try:
-            data = resp.json()
-        except ValueError as e:
-            logger.error(f"OpenRouter returned invalid JSON for {model}: {e}")
-            raise ProviderError(model, resp.status_code, "Invalid JSON response", provider="OpenRouter") from e
-        text, images, reasoning_content, tool_calls, raw_message = parse_openai_response(data)
-
-        usage = data.get("usage")
-        # reasoning_tokens may be top-level or nested under completion_tokens_details
-        reasoning_tokens = (usage or {}).get("reasoning_tokens", 0)
-        if not reasoning_tokens:
-            reasoning_tokens = (
-                (usage or {}).get("completion_tokens_details") or {}
-            ).get("reasoning_tokens", 0)
-        if require_reasoning_tokens and use_reasoning and reasoning_tokens <= 0 and not reasoning_content:
-            logger.warning(
-                f"OpenRouter response from {model} has no reasoning tokens and no reasoning content; "
-                "the model may not support reasoning despite being configured for it"
-            )
-        if reasoning_content:
-            logger.info(
-                f"OpenRouter reasoning ← {model} "
-                f"({len(reasoning_content)} chars)"
-            )
+        self.health.record_request(self.name, model)
+        data = await post_chat_completion(
+            self._client,
+            self.BASE_URL,
+            payload,
+            provider=self.name,
+            model=model,
+            timeout=_REQUEST_TIMEOUT_SECONDS,
+        )
+        response = parse_openai_response(data, model=model, provider=self.name)
+        if response.reasoning_content:
+            logger.info(f"OpenRouter reasoning ← {model} ({len(response.reasoning_content)} chars)")
+        usage = response.usage or {}
         logger.info(
             f"OpenRouter response ← {model} "
-            f"(text={bool(text)}, images={len(images or [])}, "
-            f"reasoning_tokens={reasoning_tokens})"
+            f"(text={bool(response.text)}, finish={response.finish_reason}, "
+            f"prompt_tokens={usage.get('prompt_tokens')}, completion_tokens={usage.get('completion_tokens')}, "
+            f"reasoning_tokens={response.reasoning_tokens})"
         )
-
-        return ProviderResponse(
-            text=text,
-            images=images,
-            model=data.get("model", model),
-            usage=usage,
-            reasoning_content=reasoning_content,
-            tool_calls=tool_calls,
-            raw_message=raw_message,
-        )
+        return require_output(response)

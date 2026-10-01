@@ -2,83 +2,233 @@
 
 Chat completions use the OpenAI-compatible endpoint on build.nvidia.com.
 Image generation uses NVIDIA Visual GenAI NIM endpoints on ai.api.nvidia.com
-with model-specific request/response formats.
+with model-specific request/response formats. Both go through
+:func:`~src.providers.openai_compat.post_chat_completion`, which maps HTTP
+statuses onto the provider errors and polls NVCF 202 answers.
+
+Request shapes follow each exact model id's profile
+(:mod:`src.providers.model_profiles`) and the tier options the fallback
+chain passes along (thinking, reasoning_budget, json_mode, max_tokens,
+temperature; steps for images). There is no substring family detection,
+because similar-looking ids (e.g. nemotron-3 vs nemotron-3.5) take
+different parameters.
+
+Thinking is switched per protocol: ``chat_template_kwargs.enable_thinking``
+(Nemotron 3 adds the profile's extra kwargs, e.g. Ultra's
+``medium_effort``, and a top-level ``reasoning_budget`` only where the model
+takes one), or a top-level ``reasoning_effort`` (muse-glimmer).
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Any
+
 import httpx
 
-from src.providers.openrouter_provider import (
+from src.providers.base import (
+    ContentFilteredError,
+    PayloadError,
     ProviderError,
     ProviderResponse,
-    RateLimitError,
+    SkipTierError,
     parse_openai_response,
+    require_output,
 )
+from src.providers.messages import has_image_parts, normalize_messages
+from src.providers.model_profiles import (
+    DEFAULT_THINKING_BUDGET,
+    MAX_REASONING_BUDGET,
+    NIM_CHAT_PROTOCOLS,
+    NIM_FLUX1_DEV,
+    NIM_FLUX2_KLEIN,
+    NIM_REASONING_EFFORT,
+    ModelProfile,
+    cap_max_tokens,
+    clamp_temperature,
+    generic_profile,
+    get_profile,
+    response_format_for,
+    tier_sampling,
+)
+from src.providers.openai_compat import post_chat_completion
 from src.utils.logger import logger
-from src.utils.rate_tracker import RateTracker
 
-# NVIDIA image generation endpoint base
+if TYPE_CHECKING:
+    from src.services.model_health import ModelHealth
+
+# Upper bound for one request (202 polling included); the fallback chain's
+# per-tier limit is normally much shorter.
+_REQUEST_TIMEOUT_SECONDS = 300.0
+
+
+# reasoning_effort values NIM_REASONING_EFFORT models get for off and on.
+_EFFORT_OFF = "none"
+_EFFORT_ON = "medium"
+
+
+def chat_profile(model: str) -> ModelProfile:
+    """The model's profile, or the generic NIM stand-in for an unknown id."""
+    profile = get_profile("nvidia", model)
+    if profile is None or profile.protocol not in NIM_CHAT_PROTOCOLS:
+        profile = generic_profile("nvidia", model)
+    assert profile is not None  # NVIDIA always has a generic chat protocol
+    return profile
+
+
+def build_chat_payload(
+    model: str,
+    messages: list[dict],
+    *,
+    temperature: float,
+    max_tokens: int,
+    thinking: bool,
+    options: Mapping[str, Any] | None = None,
+    thinking_budget: int = DEFAULT_THINKING_BUDGET,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict | None = None,
+    json_schema: dict | None = None,
+) -> dict:
+    """The chat completions body for *model* with these tier *options*.
+
+    Profiled models always say whether to think (every NIM chat model
+    thinks by default): ``chat_template_kwargs.enable_thinking`` (with the
+    profile's extra thinking kwargs when on), or ``reasoning_effort``
+    none/medium. Thinking adds the reasoning budget
+    (``options["reasoning_budget"]`` or *thinking_budget*) to max_tokens,
+    and sends it as a top-level ``reasoning_budget`` only to models whose
+    profile takes one. Sampling: the tier's ``max_tokens``/``temperature``
+    win, then the profile's default sampling (temperature and top_p from
+    the model card), then the call's temperature, clamped to the profile.
+    ``json_schema`` becomes a ``response_format`` only when the tier's
+    ``json_mode`` asks for one.
+    """
+    options = options or {}
+    profile = chat_profile(model)
+    temperature, max_tokens = tier_sampling(
+        options, temperature=temperature, max_tokens=max_tokens, profile=profile
+    )
+
+    payload: dict = {"model": model, "messages": messages, "stream": False}
+    if profile.protocol in NIM_CHAT_PROTOCOLS:
+        if profile.protocol == NIM_REASONING_EFFORT:
+            payload["reasoning_effort"] = _EFFORT_ON if thinking else _EFFORT_OFF
+        else:
+            kwargs: dict[str, Any] = {"enable_thinking": thinking}
+            if thinking:
+                kwargs.update(profile.thinking_template_kwargs)
+            payload["chat_template_kwargs"] = kwargs
+        if thinking:
+            budget = min(int(options.get("reasoning_budget") or thinking_budget), MAX_REASONING_BUDGET)
+            # The answer still needs max_tokens after the reasoning budget.
+            max_tokens += budget
+            if profile.reasoning_budget:
+                payload["reasoning_budget"] = budget
+    payload["max_tokens"] = cap_max_tokens(profile, max_tokens)
+    payload["temperature"] = clamp_temperature(profile, temperature)
+    if profile.default_top_p is not None:
+        payload["top_p"] = profile.default_top_p
+
+    if tools and profile.tools:
+        payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+    response_format = response_format_for(options.get("json_mode"), json_schema)
+    if response_format is not None:
+        payload["response_format"] = response_format
+    return payload
+
+
+# ── Image generation ──────────────────────────────────────────
+
 _IMAGE_GEN_BASE = "https://ai.api.nvidia.com/v1/genai"
 
-# Model-specific endpoint mapping. NVIDIA's public FLUX endpoint uses the
-# lowercase slug even though the model is commonly written as FLUX.1-dev.
-_FLUX_1_DEV_MODEL = "black-forest-labs/flux.1-dev"
-_IMAGE_MODEL_ENDPOINTS: dict[str, str] = {
-    _FLUX_1_DEV_MODEL: f"{_IMAGE_GEN_BASE}/{_FLUX_1_DEV_MODEL}",
-    "black-forest-labs/FLUX.1-dev": f"{_IMAGE_GEN_BASE}/{_FLUX_1_DEV_MODEL}",
+# FLUX.1-dev guidance: its schema takes (1, 9]; the examples use 3.5-5.
+_FLUX1_DEV_CFG_SCALE = 5.0
+
+
+def _flux2_klein_payload(prompt: str, *, steps: int | None) -> dict:
+    # klein's schema allows 1-4 steps (default 4), pins cfg_scale at 0 and
+    # rejects unknown fields, so mode/samples/cfg_scale/negative_prompt are
+    # omitted.
+    return {
+        "prompt": prompt,
+        "width": 1024,
+        "height": 1024,
+        "seed": 0,  # 0 = random
+        "steps": max(1, min(int(steps or 4), 4)),
+    }
+
+
+def _flux1_dev_payload(prompt: str, *, steps: int | None) -> dict:
+    # NVIDIA NIM FLUX.1-dev schema (see
+    # https://docs.api.nvidia.com/nim/reference/black-forest-labs-flux_1-dev-infer).
+    # Field names differ from the HuggingFace diffusers convention: using
+    # num_inference_steps or guidance_scale here returns HTTP 422.
+    return {
+        "prompt": prompt,
+        "mode": "base",
+        "width": 1024,
+        "height": 1024,
+        "cfg_scale": _FLUX1_DEV_CFG_SCALE,
+        "steps": max(5, min(int(steps or 50), 100)),
+        "samples": 1,
+        "seed": 0,
+    }
+
+
+_IMAGE_PAYLOAD_BUILDERS: dict[str, Callable[..., dict]] = {
+    NIM_FLUX2_KLEIN: _flux2_klein_payload,
+    NIM_FLUX1_DEV: _flux1_dev_payload,
 }
+
+
+def build_image_payload(model: str, prompt: str, options: Mapping[str, Any] | None = None) -> dict | None:
+    """The Visual GenAI body for *model*; None for an id without a profile."""
+    profile = get_profile("nvidia", model)
+    builder = _IMAGE_PAYLOAD_BUILDERS.get(profile.protocol) if profile else None
+    if builder is None:
+        return None
+    return builder(prompt, steps=(options or {}).get("steps"))
 
 
 class NvidiaProvider:
     """Async client for NVIDIA's free inference API.
 
-    Reasoning activation is model-family-specific:
-    - Qwen3/3.5: ``/think`` soft switch + ``chat_template_kwargs`` (top-level).
-    - Gemma 4 / Nemotron 3 Nano/Super: ``chat_template_kwargs`` (top-level).
-    - Nemotron Super V1 / Ultra V1: system prompt ``"detailed thinking on"``.
-    - GPT-OSS: ``reasoning_effort`` at top level.
-    ``parse_openai_response`` extracts reasoning from all response formats.
+    Thinking is controlled only through ``chat_template_kwargs``
+    (``enable_thinking``, plus the profile's extra kwargs and, where the
+    model takes one, a top-level ``reasoning_budget``) or a top-level
+    ``reasoning_effort``, see :func:`build_chat_payload`.
+    ``parse_openai_response`` extracts reasoning from every response format.
     """
 
+    name = "nvidia"
     BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
     def __init__(
         self,
         api_key: str,
-        rate_tracker: RateTracker,
+        health: ModelHealth,
         *,
-        thinking_enabled: bool = False,
-        thinking_budget: int = 4096,
-        thinking_model: str = "",
-        primary_model: str = "",
+        thinking_budget: int = DEFAULT_THINKING_BUDGET,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.api_key = api_key
-        self.rate_tracker = rate_tracker
-        self._thinking_enabled = thinking_enabled
+        self.health = health
         self._thinking_budget = thinking_budget
-        self._thinking_model = thinking_model.strip()
-        self._primary_model = primary_model.strip()
+        self._warned_unprofiled: set[str] = set()
         self._headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
         }
-        self._client = httpx.AsyncClient(timeout=300, headers=self._headers)
-
-    def resolve_model(self, model: str, *, disable_thinking: bool = False) -> str:
-        from src.providers.model_registry import supports_reasoning as _supports_reasoning
-
-        model = model.strip()
-        if (
-            self._thinking_enabled
-            and not disable_thinking
-            and self._thinking_model
-            and model != self._thinking_model
-            and _supports_reasoning(model)
-            and (not self._primary_model or model == self._primary_model)
-        ):
-            return self._thinking_model
-        return model
+        # ``transport`` lets scripts/live_gate.py carry the exact requests
+        # this class builds; production always uses httpx's default.
+        self._client = httpx.AsyncClient(
+            timeout=_REQUEST_TIMEOUT_SECONDS, headers=self._headers, transport=transport
+        )
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -90,202 +240,78 @@ class NvidiaProvider:
         *,
         temperature: float = 0.7,
         max_tokens: int = 2048,
-        modalities: list[str] | None = None,
-        require_reasoning_tokens: bool = False,
         disable_thinking: bool = False,
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        json_schema: dict | None = None,
+        options: Mapping[str, Any] | None = None,
     ) -> ProviderResponse:
         """Call NVIDIA chat completions API and return a unified response.
 
-        Reasoning mode depends on the model family (per official docs):
-        - **Qwen3/3.5**: ``/think`` soft switch + ``chat_template_kwargs``
-          (recommended temp=0.6, top_p=0.95).
-        - **Gemma 4 / Nemotron 3 Nano / Super**: ``chat_template_kwargs: {enable_thinking: true}``.
-        - **Nemotron Super V1 / Ultra V1**: system prompt ``"detailed thinking on"``.
-        - **GPT-OSS**: ``reasoning_effort`` at top level.
+        ``options`` are the tier's (see :func:`build_chat_payload`); the
+        chain has already folded ``options["thinking"]`` into
+        ``disable_thinking``.
+
+        Raises:
+            SkipTierError: Images for a text-only model (no request is sent).
+            ProviderError: A subclass per failure, see src/providers/base.py;
+                EmptyCompletionError when a 200 carries nothing usable.
         """
-        from src.providers.model_registry import supports_reasoning as _supports_reasoning
+        model = model.strip()
+        if not model:
+            raise PayloadError("<empty>", 400, "Model ID must not be empty", self.name)
+        profile = chat_profile(model)
+        if has_image_parts(messages) and "image" not in profile.modalities:
+            # Refuse locally: the API would reject it after a round trip.
+            raise SkipTierError(model, "text-only model cannot take image input", self.name)
+        if not profile.known and model not in self._warned_unprofiled:
+            self._warned_unprofiled.add(model)
+            logger.warning(
+                f"NVIDIA: no protocol profile for {model}; sending a generic "
+                "OpenAI payload without thinking controls"
+            )
 
-        requested_model = model.strip()
-        if not requested_model:
-            raise ProviderError("<empty>", 400, "Model ID must not be empty", provider="NVIDIA")
-
-        model = self.resolve_model(requested_model, disable_thinking=disable_thinking)
-        expect_reasoning = self._thinking_enabled and _supports_reasoning(model) and not disable_thinking
-
-        if expect_reasoning and model != requested_model:
-            logger.info(f"NVIDIA: swapping {requested_model} → {model} for thinking mode")
-
-        if disable_thinking and self._thinking_enabled:
-            logger.info(f"NVIDIA: thinking OFF for {model} (disable_thinking=True)")
-        elif expect_reasoning:
-            logger.info(f"NVIDIA: thinking ON for {model}")
-        model_lower = model.lower()
-        uses_chat_template_payload = (
-            "gemma-4" in model_lower
-            or "nemotron-3-" in model_lower
-            or "qwen" in model_lower
+        payload = build_chat_payload(
+            model,
+            normalize_messages(messages),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            thinking=not disable_thinking,
+            options=options,
+            thinking_budget=self._thinking_budget,
+            tools=tools,
+            tool_choice=tool_choice,
+            json_schema=json_schema,
         )
-
-        # --- Explicit thinking deactivation ---
-        if disable_thinking and self._thinking_enabled and "qwen" in model_lower:
-            # Qwen3/3.5: inject /no_think soft switch to explicitly suppress thinking
-            messages = list(messages)
-            for i in range(len(messages) - 1, -1, -1):
-                msg = messages[i]
-                if msg.get("role") == "user":
-                    content = msg.get("content", "")
-                    if isinstance(content, str):
-                        # Remove any leftover /think and append /no_think
-                        cleaned = content.replace(" /think", "").replace("/think", "")
-                        messages[i] = {**msg, "content": cleaned + " /no_think"}
-                    elif isinstance(content, list):
-                        new_content = list(content)
-                        for j, part in enumerate(new_content):
-                            if part.get("type") == "text" and part.get("text", "").strip():
-                                cleaned = part["text"].replace(" /think", "").replace("/think", "")
-                                new_content[j] = {**part, "text": cleaned + " /no_think"}
-                                break
-                        messages[i] = {**msg, "content": new_content}
-                    break
-
-        # --- Model-family-specific reasoning activation (per official docs) ---
-        if expect_reasoning:
-            if "gemma-4" in model_lower or "nemotron-3-" in model_lower:
-                pass  # message injection not needed; payload handled below
-            elif "nemotron" in model_lower:
-                # Nemotron Super V1 / Ultra V1: system prompt "detailed thinking on"
-                messages = list(messages)
-                if not messages or messages[0].get("role") != "system":
-                    messages.insert(0, {"role": "system", "content": "detailed thinking on"})
-                elif "detailed thinking" not in messages[0].get("content", ""):
-                    # Merge into existing system message to avoid duplicates
-                    messages[0] = {
-                        **messages[0],
-                        "content": "detailed thinking on\n" + messages[0]["content"],
-                    }
-            elif "gpt-oss" in model_lower:
-                pass  # payload handled below
-            elif "qwen" in model_lower:
-                # Qwen3/3.5: /think soft switch to force thinking mode.
-                # Append /think to last user message (per Qwen3 docs).
-                messages = list(messages)
-                injected = False
-                for i in range(len(messages) - 1, -1, -1):
-                    msg = messages[i]
-                    if msg.get("role") == "user":
-                        content = msg.get("content", "")
-                        if isinstance(content, str):
-                            if content.strip() and "/think" not in content:
-                                messages[i] = {**msg, "content": content + " /think"}
-                                injected = True
-                        elif isinstance(content, list):
-                            # Multimodal message: append /think to first text part
-                            new_content = list(content)
-                            for j, part in enumerate(new_content):
-                                if part.get("type") == "text" and part.get("text", "").strip() and "/think" not in part.get("text", ""):
-                                    new_content[j] = {**part, "text": part["text"] + " /think"}
-                                    injected = True
-                                    break
-                            if injected:
-                                messages[i] = {**msg, "content": new_content}
-                        break
-                if not injected:
-                    logger.warning(f"Qwen /think: could not inject into messages for {model}")
-
-        # Qwen3 and Gemma 4 reasoning both need extra room so the final answer
-        # is not squeezed out by thinking tokens.
-        effective_max_tokens = max_tokens
-        if expect_reasoning and ("qwen" in model_lower or "gemma-4" in model_lower):
-            effective_max_tokens = self._thinking_budget + max_tokens
-
-        payload: dict = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": effective_max_tokens,
-            "temperature": temperature,
-        }
-
-        if expect_reasoning:
-            if "gpt-oss" in model_lower:
-                payload["reasoning_effort"] = "high"
-            elif uses_chat_template_payload:
-                payload["chat_template_kwargs"] = {"enable_thinking": True}
-            # Nemotron V1/Ultra: reasoning via system prompt (injected above).
-        elif disable_thinking and self._thinking_enabled:
-            # Explicitly disable thinking to prevent the model from
-            # entering thinking mode by default.
-            if uses_chat_template_payload:
-                payload["chat_template_kwargs"] = {"enable_thinking": False}
-
-        if tools:
-            payload["tools"] = tools
-            if tool_choice is not None:
-                payload["tool_choice"] = tool_choice
+        thinking = payload.get("chat_template_kwargs", {}).get("enable_thinking", False) or (
+            payload.get("reasoning_effort", _EFFORT_OFF) != _EFFORT_OFF
+        )
 
         logger.info(
             f"NVIDIA request → {model} "
-            f"(temp={temperature}, max_tok={max_tokens}, "
-            f"expect_reasoning={expect_reasoning})"
+            f"(temp={payload['temperature']}, top_p={payload.get('top_p')}, "
+            f"max_tok={payload['max_tokens']}, thinking={thinking})"
         )
-
-        try:
-            resp = await self._client.post(self.BASE_URL, json=payload)
-        except httpx.HTTPError as e:
-            detail = str(e)
-            logger.error(f"NVIDIA request failed for {model}: {detail}")
-            raise ProviderError(model, 0, detail, provider="NVIDIA") from e
-
-        self.rate_tracker.record_request(model)
-
-        if resp.status_code == 429:
-            self.rate_tracker.record_limit_hit(model, None)
-            raise RateLimitError(model, None)
-
-        if resp.status_code != 200:
-            detail = resp.text[:500]
-            logger.error(f"NVIDIA error {resp.status_code}: {detail}")
-            raise ProviderError(model, resp.status_code, detail, provider="NVIDIA")
-
-        try:
-            data = resp.json()
-        except ValueError as e:
-            logger.error(f"NVIDIA returned invalid JSON for {model}: {e}")
-            raise ProviderError(model, resp.status_code, "Invalid JSON response", provider="NVIDIA") from e
-        text, images, reasoning_content, tool_calls, raw_message = parse_openai_response(data)
-
-        usage = data.get("usage")
-        reasoning_tokens = (usage or {}).get("reasoning_tokens", 0)
-        if not reasoning_tokens:
-            reasoning_tokens = (
-                (usage or {}).get("completion_tokens_details") or {}
-            ).get("reasoning_tokens", 0)
-        if require_reasoning_tokens and expect_reasoning and reasoning_tokens <= 0 and not reasoning_content:
-            logger.warning(
-                f"NVIDIA response from {model} has no reasoning tokens and no reasoning content; "
-                "Qwen3.5 may have skipped <think> tags for this request"
-            )
-        if reasoning_content:
-            logger.info(
-                f"NVIDIA reasoning ← {model} "
-                f"({len(reasoning_content)} chars)"
-            )
+        self.health.record_request(self.name, model)
+        data = await post_chat_completion(
+            self._client,
+            self.BASE_URL,
+            payload,
+            provider=self.name,
+            model=model,
+            timeout=_REQUEST_TIMEOUT_SECONDS,
+        )
+        response = parse_openai_response(data, model=model, provider=self.name)
+        if response.reasoning_content:
+            logger.info(f"NVIDIA reasoning ← {model} ({len(response.reasoning_content)} chars)")
+        usage = response.usage or {}
         logger.info(
             f"NVIDIA response ← {model} "
-            f"(text={bool(text)}, images={len(images or [])}, "
-            f"reasoning_tokens={reasoning_tokens})"
+            f"(text={bool(response.text)}, finish={response.finish_reason}, "
+            f"prompt_tokens={usage.get('prompt_tokens')}, completion_tokens={usage.get('completion_tokens')}, "
+            f"reasoning_tokens={response.reasoning_tokens})"
         )
-
-        return ProviderResponse(
-            text=text,
-            images=images,
-            model=data.get("model", model),
-            usage=usage,
-            reasoning_content=reasoning_content,
-            tool_calls=tool_calls,
-            raw_message=raw_message,
-        )
+        return require_output(response)
 
     # ── Image Generation ──────────────────────────────────────
 
@@ -294,155 +320,83 @@ class NvidiaProvider:
         model: str,
         prompt: str,
         *,
-        negative_prompt: str = "",
-        steps: int = 50,
-        cfg_scale: int = 5,
-        width: int = 1024,
-        height: int = 1024,
+        options: Mapping[str, Any] | None = None,
     ) -> ProviderResponse:
         """Call NVIDIA Visual GenAI NIM image generation API.
 
-        Returns a ProviderResponse with base64 image data in images[].
+        Returns a ProviderResponse with a base64 data URL in images[], or
+        no image when the model failed the request (so the caller can try
+        its next model). The payload follows the model's
+        exact id (:func:`build_image_payload`); ``options["steps"]`` is the
+        image tier's step count.
+
+        Image calls do not go through the fallback chain, so this method
+        checks and records the model's health itself.
+
+        Raises:
+            SkipTierError: The model is dead, cooling down or over budget
+                (no request is sent).
+            ContentFilteredError: The model's safety filter withheld the
+                image; the model itself stays healthy.
+            ProviderError: A subclass per HTTP failure, see src/providers/base.py.
         """
-        requested_model = model.strip()
-        if not requested_model:
-            raise ProviderError("<empty>", 400, "Model ID must not be empty", provider="NVIDIA")
-        model = _normalize_image_model(requested_model)
-        endpoint = _IMAGE_MODEL_ENDPOINTS.get(model, f"{_IMAGE_GEN_BASE}/{model}")
+        model = model.strip()
+        if not model:
+            raise PayloadError("<empty>", 400, "Model ID must not be empty", self.name)
+        blocked = self.health.unavailable(self.name, model)
+        if blocked is not None:
+            raise SkipTierError(model, f"{blocked.kind}: {blocked.reason}", self.name)
+        endpoint = f"{_IMAGE_GEN_BASE}/{model}"
 
-        is_flux = _is_flux_model(model)
-        is_sd35 = "3.5" in model
-        is_qwen_image = _is_qwen_image_model(model)
-        payload = self._build_image_payload(
-            model,
-            prompt,
-            negative_prompt,
-            steps,
-            cfg_scale,
-            width,
-            height,
-            is_flux,
-            is_sd35,
-            is_qwen_image,
-        )
+        payload = build_image_payload(model, prompt, options)
+        if payload is None:
+            if model not in self._warned_unprofiled:
+                self._warned_unprofiled.add(model)
+                logger.warning(
+                    f"NVIDIA: no payload builder for image model {model}; "
+                    "sending only the prompt (the one field every schema requires)"
+                )
+            payload = {"prompt": prompt}
 
-        logger.info(f"NVIDIA image request → {model} (steps={steps}, {width}x{height})")
-
+        logger.info(f"NVIDIA image request → {model} (steps={payload.get('steps')})")
+        self.health.record_request(self.name, model)
         try:
-            resp = await self._client.post(endpoint, json=payload)
-        except httpx.HTTPError as e:
-            detail = str(e)
-            logger.error(f"NVIDIA image request failed for {model}: {detail}")
-            raise ProviderError(model, 0, detail, provider="NVIDIA") from e
-
-        self.rate_tracker.record_request(model)
-
-        if resp.status_code == 429:
-            self.rate_tracker.record_limit_hit(model, None)
-            raise RateLimitError(model, None)
-
-        if resp.status_code != 200:
-            detail = resp.text[:500]
-            logger.error(f"NVIDIA image error {resp.status_code}: {detail}")
-            raise ProviderError(model, resp.status_code, detail, provider="NVIDIA")
-
-        try:
-            data = resp.json()
-        except ValueError as e:
-            logger.error(f"NVIDIA image returned invalid JSON for {model}: {e}")
-            raise ProviderError(model, resp.status_code, "Invalid JSON response", provider="NVIDIA") from e
+            data = await post_chat_completion(
+                self._client,
+                endpoint,
+                payload,
+                provider=self.name,
+                model=model,
+                timeout=_REQUEST_TIMEOUT_SECONDS,
+            )
+        except ProviderError as exc:
+            logger.error(f"NVIDIA image error {exc.status} for {model}: {exc.detail}")
+            self.health.record_failure(self.name, model, exc)
+            raise
+        self.health.record_success(self.name, model)
 
         base64_image, finish_reason = self._parse_image_response(data)
 
         if finish_reason == "CONTENT_FILTERED":
             logger.warning(f"NVIDIA image {model}: content filtered")
-            return ProviderResponse(text="圖片內容被安全過濾，請換個描述再試。", model=model)
+            raise ContentFilteredError(model, self.name)
+
+        if finish_reason == "ERROR":
+            logger.warning(f"NVIDIA image {model}: generation reported ERROR")
+            return ProviderResponse(model=model)
 
         if not base64_image:
             logger.warning(f"NVIDIA image {model}: no image in response")
             return ProviderResponse(model=model)
 
         # Return as data URL so downstream can handle uniformly
-        data_url = f"data:image/png;base64,{base64_image}"
+        data_url = _to_data_url(base64_image)
         logger.info(f"NVIDIA image response ← {model} (success)")
 
         return ProviderResponse(
             images=[data_url],
             model=model,
         )
-
-    @staticmethod
-    def _build_image_payload(
-        model: str,
-        prompt: str,
-        negative_prompt: str,
-        steps: int,
-        cfg_scale: int,
-        width: int,
-        height: int,
-        is_flux: bool,
-        is_sd35: bool,
-        is_qwen_image: bool = False,
-    ) -> dict:
-        """Build the request payload based on model variant."""
-        if is_qwen_image:
-            # NVIDIA NIM Qwen-Image schema. The endpoint accepts only
-            # ``prompt`` / ``mode`` / ``seed`` / ``steps`` and *both*
-            # ``width`` & ``height`` together (or neither). Sending
-            # ``cfg_scale`` / ``samples`` / ``num_inference_steps``
-            # results in HTTP 422. Steps default to a small value
-            # (4–8 typical) so we cap to avoid 422 from over-large
-            # diffusion budgets.
-            payload: dict = {
-                "prompt": prompt,
-                "mode": "base",
-                "seed": 0,
-                "steps": max(1, min(steps, 8)),
-            }
-            if width and height:
-                payload["width"] = int(width)
-                payload["height"] = int(height)
-            return payload
-        if is_flux:
-            # NVIDIA NIM FLUX.1-dev schema (see
-            # https://docs.api.nvidia.com/nim/reference/black-forest-labs-flux_1-dev-infer):
-            # prompt / width(=1024) / height(=1024) / cfg_scale / steps /
-            # seed / mode / samples. Field names differ from the
-            # HuggingFace diffusers convention — using num_inference_steps
-            # or guidance_scale here returns HTTP 422.
-            payload = {
-                "prompt": prompt,
-                "mode": "base",
-                "width": 1024,
-                "height": 1024,
-                "cfg_scale": float(cfg_scale),
-                "steps": steps,
-                "samples": 1,
-                "seed": 0,
-            }
-        elif is_sd35:
-            # Legacy SD 3.5 endpoint uses width/height.
-            payload = {
-                "prompt": prompt,
-                "mode": "base",
-                "steps": steps,
-                "cfg_scale": cfg_scale,
-                "width": width,
-                "height": height,
-                "samples": 1,
-            }
-        else:
-            # Some legacy image endpoints use aspect_ratio instead of dimensions.
-            aspect = _nearest_aspect_ratio(width, height)
-            payload = {
-                "prompt": prompt,
-                "cfg_scale": cfg_scale,
-                "steps": steps,
-                "aspect_ratio": aspect,
-            }
-            if negative_prompt:
-                payload["negative_prompt"] = negative_prompt
-        return payload
 
     @staticmethod
     def _parse_image_response(data: dict) -> tuple[str | None, str | None]:
@@ -498,33 +452,23 @@ class NvidiaProvider:
         return None, finish_reason
 
 
-def _normalize_image_model(model: str) -> str:
-    value = model.strip()
-    if value.lower() in {"flux.1-dev", _FLUX_1_DEV_MODEL}:
-        return _FLUX_1_DEV_MODEL
-    if value.lower() in {"flux.1-schnell", "black-forest-labs/flux.1-schnell"}:
-        return "black-forest-labs/flux.1-schnell"
-    return value
+def _to_data_url(image_b64: str) -> str:
+    if image_b64.startswith("data:"):
+        return image_b64
+    return f"data:{_sniff_image_mime(image_b64)};base64,{image_b64}"
 
 
-def _is_flux_model(model: str) -> bool:
-    return "flux" in model.lower()
-
-
-def _is_qwen_image_model(model: str) -> bool:
-    return "qwen-image" in model.lower()
-
-
-def _nearest_aspect_ratio(width: int, height: int) -> str:
-    """Map width/height to the nearest legacy image API aspect ratio."""
-    ratio = width / height if height else 1.0
-    options = [
-        (1 / 1, "1:1"),
-        (16 / 9, "16:9"),
-        (9 / 16, "9:16"),
-        (5 / 4, "5:4"),
-        (4 / 5, "4:5"),
-        (3 / 2, "3:2"),
-        (2 / 3, "2:3"),
-    ]
-    return min(options, key=lambda x: abs(x[0] - ratio))[1]
+def _sniff_image_mime(image_b64: str) -> str:
+    """Mime type from the decoded magic bytes (NVIDIA FLUX returns JPEG)."""
+    try:
+        # 16 base64 chars decode to the 12 bytes a WEBP header needs.
+        head = base64.b64decode(image_b64[:16], validate=False)
+    except (binascii.Error, ValueError):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG"):
+        return "image/png"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"

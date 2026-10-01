@@ -52,7 +52,9 @@ def _resolve_timezone(name: str):
         return UTC
     try:
         return ZoneInfo(name)
-    except ZoneInfoNotFoundError:
+    # ValueError: not a zone key at all ("", "/etc/localtime"). A bad
+    # SCHEDULED_MESSAGES_TIMEZONE must not stop startup.
+    except (ZoneInfoNotFoundError, ValueError):
         logger.warning(f"Timezone {name!r} not available; falling back to UTC")
         return UTC
 

@@ -1,17 +1,39 @@
+# Files `gcloud builds submit` must not upload (gitignore syntax; the last
+# matching pattern wins). Check with: gcloud meta list-files-for-upload .
+#
+# Cloud Build runs ruff, pytest and compileall on the upload, so never ignore
+# requirements*.lock (installed with --require-hashes), requirements*.in,
+# requirements*.txt, Dockerfile, pyproject.toml, main.py, src/, prompts/,
+# scripts/, tests/ or infra/ (the provisioning tests read infra/gcp) here.
 .gcloudignore
 .git
 .gitignore
+
+# Secrets. scripts/deploy_cloud_run.sh also refuses to submit when any of
+# these would be uploaded (scripts/envfile.py _UPLOAD_LEAK_RES; a test keeps
+# them in step). .env.* covers .env.example and migrate-v3's backups of .env;
+# the last pattern covers its backups of env files with other names
+# (<name>.bak.<YYYYmmddHHMMSS>).
 .env
-.env.example
-__pycache__/
+.env.*
+.cloudrun-env*
+.claude/
+credentials.json
+*.bak
+*.bak.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]
+
+# Local caches and tooling
+**/__pycache__/
 *.py[cod]
 .pytest_cache/
-.venv/
+.ruff_cache/
+.venv*/
 venv/
 .vscode/
 .DS_Store
-credentials.json
 /tmp/
+
+# Docs are not needed to test or build the image
 README.md
 DEPLOY.md
 LICENSE

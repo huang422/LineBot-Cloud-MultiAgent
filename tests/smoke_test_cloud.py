@@ -1,3 +1,13 @@
+"""Post-deploy smoke checks for a deployed LineBot-CloudAgent service.
+
+scripts/deploy_cloud_run.sh runs this after ``gcloud run deploy``. The signed
+webhook check posts a body with an empty ``events`` list, so it proves the
+signature path works without writing anything to production memory.
+
+The LINE channel secret comes from ``--webhook-secret`` or, preferably, the
+SMOKE_WEBHOOK_SECRET environment variable (it stays out of ``ps`` output).
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -5,10 +15,14 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import sys
-from pathlib import Path
 
 import httpx
+
+WEBHOOK_SECRET_ENV = "SMOKE_WEBHOOK_SECRET"
+# The public /health is minimal; the rest is on the authenticated /health/detail.
+_REQUIRED_HEALTH_KEYS = {"status", "ready_for_webhook"}
 
 
 def _sign_body(secret: str, body: bytes) -> str:
@@ -17,26 +31,9 @@ def _sign_body(secret: str, body: bytes) -> str:
 
 
 def _build_noop_event() -> dict:
-    return {
-        "destination": "cloud-smoke-test",
-        "events": [
-            {
-                "type": "message",
-                "replyToken": "smoke-test-reply-token",
-                "source": {
-                    "type": "group",
-                    "groupId": "CLOUD_SMOKE_GROUP",
-                    "userId": "CLOUD_SMOKE_USER",
-                },
-                "timestamp": 1735689600000,
-                "message": {
-                    "type": "text",
-                    "id": "smoke-message-id",
-                    "text": "smoke noop",
-                },
-            }
-        ],
-    }
+    # No events: the webhook verifies the signature and returns 200 without
+    # recording, caching or routing anything.
+    return {"destination": "cloud-smoke-test", "events": []}
 
 
 def _require_keys(payload: dict, keys: set[str]) -> None:
@@ -45,30 +42,13 @@ def _require_keys(payload: dict, keys: set[str]) -> None:
         raise RuntimeError(f"Response missing keys: {', '.join(missing)}")
 
 
-def _load_webhook_secret_from_cloud_run_env(path: str | None) -> str | None:
-    if not path:
-        return None
-
-    env_file = Path(path)
-    if not env_file.exists():
-        return None
-
-    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line.startswith("LINE_CHANNEL_SECRET:"):
-            continue
-        return json.loads(line.split(":", 1)[1].strip())
-
-    return None
-
-
 def run_health_check(client: httpx.Client, base_url: str, expect_ready: bool) -> None:
     response = client.get(f"{base_url}/health")
     if response.status_code != 200:
-        raise RuntimeError(f"/health returned {response.status_code}: {response.text}")
+        raise RuntimeError(f"/health returned {response.status_code}: {response.text[:200]}")
 
     payload = response.json()
-    _require_keys(payload, {"status", "ready_for_webhook", "providers", "cost_controls"})
+    _require_keys(payload, _REQUIRED_HEALTH_KEYS)
 
     print(f"[ok] /health status={payload['status']}")
     print(f"     ready_for_webhook={payload['ready_for_webhook']}")
@@ -110,12 +90,13 @@ def run_valid_webhook_check(
     )
     if response.status_code != 200:
         raise RuntimeError(
-            f"/webhook valid signed request expected 200, got {response.status_code}: {response.text}"
+            f"/webhook valid signed request expected 200, got {response.status_code}: "
+            f"{response.text[:200]}"
         )
-    print("[ok] /webhook accepts a valid signed no-op event")
+    print("[ok] /webhook accepts a valid signed request (no events, nothing recorded)")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Smoke test a deployed LineBot-CloudAgent service."
     )
@@ -126,11 +107,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--webhook-secret",
-        help="Optional LINE channel secret. When provided, the script also sends a valid signed webhook event.",
-    )
-    parser.add_argument(
-        "--cloud-run-env-file",
-        help="Optional Cloud Run env-vars YAML file. Used to read LINE_CHANNEL_SECRET for the valid webhook check.",
+        help=(
+            "LINE channel secret for the signed webhook check. Defaults to the "
+            f"{WEBHOOK_SECRET_ENV} environment variable; the check is skipped when neither is set."
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -143,22 +123,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fail if /health reports ready_for_webhook=false.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None, *, client: httpx.Client | None = None) -> int:
+    args = parse_args(argv)
     base_url = args.base_url.rstrip("/")
-    webhook_secret = args.webhook_secret or _load_webhook_secret_from_cloud_run_env(
-        args.cloud_run_env_file
-    )
+    webhook_secret = args.webhook_secret or os.environ.get(WEBHOOK_SECRET_ENV, "")
 
-    with httpx.Client(timeout=args.timeout) as client:
-        run_health_check(client, base_url, args.expect_ready)
-        run_invalid_signature_check(client, base_url)
+    with client or httpx.Client(timeout=args.timeout) as http:
+        run_health_check(http, base_url, args.expect_ready)
+        run_invalid_signature_check(http, base_url)
 
         if webhook_secret:
-            run_valid_webhook_check(client, base_url, webhook_secret)
+            run_valid_webhook_check(http, base_url, webhook_secret)
         else:
             print("[skip] valid signed webhook check skipped (no webhook secret available)")
 

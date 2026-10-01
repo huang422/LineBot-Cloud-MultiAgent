@@ -1,8 +1,17 @@
 """Vision Agent — analyses images and answers questions about visual content.
 
-Uses NVIDIA Qwen3.5 397B as the primary vision model. When the primary NVIDIA
-leg needs deeper reasoning, it swaps to NVIDIA Gemma 4 31B; OpenRouter Gemma 4
-31B serves as the fallback.
+Runs on the vision role's tiers (src/runtime/model_roles.py): Colab qwen3.8
+once it is READY, then Nemotron 3 Nano Omni (15 s) and muse-glimmer 30B
+(35 s) on NVIDIA and the OpenRouter free qwen3.8 (15 s), each taking image
+input (Nemotron Ultra, the text tiers' model, cannot). The API tiers never
+think; a request that needs thinking lets Colab think (COLAB_DEEP_THINK),
+then runs every tier with thinking off (``BaseAgent.targets_for``). A
+quoted image that reaches the agent as a URL (the message cache or GCS)
+goes straight to the API tiers: Colab takes inline images only and skips
+it by design (``skip(by design: url image)`` in the summary line).
+
+The prompt is kept near 4k tokens, as for every image request
+(``BaseAgent._build_messages``, ``IMAGE_CONTEXT_CHARS``).
 """
 
 from __future__ import annotations
@@ -19,16 +28,16 @@ class VisionAgent(BaseAgent):
     async def process(self, request: AgentRequest) -> AgentResponse:
         self.call_count += 1
         messages = self._build_messages(request)
+        tiers, deadline = self._plan(request)
 
         logger.info(f"[{request.request_id}] VisionAgent processing")
 
         resp = await self.fallback_chain.generate(
-            targets=self.targets,
+            targets=tiers,
             messages=messages,
             temperature=self.settings.vision_temperature,
             max_tokens=self.settings.vision_max_tokens,
-            require_reasoning_tokens=self.settings.require_reasoning_tokens,
-            thinking_timeout=self.settings.thinking_timeout_seconds,
+            deadline=deadline,
             disable_thinking=request.disable_thinking,
         )
 

@@ -21,6 +21,11 @@ def setup_logger(name: str = "linebot", level: str = "INFO") -> logging.Logger:
             )
         )
         logger.addHandler(handler)
+        # This handler is the only output. A library's root-level logging
+        # call (colab_cli's logging.debug) installs logging.basicConfig's
+        # handler on the root logger, which would print every line again
+        # as "INFO:linebot:...".
+        logger.propagate = False
         _configured = True
 
     # Always update level so lifespan reconfiguration takes effect

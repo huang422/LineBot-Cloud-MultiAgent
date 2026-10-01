@@ -1,67 +1,94 @@
 """Image Generation Agent — two-stage pipeline.
 
-Stage 1: Text LLM (via fallback chain) refines the user's request into an
-         optimised English image generation prompt (non-thinking mode).
-Stage 2: NVIDIA Visual GenAI NIM generates the actual image
-         (FLUX.1-dev by default).
+Stage 1: the utility tiers (text only, thinking off) refine the user's
+         request into an optimised English image prompt.
+Stage 2: the image role's tiers (NVIDIA Visual GenAI: FLUX.2 klein, then
+         FLUX.1-dev) generate the actual image, first answer wins. Each tier
+         runs within its own ``timeout_s`` and the turn deadline, in a 1:1
+         chat and in a group alike: an image that misses the reply token
+         goes out by push. A prompt one model's safety filter refuses goes
+         to the next model; when none draws it, the user is told the filter
+         blocked it (CONTENT_FILTERED_TEXT), not the generic failure.
+
+The short caption sent with the image is optional: the utility tiers write
+it alongside both stages, and it never holds up the image. A caption that
+is not ready when the image is gets dropped for the default one.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 from src.agents.base_agent import BaseAgent
 from src.config import Settings
 from src.models.agent_request import AgentRequest
 from src.models.agent_response import AgentResponse
+from src.providers.base import (
+    ContentFilteredError,
+    ProviderError,
+    RateLimitError,
+    SkipTierError,
+    TransientError,
+)
 from src.providers.fallback_chain import (
     AllModelsRateLimitedError,
     AllProvidersFailedError,
     FallbackChain,
-    Target,
+    Tier,
 )
-from src.providers.nvidia_provider import NvidiaProvider
-from src.providers.openrouter_provider import (
-    ProviderError,
-    RateLimitError,
-)
+from src.providers.messages import strip_image_parts
+from src.utils import request_trace
 from src.utils.logger import logger
+from src.utils.request_trace import Attempt
+
+if TYPE_CHECKING:
+    from src.services.model_health import ModelHealth
 
 _PROMPT_REFINE_SYSTEM = (
-    "Convert the user's request into a detailed, optimized English prompt for FLUX.1-dev image generation. "
-    "If a reference image is provided, preserve its important subject, composition, or style cues unless the user asks to change them. "
+    "Convert the user's request into a detailed, optimized English prompt for a FLUX text-to-image model. "
+    "Neither you nor the image model can see a reference image: if the user refers to one, carry the subject, composition and style cues they describe in words into the prompt, unless they ask to change them. "
     "Output ONLY the prompt text, nothing else. "
     "Include: subject, style, lighting, composition, mood, color palette, camera angle, and any relevant details. "
     "Use concrete, specific descriptors instead of vague words (e.g. 'golden hour side lighting' not just 'nice lighting'). "
-    "Prioritize quality tokens: 'masterpiece, best quality, highly detailed, sharp focus, professional'. "
     "Keep it under 200 words."
 )
 
-_DEFAULT_NEGATIVE_PROMPT = (
-    "low quality, worst quality, blurry, out of focus, deformed, disfigured, "
-    "extra limbs, bad anatomy, bad proportions, watermark, text, signature, "
-    "cropped, poorly drawn, mutation, ugly, duplicate"
-)
+CONTENT_FILTERED_TEXT = "這個請求被圖片模型的安全過濾擋下了，沒辦法生成。可以換個描述再試試，例如避開品牌、真實人物或敏感內容。"
 
 
 class ImageGenAgent(BaseAgent):
     name = "image_gen"
+    # The prompt refiner draws what the user asked for; facts about the
+    # user (hobbies, pets) would leak into unrelated images.
+    sees_user_profile = False
 
     def __init__(
         self,
         settings: Settings,
         fallback_chain: FallbackChain,
-        targets: list[Target] | None = None,
-        nvidia_provider: NvidiaProvider | None = None,
+        targets: Sequence[Tier] | None = None,
+        image_tiers: Sequence[Tier] | None = None,
+        *,
+        health: ModelHealth | None = None,
     ) -> None:
+        """``targets`` are the utility tiers (stage 1, text only).
+
+        ``image_tiers`` are the image role: providers with
+        ``generate_image()``, in order. ``health`` records a tier that runs
+        out of time (the provider records every other outcome itself).
+        """
         super().__init__(settings, fallback_chain, targets)
-        self._nvidia = nvidia_provider
+        self.image_tiers: list[Tier] = list(image_tiers or [])
+        self._health = health
 
     async def process(self, request: AgentRequest) -> AgentResponse:
         self.call_count += 1
         logger.info(f"[{request.request_id}] ImageGenAgent processing")
 
-        if not self._nvidia:
+        if not self.image_tiers:
             return AgentResponse(
                 text="圖片生成服務未設定（需要 NVIDIA API Key）。",
                 agent_name=self.name,
@@ -69,26 +96,29 @@ class ImageGenAgent(BaseAgent):
                 output_format="image",
             )
 
-        # ── Stage 1: Refine prompt + generate description in parallel ──
-        # (description only depends on user's original text, not the refined prompt)
-        refine_task = asyncio.create_task(self._refine_prompt(request))
+        # The caption depends only on the user's text: it runs alongside
+        # both stages, and stage 2 never waits for it.
         desc_task = asyncio.create_task(self._generate_description(request))
-        refined_prompt, description = await asyncio.gather(refine_task, desc_task)
+        try:
+            # ── Stage 1: Refine the prompt ──
+            refined_prompt = await self._refine_prompt(request)
+            logger.info(f"[{request.request_id}] Stage 1 refined prompt: {refined_prompt[:100]}...")
 
-        logger.info(f"[{request.request_id}] Stage 1 refined prompt: {refined_prompt[:100]}...")
-
-        # ── Stage 2: Generate image via NVIDIA Visual GenAI NIM (primary → fallback) ──
-        image_models = [self.settings.image_gen_primary_model]
-        fallback = self.settings.image_gen_fallback_model.strip()
-        if fallback and fallback != self.settings.image_gen_primary_model:
-            image_models.append(fallback)
-
-        image_data, text, model_used = await self._generate_with_fallback(
-            request, refined_prompt, image_models
-        )
+            # ── Stage 2: Generate the image, one image tier after another ──
+            # An image is slow like a thinking answer: it may use the whole
+            # turn in any chat, and goes out by push once the reply token
+            # is gone.
+            image_data, text, model_used = await self._generate_with_fallback(
+                request, refined_prompt, deadline=request.turn_deadline()
+            )
+        finally:
+            desc_task.cancel()  # late: the image goes out with the default caption
 
         if image_data:
-            text = description or text or "已根據你的需求生成圖片。"
+            description = (
+                desc_task.result() if desc_task.done() and not desc_task.cancelled() else None
+            )
+            text = description or "已根據你的需求生成圖片。"
         elif not text:
             text = "圖片生成暫時失敗，請稍後再試。"
 
@@ -104,42 +134,103 @@ class ImageGenAgent(BaseAgent):
         self,
         request: AgentRequest,
         refined_prompt: str,
-        image_models: list[str],
+        *,
+        deadline: float,
     ) -> tuple[str | None, str | None, str]:
-        """Try each NVIDIA image model in order, returning (image_data, text, model_used)."""
-        last_error: Exception | None = None
+        """Try each image tier in order, returning (image_data, text, model_used).
 
-        for image_model in image_models:
-            try:
-                resp = await self._nvidia.generate_image(
-                    model=image_model,
-                    prompt=refined_prompt,
-                    negative_prompt=_DEFAULT_NEGATIVE_PROMPT,
-                    steps=self.settings.image_gen_steps,
-                    cfg_scale=self.settings.image_gen_cfg_scale,
+        A tier runs for at most ``min(tier.timeout_s, time left)``; no tier
+        starts with less than MIN_TIER_SECONDS before *deadline*
+        (``time.monotonic()``). A tier that runs out of time counts as a
+        transient failure of its model, and the next tier is tried; so is
+        one whose safety filter refused the prompt. The tiers' outcomes go
+        to the request's summary line as one walk.
+        """
+        attempts: list[Attempt] = []
+        try:
+            return await self._walk_image_tiers(request, refined_prompt, deadline, attempts)
+        finally:
+            request_trace.record_walk(attempts)
+
+    async def _walk_image_tiers(
+        self,
+        request: AgentRequest,
+        refined_prompt: str,
+        deadline: float,
+        attempts: list[Attempt],
+    ) -> tuple[str | None, str | None, str]:
+        last_error: Exception | None = None
+        filtered = False
+
+        for tier in self.image_tiers:
+            image_model = tier.model
+            started = time.monotonic()
+            remaining = deadline - started
+            if remaining < self.settings.min_tier_seconds:
+                logger.warning(
+                    f"[{request.request_id}] Stage 2 stopped: {remaining:.0f}s left, "
+                    f"not enough for {image_model}"
                 )
+                attempts.append(request_trace.skipped(tier.label, "no time left"))
+                break
+            limit = min(tier.timeout_s, remaining)
+            try:
+                async with asyncio.timeout(limit):
+                    resp = await tier.provider.generate_image(
+                        model=image_model,
+                        prompt=refined_prompt,
+                        options=tier.options,
+                    )
                 image_data = resp.images[0] if resp.images else None
-                model_used = resp.model or image_model
-                if image_data or resp.text:
+                if image_data:
                     logger.info(
                         f"[{request.request_id}] Stage 2 success with {image_model}"
                     )
-                    return image_data, resp.text, model_used
+                    attempts.append(Attempt(tier.label, request_trace.OK, time.monotonic() - started))
+                    return image_data, None, resp.model or image_model
                 logger.warning(
                     f"[{request.request_id}] Stage 2 {image_model} returned empty, trying next"
                 )
+                attempts.append(Attempt(tier.label, request_trace.EMPTY, time.monotonic() - started))
+            except TimeoutError:
+                attempts.append(Attempt(tier.label, request_trace.TIMEOUT, time.monotonic() - started))
+                timeout = TransientError(
+                    image_model, 0, f"no image within {limit:.3g}s", tier.provider_name
+                )
+                logger.warning(f"[{request.request_id}] Stage 2 {image_model} {timeout.detail}, trying next")
+                if self._health is not None:
+                    self._health.record_failure(tier.provider_name, image_model, timeout)
+                last_error = timeout
             except RateLimitError as e:
+                attempts.append(Attempt(tier.label, request_trace.RATE_LIMITED, time.monotonic() - started))
                 logger.warning(
                     f"[{request.request_id}] Stage 2 {image_model} rate-limited, trying next"
                 )
                 last_error = e
+            except ContentFilteredError as e:
+                # The prompt, not the model: the next model may still draw it.
+                attempts.append(
+                    Attempt(tier.label, request_trace.error_outcome(e), time.monotonic() - started)
+                )
+                logger.warning(f"[{request.request_id}] Stage 2 {image_model} content filtered, trying next")
+                filtered = True
+            except SkipTierError as e:
+                # Dead, cooling down or over budget: nothing was sent.
+                attempts.append(request_trace.skipped(tier.label, e.detail))
+                logger.info(f"[{request.request_id}] Stage 2 skipping {image_model} ({e.detail})")
+                last_error = e
             except ProviderError as e:
+                attempts.append(
+                    Attempt(tier.label, request_trace.error_outcome(e), time.monotonic() - started)
+                )
                 logger.warning(
                     f"[{request.request_id}] Stage 2 {image_model} failed ({e.status}), trying next"
                 )
                 last_error = e
 
         # All models failed
+        if filtered:
+            return None, CONTENT_FILTERED_TEXT, ""
         if isinstance(last_error, ProviderError) and last_error.status in (401, 403):
             return None, "圖片生成功能驗證失敗，請檢查 NVIDIA_API_KEY 是否有效。", ""
         if isinstance(last_error, RateLimitError):
@@ -147,22 +238,27 @@ class ImageGenAgent(BaseAgent):
         return None, "圖片生成暫時失敗，請稍後再試或換個描述。", ""
 
     async def _refine_prompt(self, request: AgentRequest) -> str:
-        """Stage 1: Use the text-agent reasoning chain to refine the user's request."""
-        messages = self._build_messages(
-            request,
-            system_override=self._build_refine_system_prompt(),
+        """Stage 1: the utility tiers turn the request into an English prompt.
+
+        The utility tiers are text only, so image parts are removed first;
+        the hosted FLUX models cannot use a reference image anyway.
+        """
+        messages = strip_image_parts(
+            self._build_messages(
+                request, system_override=self._build_refine_system_prompt(), sees_images=False
+            )
         )
 
         try:
-            resp = await self.fallback_chain.generate(
-                targets=self.targets,
-                messages=messages,
-                temperature=self.settings.image_gen_temperature,
-                max_tokens=self.settings.image_gen_max_tokens,
-                require_reasoning_tokens=self.settings.require_reasoning_tokens,
-                thinking_timeout=self.settings.thinking_timeout_seconds,
-                disable_thinking=request.disable_thinking,
-            )
+            with request_trace.phase(request_trace.IMAGE_PROMPT):
+                resp = await self.fallback_chain.generate(
+                    targets=self.targets,
+                    messages=messages,
+                    temperature=self.settings.image_gen_temperature,
+                    max_tokens=self.settings.image_gen_max_tokens,
+                    deadline=self._deadline_for(request, thinking=False),
+                    disable_thinking=True,
+                )
             return resp.text or request.text or "A beautiful creative image"
         except (AllModelsRateLimitedError, AllProvidersFailedError) as e:
             logger.warning(f"Prompt refinement failed, using raw text: {e}")
@@ -180,13 +276,15 @@ class ImageGenAgent(BaseAgent):
             {"role": "user", "content": user_text},
         ]
         try:
-            resp = await self.fallback_chain.generate(
-                targets=self.targets,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=150,
-                disable_thinking=True,
-            )
+            with request_trace.phase(request_trace.IMAGE_CAPTION):
+                resp = await self.fallback_chain.generate(
+                    targets=self.targets,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=150,
+                    disable_thinking=True,
+                    deadline=self._deadline_for(request, thinking=False),
+                )
             return resp.text.strip() if resp.text else None
         except Exception as e:
             logger.warning(f"Description generation failed: {e}")

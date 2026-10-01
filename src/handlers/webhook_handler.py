@@ -4,6 +4,7 @@ Trigger conditions:
 1. !hej [message] — explicit command
 2. @mention bot name — natural trigger in groups
 3. Image sent in DM — auto-trigger vision
+4. !new and !colab — commands that trigger on their own in groups too
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import re
 
 from src.config import get_settings
 from src.models.agent_request import AgentRequest
+from src.services.colab.admin import GROUP_TRIGGER as _COLAB_COMMAND_PATTERN
 from src.services.memory_service import MemoryServiceError, get_memory_service
 from src.services.rate_limit_service import get_rate_limit_service
 from src.utils.logger import logger
@@ -67,6 +69,9 @@ def should_handle(event: dict) -> bool:
     # Group/room: need trigger
     if msg_type == "text":
         if _NEW_CHAT_PATTERN.match(text.strip()):
+            return True
+        # !colab on|off|status (the pipeline answers non-admins too)
+        if _COLAB_COMMAND_PATTERN.match(text.strip()):
             return True
         # !hej command
         if _HEJ_PREFIX.match(text):

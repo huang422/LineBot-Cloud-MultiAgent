@@ -1,12 +1,24 @@
+# Secrets: dotenv files (the template stays tracked), migrate-v3 backups
+# (<env file>.bak.<time>; .env.* covers those of .env), generated Cloud Run
+# env files and local agent settings.
 .env
+.env.*
+!.env.example
+*.bak
+*.bak.[0-9]*
 .cloudrun-env.generated.*
-__pycache__/
+.claude/
+credentials.json
+
+# Caches and virtualenvs
+**/__pycache__/
 *.py[cod]
 .pytest_cache/
-.venv/
+.ruff_cache/
+.venv*/
 venv/
+
+# Editors and OS
 .vscode/
-.claude
 .DS_Store
-credentials.json
 /tmp/

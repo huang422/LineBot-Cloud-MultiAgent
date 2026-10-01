@@ -1,35 +1,4 @@
-# Web Framework
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
-
-# HTTP Client (OpenRouter + LINE API)
-httpx>=0.26.0
-
-# Data Validation & Settings
-pydantic>=2.5.0
-pydantic-settings>=2.1.0
-python-dotenv>=1.0.0
-
-# Image Processing
-Pillow>=10.2.0
-
-# Text-to-Speech (completely free, no API key)
-edge-tts>=6.1.0
-mutagen>=1.47.0
-
-# Web Search
-tavily-python>=0.5.0
-
-# Chinese Simplified → Traditional conversion
-opencc-python-reimplemented>=0.1.7
-
-# GCP Cloud Storage (for audio/image temp URLs)
-google-cloud-storage>=2.14.0
-
-# GCP Firestore Native (persistent long-term memory; optional)
-# Free tier: 50K reads / 20K writes / 1 GiB storage per day.
-# Disable via FIRESTORE_ENABLED=false to fall back to in-memory.
-google-cloud-firestore>=2.16.0
-
-# Timezone database for zoneinfo (Asia/Taipei scheduling under python:3.11-slim)
-tzdata>=2024.1
+# Compatibility shim for tools that look for requirements.txt. Versions and
+# hashes live only in requirements.lock (generated from requirements.in); do
+# not add packages here. See DEPLOY.md, "依賴鎖定與本機驗證".
+-r requirements.lock

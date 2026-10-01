@@ -1,7 +1,7 @@
 [tool.ruff]
 line-length = 100
-target-version = "py311"
-exclude = [".venv", "venv", "__pycache__", ".pytest_cache"]
+target-version = "py312"
+exclude = [".venv*", "venv", "__pycache__", ".pytest_cache"]
 
 [tool.ruff.lint]
 # Start deliberately narrow: correctness-flavoured rules that catch real
@@ -22,7 +22,6 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Re-exported for backwards compatibility with existing import paths.
 "main.py" = ["F401"]
-"src/agents/orchestrator.py" = ["F401", "E402"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["src", "main"]

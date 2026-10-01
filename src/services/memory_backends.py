@@ -9,29 +9,62 @@ Two backends are provided:
 - :class:`FirestoreBackend` — persists to Google Cloud Firestore Native.
   Survives Cloud Run cold starts and can be shared across instances.
 
-The backend interface is intentionally narrow: load/save/list/delete the
-chat-level memory document, plus optional helpers for the per-user
-profile collection introduced in Phase A. Episodic vector storage will
-extend the same interface in Phase B.
+The backend interface is intentionally narrow: load/save/delete the
+chat-level memory document, load/save the per-user profile, and save /
+vector-search a chat's episodes. ``tests/test_firestore_backend_fake.py``
+drives the Firestore backend through a fake client.
 
 All Firestore access is wrapped in ``run_in_executor`` because the
 official ``google-cloud-firestore`` client is sync-only at the time of
 writing. The backend keeps that detail isolated from ``MemoryService``.
+A chat or profile write is waited for even when its caller is cancelled
+(:meth:`FirestoreBackend._write`), so it lands while the caller still
+holds the chat's lock.
 """
 
 from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any
 
 from src.config import Settings
 from src.utils.logger import logger
 
+# A Firestore chat or profile write (FirestoreBackend._write) gives up
+# within about twice this: each attempt's deadline, and retries (on
+# ResourceExhausted or ServiceUnavailable, as the client's default does)
+# only start within it. The client's own default is a 60 s retry deadline.
+# The write is waited for even after its caller is cancelled, so this bounds
+# that wait: the task handler cancels an event EVENT_NOTICE_SECONDS (10 s)
+# before its budget runs out, and its timeout notice needs that time.
+WRITE_TIMEOUT_SECONDS = 3.0
+
 
 class MemoryBackendError(Exception):
     """Raised when a backend operation fails irrecoverably."""
+
+
+def _bounded_write_options() -> dict[str, Any]:
+    """``retry`` and ``timeout`` for a Firestore write (WRITE_TIMEOUT_SECONDS)."""
+    try:
+        from google.api_core import exceptions, retry
+    except ImportError:  # pragma: no cover - only a fake client runs without it
+        return {"retry": None, "timeout": WRITE_TIMEOUT_SECONDS}
+    return {
+        "retry": retry.Retry(
+            predicate=retry.if_exception_type(
+                exceptions.ResourceExhausted, exceptions.ServiceUnavailable
+            ),
+            initial=0.1,
+            maximum=1.0,
+            multiplier=1.3,
+            timeout=WRITE_TIMEOUT_SECONDS,
+        ),
+        "timeout": WRITE_TIMEOUT_SECONDS,
+    }
 
 
 class MemoryBackend(ABC):
@@ -70,7 +103,9 @@ class MemoryBackend(ABC):
         ``episode`` should contain at minimum ``summary`` and ``ts``.
         ``embedding`` (list[float]) is optional but required for vector
         recall. Default: best-effort no-op so backends without vector
-        support degrade gracefully.
+        support degrade gracefully. A backend that stores episodes raises
+        :class:`MemoryBackendError` when the write fails, so the compaction
+        keeps the conversation pending for the next episode.
         """
 
     async def search_episodes(
@@ -186,7 +221,9 @@ class FirestoreBackend(MemoryBackend):
 
     - ``{prefix}_chat_memory/{key}`` — keyed as ``"{source_type}::{chat_id}"``
     - ``{prefix}_user_profile/{user_id}`` — per-user profile facts
-    - ``{prefix}_episodes/{key}/items/{auto_id}`` — Phase B episodic memory
+    - ``{prefix}_episodes/{key}/items/{auto_id}`` — episodes (summary,
+      snippet, embedding); DEPLOY.md lists the large fields whose
+      single-field indexes should be exempted
 
     The client library is synchronous, so all RPCs run inside
     ``loop.run_in_executor`` to keep the event loop responsive.
@@ -201,27 +238,14 @@ class FirestoreBackend(MemoryBackend):
         project_id: str,
         database: str = "(default)",
         collection_prefix: str = "linebot",
+        client: Any | None = None,
     ) -> None:
-        try:
-            from google.cloud import firestore  # type: ignore
-        except ImportError as exc:  # pragma: no cover - import guard
-            raise MemoryBackendError(
-                "google-cloud-firestore is not installed; cannot use Firestore backend"
-            ) from exc
-
-        self._firestore_module = firestore
-        client_kwargs: dict[str, Any] = {}
-        if project_id:
-            client_kwargs["project"] = project_id
-        if database and database != "(default)":
-            client_kwargs["database"] = database
-
-        try:
-            self._client = firestore.Client(**client_kwargs)
-        except Exception as exc:  # pragma: no cover - depends on env
-            raise MemoryBackendError(
-                f"Failed to initialise Firestore client: {exc}"
-            ) from exc
+        """``client`` replaces the ``firestore.Client`` built from the
+        project and database (tests pass a fake one)."""
+        if client is None:
+            client = self._build_client(project_id, database)
+        self._client = client
+        self._write_options = _bounded_write_options()
 
         prefix = (collection_prefix or "linebot").strip().rstrip("_") or "linebot"
         self._chat_collection = f"{prefix}_chat_memory"
@@ -232,6 +256,28 @@ class FirestoreBackend(MemoryBackend):
             f"(project={project_id or 'default'}, database={database}, "
             f"prefix={prefix})"
         )
+
+    @staticmethod
+    def _build_client(project_id: str, database: str):
+        try:
+            from google.cloud import firestore  # type: ignore
+        except ImportError as exc:  # pragma: no cover - import guard
+            raise MemoryBackendError(
+                "google-cloud-firestore is not installed; cannot use Firestore backend"
+            ) from exc
+
+        client_kwargs: dict[str, Any] = {}
+        if project_id:
+            client_kwargs["project"] = project_id
+        if database and database != "(default)":
+            client_kwargs["database"] = database
+
+        try:
+            return firestore.Client(**client_kwargs)
+        except Exception as exc:  # pragma: no cover - depends on env
+            raise MemoryBackendError(
+                f"Failed to initialise Firestore client: {exc}"
+            ) from exc
 
     @property
     def episodes_collection(self) -> str:
@@ -260,22 +306,19 @@ class FirestoreBackend(MemoryBackend):
     async def delete_chat(self, key: str) -> None:
         if not key:
             return
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(
-                None,
-                lambda: self._client.collection(self._chat_collection)
-                .document(key)
-                .delete(),
-            )
-        except Exception as exc:
-            raise MemoryBackendError(
-                f"Firestore delete failed for {self._chat_collection}/{key}: {exc}"
-            ) from exc
+        # Waited for like a save (_write): a delete landing after the next
+        # writer saved would erase that write.
+        await self._write(
+            lambda: self._client.collection(self._chat_collection).document(key).delete(
+                **self._write_options
+            ),
+            failure=f"Firestore delete failed for {self._chat_collection}/{key}",
+        )
 
         # Best-effort cleanup of the chat's episode subcollection so
         # ``!new`` does not leave dangling vector docs around. Failures
         # here are logged but do not propagate.
+        loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(None, self._purge_episodes_sync, key)
         except Exception as exc:
@@ -292,9 +335,9 @@ class FirestoreBackend(MemoryBackend):
                 None, self._save_episode_sync, key, episode
             )
         except Exception as exc:
-            logger.warning(
+            raise MemoryBackendError(
                 f"Firestore episode save failed for {key}: {exc}"
-            )
+            ) from exc
 
     async def search_episodes(
         self,
@@ -387,18 +430,47 @@ class FirestoreBackend(MemoryBackend):
         return deepcopy(data)
 
     async def _save(self, collection: str, doc_id: str, document: dict[str, Any]) -> None:
-        loop = asyncio.get_running_loop()
+        payload = deepcopy(document)
+        await self._write(
+            lambda: self._client.collection(collection).document(doc_id).set(
+                payload, merge=False, **self._write_options
+            ),
+            failure=f"Firestore save failed for {collection}/{doc_id}",
+        )
+
+    @staticmethod
+    async def _write(write: Callable[[], Any], *, failure: str) -> None:
+        """Run the *write* RPC in the executor and wait for it to finish,
+        even when the caller is cancelled.
+
+        Cancelling a task cannot stop an executor thread. Without this a
+        cancelled caller (the task handler's ``asyncio.timeout``) would
+        release the chat's lock while its write was still in flight, the
+        next writer would load the document without it, and whichever of
+        the two writes landed last would erase the other. So the write is
+        shielded: a cancellation waits for the thread (the write lands or
+        fails; the caller passes the client a bound of about twice
+        WRITE_TIMEOUT_SECONDS), then re-raises the ``CancelledError``, still
+        under the caller's lock. Later cancellations while waiting are absorbed the
+        same way. A write that failed after the cancellation is logged.
+        """
+        future = asyncio.get_running_loop().run_in_executor(None, write)
+        cancelled: asyncio.CancelledError | None = None
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError as exc:
+                cancelled = cancelled or exc
+            except Exception:
+                pass  # raised from future.result() below
+        if cancelled is not None:
+            if not future.cancelled() and future.exception() is not None:
+                logger.warning(f"{failure} after its caller was cancelled: {future.exception()}")
+            raise cancelled
         try:
-            await loop.run_in_executor(
-                None,
-                lambda: self._client.collection(collection).document(doc_id).set(
-                    deepcopy(document), merge=False
-                ),
-            )
+            future.result()
         except Exception as exc:
-            raise MemoryBackendError(
-                f"Firestore save failed for {collection}/{doc_id}: {exc}"
-            ) from exc
+            raise MemoryBackendError(f"{failure}: {exc}") from exc
 
 
 def build_backend(settings: Settings) -> MemoryBackend:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from src.models.agent_request import AgentRequest, InputType
 from src.services.image_service import process_image
@@ -10,6 +11,14 @@ from src.services.line_service import get_line_service
 from src.services.message_cache_service import get_message_cache_service
 from src.utils.logger import logger
 from src.utils.validators import check_prompt_injection, sanitize_input
+
+
+def event_received_at(event: dict, now: float | None = None) -> float:
+    """Epoch seconds from the LINE event's ``timestamp`` (ms), else now."""
+    raw = event.get("timestamp")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return float(raw) / 1000.0
+    return time.time() if now is None else now
 
 
 async def process_input(event: dict) -> AgentRequest | None:
@@ -37,17 +46,17 @@ async def process_input(event: dict) -> AgentRequest | None:
         reply_token=reply_token,
         source_type=source_type,
         chat_scope=chat_scope,
+        received_at=event_received_at(event),
     )
 
     if msg_type == "text":
-        text = sanitize_input(message.get("text", ""))
-        if not text:
-            return None
-        if check_prompt_injection(text):
-            logger.warning(
-                f"Prompt injection detected from {user_id[:8]}, "
-                f"text={_json_log_text(text)}, ignoring"
-            )
+        raw_text = message.get("text", "")
+        text = sanitize_input(raw_text)
+        request.prompt_injection_stripped = _injection_stripped(raw_text, user_id)
+        # A message that was nothing but an injection marker is kept, empty:
+        # the pipeline answers it with its "nothing to answer" reply rather
+        # than ignoring the user.
+        if not text and not request.prompt_injection_stripped:
             return None
         request.input_type = InputType.TEXT
         request.text = text
@@ -69,15 +78,10 @@ async def process_input(event: dict) -> AgentRequest | None:
         request.image_base64 = image_b64
 
         # Check if there's accompanying text (from caption or quote)
-        text = message.get("text", "")
+        raw_text = message.get("text", "")
+        text = sanitize_input(raw_text) if raw_text else ""
         if text:
-            text = sanitize_input(text)
-            if check_prompt_injection(text):
-                logger.warning(
-                    f"Prompt injection detected from {user_id[:8]}, "
-                    f"text={_json_log_text(text)}, ignoring"
-                )
-                return None
+            request.prompt_injection_stripped = _injection_stripped(raw_text, user_id)
             request.input_type = InputType.IMAGE_TEXT
             request.text = text
 
@@ -89,6 +93,18 @@ async def process_input(event: dict) -> AgentRequest | None:
 
     logger.info(_build_input_log_summary(request))
     return request
+
+
+def _injection_stripped(raw_text: str, user_id: str) -> bool:
+    """True (and logged) when sanitizing removed an injection marker.
+
+    The message is still answered: the markers are gone from its text and
+    the agents add a guard line (src/agents/base_agent.py).
+    """
+    if not check_prompt_injection(raw_text):
+        return False
+    logger.warning(f"Prompt-injection marker stripped from a message by {user_id[:8]}")
+    return True
 
 
 def _apply_quoted_context(request: AgentRequest, message: dict) -> None:

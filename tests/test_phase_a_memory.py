@@ -68,7 +68,6 @@ class BuildBackendFallbackTests(unittest.TestCase):
             firestore_project_id=None,
             firestore_database="(default)",
             firestore_collection_prefix="linebot",
-            firestore_location="us-west1",
         )
         backend = build_backend(settings)
         self.assertIsInstance(backend, InMemoryBackend)
@@ -79,7 +78,6 @@ class BuildBackendFallbackTests(unittest.TestCase):
             firestore_project_id=None,
             firestore_database="(default)",
             firestore_collection_prefix="linebot",
-            firestore_location="us-west1",
         )
         with patch(
             "src.services.memory_backends.FirestoreBackend",
@@ -89,10 +87,19 @@ class BuildBackendFallbackTests(unittest.TestCase):
         self.assertIsInstance(backend, InMemoryBackend)
 
 
+class _Clock:
+    def __init__(self, now: float = 1_790_000_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
 class TouchUserProfileTests(unittest.TestCase):
     def test_touch_creates_then_preserves_existing_display_name(self) -> None:
         backend = InMemoryBackend()
-        service = _make_memory_service(backend)
+        clock = _Clock()
+        service = MemoryService(_make_settings(), backend=backend, clock=clock)
 
         asyncio.run(
             service.touch_user_profile(
@@ -106,7 +113,9 @@ class TouchUserProfileTests(unittest.TestCase):
         self.assertEqual(profile["display_name"], "Alice")
         self.assertEqual(profile["last_seen_source_type"], "user")
 
-        # Subsequent call with empty display_name must NOT overwrite
+        # A day later the last-seen fields are due; an empty display_name
+        # must still NOT overwrite the stored one.
+        clock.now += 24 * 3600
         asyncio.run(
             service.touch_user_profile(
                 user_id="U1",
@@ -119,6 +128,64 @@ class TouchUserProfileTests(unittest.TestCase):
         self.assertEqual(profile["display_name"], "Alice")
         self.assertEqual(profile["last_seen_source_type"], "group")
         self.assertEqual(profile["last_seen_chat_id"], "G42")
+        self.assertEqual(backend.user_profiles["U1"]["last_seen_at"], clock.now)
+
+    def test_touch_writes_only_on_a_new_name_or_a_day_old_last_seen(self) -> None:
+        backend = InMemoryBackend()
+        clock = _Clock()
+        service = MemoryService(_make_settings(), backend=backend, clock=clock)
+        loads = AsyncMock(wraps=backend.load_user_profile)
+        saves = AsyncMock(wraps=backend.save_user_profile)
+
+        async def touches() -> None:
+            with patch.object(backend, "load_user_profile", loads), patch.object(
+                backend, "save_user_profile", saves
+            ):
+                # First sight: one read (nothing stored) and one write.
+                await service.touch_user_profile(user_id="U1", display_name="Alice")
+                self.assertEqual((loads.await_count, saves.await_count), (1, 1))
+
+                # Same name within the cache's 10 minutes: no I/O at all.
+                clock.now += 300
+                for name in ("Alice", ""):
+                    await service.touch_user_profile(user_id="U1", display_name=name)
+                self.assertEqual((loads.await_count, saves.await_count), (1, 1))
+
+                # Later the same day: one read to refresh the cache, no write.
+                clock.now += 600
+                await service.touch_user_profile(user_id="U1", display_name="Alice")
+                self.assertEqual((loads.await_count, saves.await_count), (2, 1))
+
+                # A new name is written at once. The cache decided, so the
+                # stored copy is read again first (facts saved meanwhile stay).
+                backend.user_profiles["U1"]["facts"] = ["住台北"]
+                await service.touch_user_profile(user_id="U1", display_name="Alice Wang")
+                self.assertEqual((loads.await_count, saves.await_count), (3, 2))
+                self.assertEqual(backend.user_profiles["U1"]["facts"], ["住台北"])
+                self.assertEqual(backend.user_profiles["U1"]["display_name"], "Alice Wang")
+
+                # 24 hours after the last write, last_seen is refreshed once.
+                written_at = clock.now
+                clock.now = written_at + 24 * 3600 - 1
+                await service.touch_user_profile(user_id="U1")
+                self.assertEqual(saves.await_count, 2)
+                clock.now = written_at + 24 * 3600
+                await service.touch_user_profile(user_id="U1")
+                self.assertEqual(saves.await_count, 3)
+                self.assertEqual(backend.user_profiles["U1"]["last_seen_at"], clock.now)
+
+        asyncio.run(touches())
+
+    def test_a_user_without_a_resolvable_name_is_recorded_once(self) -> None:
+        backend = InMemoryBackend()
+        service = MemoryService(_make_settings(), backend=backend, clock=_Clock())
+        saves = AsyncMock(wraps=backend.save_user_profile)
+        with patch.object(backend, "save_user_profile", saves):
+            for _ in range(3):
+                asyncio.run(service.touch_user_profile(user_id="U9", source_type="group", chat_id="G1"))
+        self.assertEqual(saves.await_count, 1)
+        self.assertEqual(backend.user_profiles["U9"]["display_name"], "")
+        self.assertEqual(backend.user_profiles["U9"]["last_seen_chat_id"], "G1")
 
     def test_touch_with_empty_user_id_is_noop(self) -> None:
         backend = InMemoryBackend()

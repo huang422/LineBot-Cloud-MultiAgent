@@ -1,10 +1,19 @@
 """LINE Messaging Service.
 
 Core strategy: ALWAYS try reply_token first (free), then fall back to
-push_message when reply fails and push fallback is enabled.
+push_message when the reply certainly failed (an expired or invalid token,
+or a request that never left).
 
-Normal reply-fallback push is separate from proactive direct push
-(for example scheduled messages), which stays budget-controlled.
+A send whose outcome is unknown (a timeout or dropped connection after the
+request went out, or a 5xx) counts as sent: LINE may have delivered it, and
+a second send (the push after a reply, or the text after an image) would
+deliver the answer twice. LINE's X-Line-Retry-Key cannot help here: it
+dedupes a repeated push, and the reply API takes no retry key.
+
+No push is counted, capped or refused here, the reply fallback and direct
+pushes (scheduled messages) alike: LINE's own monthly quota is the only
+limit. Each send that goes out is noted on the event's summary line
+(``delivery=reply|push``, :func:`src.utils.request_trace.note_delivery`).
 """
 
 from __future__ import annotations
@@ -14,23 +23,34 @@ from io import BytesIO
 
 import httpx
 
-from src.config import get_settings
+from src.config import Settings, get_settings
+from src.utils import request_trace
 from src.utils.logger import logger
 
 LINE_API_BASE = "https://api.line.me/v2"
 LINE_DATA_API_BASE = "https://api-data.line.me/v2"
 
+# Transport errors raised before any byte of the request left, so LINE
+# cannot have delivered it. Any other failure is unclear.
+_NOT_SENT_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.UnsupportedProtocol,
+)
+
 
 class LineService:
-    def __init__(self) -> None:
-        settings = get_settings()
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        """``transport`` exists for tests."""
+        settings = settings or get_settings()
         self.channel_secret = settings.line_channel_secret
         self.channel_access_token = settings.line_channel_access_token
-        self.push_fallback_enabled = settings.line_push_fallback_enabled
-        self._push_monthly_limit = settings.line_push_monthly_limit
-        self._current_month = datetime.now(UTC).strftime("%Y-%m")
-        self._reply_fallback_push_count = 0
-        self._direct_push_count = 0
         self._profile_cache_ttl = max(0, settings.line_profile_cache_ttl_seconds)
         # Maps "{source_type}::{chat_id}::{user_id}" → (cached_at, display_name)
         self._profile_cache: dict[str, tuple[float, str]] = {}
@@ -40,19 +60,8 @@ class LineService:
                 "Authorization": f"Bearer {self.channel_access_token}",
                 "Content-Type": "application/json",
             },
+            transport=transport,
         )
-        if self.push_fallback_enabled and self._push_monthly_limit > 0:
-            logger.info(
-                "LineService initialized "
-                f"(reply fallback enabled, direct push limit={self._push_monthly_limit}/month)"
-            )
-        elif self.push_fallback_enabled:
-            logger.warning(
-                "LineService initialized "
-                "(reply fallback enabled, direct push unlimited)"
-            )
-        else:
-            logger.info("LineService initialized (all push usage disabled)")
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -72,7 +81,7 @@ class LineService:
             if success:
                 return True
 
-        # Step 2: fall back to push if reply is unavailable and push fallback is enabled
+        # Step 2: fall back to push when the reply certainly failed
         if to:
             return await self._push(to, [{"type": "text", "text": text}])
         return False
@@ -223,94 +232,48 @@ class LineService:
     async def push_text(
         self, to: str, text: str, notification_disabled: bool = False
     ) -> bool:
-        """Push a text message directly when the explicit direct-push budget allows it."""
+        """Push a text message directly (scheduled messages)."""
         if len(text) > 5000:
             text = text[:4997] + "..."
         return await self._push(
-            to, [{"type": "text", "text": text}],
-            notification_disabled=notification_disabled,
-            push_reason="direct_push",
+            to, [{"type": "text", "text": text}], notification_disabled=notification_disabled
         )
 
     # ── Internal ─────────────────────────────────────────────
 
-    def _check_and_reset_push_budget(self) -> None:
-        current_month = datetime.now(UTC).strftime("%Y-%m")
-        if current_month != self._current_month:
-            logger.info(
-                f"LINE push budget reset: {self._current_month} -> {current_month}, "
-                f"reply_fallback={self._reply_fallback_push_count}, "
-                f"direct_push={self._direct_push_count}/{self._push_monthly_limit}"
-            )
-            self._current_month = current_month
-            self._reply_fallback_push_count = 0
-            self._direct_push_count = 0
-
-    @property
-    def direct_push_remaining(self) -> int | None:
-        self._check_and_reset_push_budget()
-        if not self.push_fallback_enabled:
-            return 0
-        if self._push_monthly_limit <= 0:
-            return None
-        return max(0, self._push_monthly_limit - self._direct_push_count)
-
-    def _is_push_allowed(self, push_reason: str) -> bool:
-        self._check_and_reset_push_budget()
-        if not self.push_fallback_enabled:
-            return False
-        if push_reason == "reply_fallback":
-            return True
-        if self._push_monthly_limit <= 0:
-            return True
-        return self._direct_push_count < self._push_monthly_limit
-
-    def get_push_stats(self) -> dict:
-        self._check_and_reset_push_budget()
-        return {
-            "enabled": self.push_fallback_enabled,
-            "month": self._current_month,
-            "reply_fallback_used": self._reply_fallback_push_count,
-            "direct_push_used": self._direct_push_count,
-            "direct_push_limit": self._push_monthly_limit if self._push_monthly_limit > 0 else None,
-            "direct_push_remaining": self.direct_push_remaining,
-            "direct_push_unlimited": self.push_fallback_enabled and self._push_monthly_limit <= 0,
-            "scope": "per-instance",
-        }
-
     async def _reply(self, reply_token: str, messages: list[dict]) -> bool:
+        """False only when the reply certainly did not go out."""
         try:
             resp = await self.client.post(
                 f"{LINE_API_BASE}/bot/message/reply",
                 json={"replyToken": reply_token, "messages": messages},
             )
-            if resp.status_code == 200:
-                self._cache_sent_messages(messages, resp)
-                logger.info("Reply sent (free)")
-                return True
-            logger.warning(f"Reply failed {resp.status_code}: {resp.text[:200]}")
+        except _NOT_SENT_ERRORS as e:
+            logger.warning(f"Reply error: {e!r}")
             return False
         except Exception as e:
-            logger.warning(f"Reply error: {e}")
-            return False
+            logger.error(f"Reply outcome unknown ({e!r}); counted as sent, not pushed again")
+            request_trace.note_delivery(request_trace.REPLY)
+            return True
+        if resp.status_code == 200:
+            self._cache_sent_messages(messages, resp)
+            logger.info("Reply sent (free)")
+            request_trace.note_delivery(request_trace.REPLY)
+            return True
+        if resp.status_code >= 500:
+            logger.error(
+                f"Reply outcome unknown ({resp.status_code}: {resp.text[:200]}); "
+                "counted as sent, not pushed again"
+            )
+            request_trace.note_delivery(request_trace.REPLY)
+            return True
+        logger.warning(f"Reply failed {resp.status_code}: {resp.text[:200]}")
+        return False
 
     async def _push(
-        self,
-        to: str,
-        messages: list[dict],
-        *,
-        notification_disabled: bool = False,
-        push_reason: str = "reply_fallback",
+        self, to: str, messages: list[dict], *, notification_disabled: bool = False
     ) -> bool:
-        if not self._is_push_allowed(push_reason):
-            limit = self._push_monthly_limit if self._push_monthly_limit > 0 else "unlimited"
-            logger.warning(
-                f"Push blocked ({push_reason}): "
-                f"enabled={self.push_fallback_enabled}, "
-                f"direct_push={self._direct_push_count}/{limit}"
-            )
-            return False
-
+        """False only when the push certainly did not go out."""
         try:
             resp = await self.client.post(
                 f"{LINE_API_BASE}/bot/message/push",
@@ -320,24 +283,26 @@ class LineService:
                     "notificationDisabled": notification_disabled,
                 },
             )
-            if resp.status_code == 200:
-                self._cache_sent_messages(messages, resp)
-                if push_reason == "reply_fallback":
-                    self._reply_fallback_push_count += 1
-                else:
-                    self._direct_push_count += 1
-                limit = self._push_monthly_limit if self._push_monthly_limit > 0 else "unlimited"
-                logger.warning(
-                    f"Push message sent ({push_reason}) to {to[:8]}..., "
-                    f"reply_fallback={self._reply_fallback_push_count}, "
-                    f"direct_push={self._direct_push_count}/{limit}"
-                )
-                return True
-            logger.error(f"Push failed {resp.status_code}: {resp.text[:200]}")
+        except _NOT_SENT_ERRORS as e:
+            logger.error(f"Push error: {e!r}")
             return False
         except Exception as e:
-            logger.error(f"Push error: {e}")
-            return False
+            logger.error(f"Push outcome unknown ({e!r}); counted as sent")
+            request_trace.note_delivery(request_trace.PUSH)
+            return True
+        if resp.status_code == 200:
+            self._cache_sent_messages(messages, resp)
+            logger.warning(f"Push message sent to {to[:8]}...")
+            request_trace.note_delivery(request_trace.PUSH)
+            return True
+        if resp.status_code >= 500:
+            logger.error(
+                f"Push outcome unknown ({resp.status_code}: {resp.text[:200]}); counted as sent"
+            )
+            request_trace.note_delivery(request_trace.PUSH)
+            return True
+        logger.error(f"Push failed {resp.status_code}: {resp.text[:200]}")
+        return False
 
     def _cache_sent_messages(self, messages: list[dict], response) -> None:
         try:

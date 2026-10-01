@@ -1,18 +1,38 @@
+# Build context exclusions for the runtime image. Unlike .gitignore,
+# patterns are anchored at the context root, so nested matches need **/.
 .git
 .gcloudignore
 .gitignore
-.env
-.env.example
-.cloudrun-env.generated.*
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.venv/
+
+# Secrets: never bake dotenv files, migrate-v3 backups (<env file>.bak.<time>),
+# generated Cloud Run env files or local agent settings into the image.
+**/.env
+**/.env.*
+**/.cloudrun-env*
+**/.claude
+**/credentials.json
+**/*.bak
+**/*.bak.[0-9]*
+
+# Local caches and tooling (the Cloud Build test step creates __pycache__)
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+.venv*
 venv/
 .vscode/
+.DS_Store
+
+# Not needed at runtime. Keep requirements.lock: the image installs it with
+# --require-hashes.
 README.md
 DEPLOY.md
+docs/
+CONTEXT.md
 tests/
 scripts/
+infra/
+requirements-dev.in
 requirements-dev.txt
 LICENSE

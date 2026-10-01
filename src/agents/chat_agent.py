@@ -6,9 +6,15 @@ agentic tool-calling loop so the model can actively pull longer-term
 memory (``recall_memory``), persist user facts (``update_user_profile``)
 or fall back to a web search when a query needs fresh data.
 
-If the tool loop fails for any reason (provider lacks tool support,
-JSON-decode error, hits ``max_iterations``) we fall back to the plain
-``fallback_chain.generate`` path so the user always gets a reply.
+When the loop cannot answer, one plain ``fallback_chain.generate`` call
+(no tools, the original messages, what is left of the same deadline)
+does: after a :class:`~src.agents.tool_runner.ToolLoopError` (a
+misconfigured registry, or no text even after the loop's final
+``tool_choice="none"`` request), and after an ``AllProvidersFailedError``,
+since a tier may refuse a request with tools or tool turns (HTTP 400)
+and still answer one without. A ``DeadlineExceededError`` (no time left)
+or an ``AllModelsRateLimitedError`` (every tier now cooling down)
+propagates: a retry could not answer.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from src.agents.tool_runner import ToolLoopError, run_tool_loop
 from src.agents.tools import ToolContext, ToolRegistry
 from src.models.agent_request import AgentRequest
 from src.models.agent_response import AgentResponse
+from src.providers.fallback_chain import AllProvidersFailedError, DeadlineExceededError
 from src.utils.logger import logger
 
 
@@ -30,9 +37,17 @@ class ChatAgent(BaseAgent):
         fallback_chain,
         targets=None,
         *,
+        thinking_targets=None,
+        vision_targets=None,
         tool_registry: ToolRegistry | None = None,
     ) -> None:
-        super().__init__(settings, fallback_chain, targets)
+        super().__init__(
+            settings,
+            fallback_chain,
+            targets,
+            thinking_targets=thinking_targets,
+            vision_targets=vision_targets,
+        )
         self._tool_registry = tool_registry
 
     @property
@@ -45,6 +60,7 @@ class ChatAgent(BaseAgent):
     async def process(self, request: AgentRequest) -> AgentResponse:
         self.call_count += 1
         messages = self._build_messages(request)
+        tiers, deadline = self._plan(request)
 
         logger.info(f"[{request.request_id}] ChatAgent processing")
 
@@ -57,7 +73,7 @@ class ChatAgent(BaseAgent):
                 )
                 loop_result = await run_tool_loop(
                     fallback_chain=self.fallback_chain,
-                    targets=self.targets,
+                    targets=tiers,
                     messages=messages,
                     registry=self._tool_registry,
                     context=ctx,
@@ -65,8 +81,7 @@ class ChatAgent(BaseAgent):
                     max_iterations=self.settings.tool_loop_max_iterations,
                     temperature=self.settings.chat_temperature,
                     max_tokens=self.settings.chat_max_tokens,
-                    require_reasoning_tokens=self.settings.require_reasoning_tokens,
-                    thinking_timeout=self.settings.thinking_timeout_seconds,
+                    deadline=deadline,
                     disable_thinking=request.disable_thinking,
                 )
                 resp = loop_result.response
@@ -81,24 +96,20 @@ class ChatAgent(BaseAgent):
                     model_used=resp.model,
                     output_format=request.output_format,
                 )
-            except ToolLoopError as exc:
+            except DeadlineExceededError:
+                raise
+            except (ToolLoopError, AllProvidersFailedError) as exc:
                 logger.warning(
-                    f"[{request.request_id}] Tool loop unusable, "
+                    f"[{request.request_id}] Tool loop could not answer, "
                     f"falling back to plain generate: {exc}"
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning(
-                    f"[{request.request_id}] Tool loop raised "
-                    f"{exc!r}, falling back to plain generate"
                 )
 
         resp = await self.fallback_chain.generate(
-            targets=self.targets,
+            targets=tiers,
             messages=messages,
             temperature=self.settings.chat_temperature,
             max_tokens=self.settings.chat_max_tokens,
-            require_reasoning_tokens=self.settings.require_reasoning_tokens,
-            thinking_timeout=self.settings.thinking_timeout_seconds,
+            deadline=deadline,
             disable_thinking=request.disable_thinking,
         )
 

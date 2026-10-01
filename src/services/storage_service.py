@@ -1,7 +1,10 @@
 """GCS Storage Service — temporary file hosting for audio and images.
 
 Uploads files to Google Cloud Storage and generates signed URLs for
-LINE to fetch (audio messages, generated images).
+LINE to fetch (audio messages, generated images). Objects expire through
+the bucket's lifecycle rule (Delete after 3 days, enforced by
+scripts/deploy_cloud_run.sh); the app only deletes an object itself when
+delivering it failed.
 """
 
 from __future__ import annotations
@@ -12,8 +15,6 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
-from urllib.request import Request as UrlRequest
-from urllib.request import urlopen
 from uuid import uuid4
 
 from google.auth import credentials as google_auth_credentials
@@ -22,6 +23,7 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account as google_service_account
 
 from src.config import get_settings
+from src.utils.gcp_metadata import get_service_account_email_sync
 from src.utils.logger import logger
 
 
@@ -46,7 +48,6 @@ class StorageService:
         settings = get_settings()
         self._bucket_name = settings.gcs_bucket_name
         self._expiry_hours = settings.gcs_signed_url_expiry_hours
-        self._cleanup_delay_seconds = settings.gcs_media_cleanup_delay_seconds
         self._current_month = datetime.now(UTC).strftime("%Y-%m")
         self._month_upload_count = 0
         self._month_upload_bytes = 0
@@ -54,7 +55,6 @@ class StorageService:
         self._credentials = None
         self._service_account_email = ""
         self._bucket = None
-        self._cleanup_tasks: set[asyncio.Task] = set()
         self._signing_credentials: google_auth_credentials.Signing | None = None
 
         if self._bucket_name:
@@ -69,7 +69,7 @@ class StorageService:
                 # On Cloud Run, compute credentials report "default" as the email.
                 # Resolve the real email from the metadata server for signBlob to work.
                 if not self._service_account_email or self._service_account_email == "default":
-                    self._service_account_email = self._resolve_service_account_email()
+                    self._service_account_email = get_service_account_email_sync()
                 signed_url_mode = "private-key credentials"
                 if (
                     self._credentials is not None
@@ -82,36 +82,12 @@ class StorageService:
                 logger.info(
                     "StorageService initialized, "
                     f"bucket={self._bucket_name}, "
-                    f"cleanup_delay_s={self._cleanup_delay_seconds}, "
                     f"signed_url_mode={signed_url_mode}"
                 )
             except Exception as e:
                 logger.warning(f"StorageService GCS init failed: {e}")
         else:
             logger.warning("StorageService: GCS_BUCKET_NAME not configured")
-
-    @staticmethod
-    def _resolve_service_account_email() -> str:
-        """Fetch the real service account email from the GCE metadata server.
-
-        On Cloud Run / GCE, the default credentials report 'default' as the
-        email, but IAM signBlob requires the actual email address.
-        """
-        try:
-            request = UrlRequest(
-                "http://metadata.google.internal/computeMetadata/v1/"
-                "instance/service-accounts/default/email",
-                headers={"Metadata-Flavor": "Google"},
-            )
-            with urlopen(request, timeout=3) as response:
-                if response.getcode() != 200:
-                    return ""
-                email = response.read().decode("utf-8").strip()
-                if "@" in email:
-                    return email
-        except (OSError, UnicodeDecodeError):
-            pass
-        return ""
 
     @property
     def is_configured(self) -> bool:
@@ -150,8 +126,7 @@ class StorageService:
             "upload_bytes": self._month_upload_bytes,
             "deleted_objects": self._month_delete_count,
             "signed_url_expiry_hours": self._expiry_hours,
-            "cleanup_delay_seconds": self._cleanup_delay_seconds,
-            "cleanup_tasks": len(self._cleanup_tasks),
+            "media_expiry": "bucket lifecycle",
             "scope": "per-instance",
         }
 
@@ -326,27 +301,6 @@ class StorageService:
             logger.error(f"Failed to upload bytes: {e}")
             return None
 
-    def schedule_cleanup(
-        self,
-        media: UploadedMedia | None,
-        *,
-        delay_seconds: int | None = None,
-    ) -> None:
-        """Schedule deletion of a temporary object after LINE has time to fetch it."""
-        if media is None or not media.blob_name or not self.is_configured:
-            return
-
-        delay = self._cleanup_delay_seconds if delay_seconds is None else max(0, delay_seconds)
-        task = asyncio.create_task(self._delete_blob_after_delay(media.blob_name, delay))
-        self._cleanup_tasks.add(task)
-        task.add_done_callback(self._cleanup_tasks.discard)
-        task.add_done_callback(self._log_cleanup_task_exception)
-
-    async def _delete_blob_after_delay(self, blob_name: str, delay_seconds: int) -> None:
-        if delay_seconds > 0:
-            await asyncio.sleep(delay_seconds)
-        await self.delete_blob(blob_name)
-
     async def delete_blob(self, blob_name: str) -> bool:
         """Delete a temporary object from GCS."""
         if not self.is_configured:
@@ -362,18 +316,6 @@ class StorageService:
         except Exception as e:
             logger.warning(f"Failed to delete temporary object {blob_name}: {e}")
             return False
-
-    def _log_cleanup_task_exception(self, task: asyncio.Task) -> None:
-        try:
-            exc = task.exception()
-        except asyncio.CancelledError:
-            return
-
-        if exc is not None:
-            logger.error(
-                f"GCS cleanup task failed: {exc}",
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
 
 
 # Global singleton

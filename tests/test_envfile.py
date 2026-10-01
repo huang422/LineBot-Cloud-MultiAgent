@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -85,20 +86,19 @@ def _check(values: dict[str, str]) -> V3Report:
 def _dotenv_lock_mismatch() -> str:
     """Why the installed python-dotenv is not the reference parser ('' when it is).
 
-    The app reads its env files with the version requirements.lock pins; a
-    parity test against another version proves nothing.
+    The app reads its env files with the version uv.lock pins; a parity test
+    against another version proves nothing.
     """
-    lock = _REPO_ROOT / "requirements.lock"
+    lock = _REPO_ROOT / "uv.lock"
     if not lock.is_file():
-        return "requirements.lock is not part of this checkout"
-    pinned = re.search(
-        r"^python-dotenv==([^\s\\]+)", lock.read_text(encoding="utf-8"), re.MULTILINE
-    )
+        return "uv.lock is not part of this checkout"
+    packages = tomllib.loads(lock.read_text(encoding="utf-8")).get("package", [])
+    pinned = next((p["version"] for p in packages if p.get("name") == "python-dotenv"), None)
     if pinned is None:
-        return "requirements.lock does not pin python-dotenv"
+        return "uv.lock does not pin python-dotenv"
     installed = importlib.metadata.version("python-dotenv")
-    if installed != pinned.group(1):
-        return f"python-dotenv {installed} is installed, requirements.lock pins {pinned.group(1)}"
+    if installed != pinned:
+        return f"python-dotenv {installed} is installed, uv.lock pins {pinned}"
     return ""
 
 
@@ -321,6 +321,24 @@ SCHEDULED_YEARLY_MESSAGES='[
         # migrate-v3 keeps the mark, whichever line it drops.
         self.assertEqual(remove_env_keys("\ufeffA=1\nB=2\n", ["a"]), "\ufeffB=2\n")
         self.assertEqual(remove_env_keys("\ufeffA=1\nB=2\n", ["B"]), "\ufeffA=1\n")
+
+    def test_get_and_dump_read_keys_case_insensitively_like_the_app(self) -> None:
+        # The app's settings (pydantic-settings, case_sensitive=False) read
+        # internal_cron_secret as INTERNAL_CRON_SECRET, and of two spellings
+        # the later one. Case-sensitive, the deploy skipped the cron job.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text("internal_cron_secret=lower\nBot_Name=first\nBOT_NAME=second\nbot_name=third\n")
+            results = {
+                "get": _run_cli(["get", "--file", str(env_path), "INTERNAL_CRON_SECRET"]),
+                "get any case": _run_cli(["get", "--file", str(env_path), "Bot_Name"]),
+                "dump": _run_cli(["dump", "--file", str(env_path)]),
+            }
+
+        self.assertEqual(results["get"], (0, "lower\n", ""))
+        self.assertEqual(results["get any case"], (0, "third\n", ""))
+        dump_fields = ["INTERNAL_CRON_SECRET", "lower", "0", "BOT_NAME", "third", "0"]
+        self.assertEqual(results["dump"], (0, "".join(f"{field}\x00" for field in dump_fields), ""))
 
     def test_remove_env_keys_splits_lines_like_python_dotenv(self) -> None:
         text = "A=x\u2028B=y\r\nC='1\r\n2'\rD=4\n"

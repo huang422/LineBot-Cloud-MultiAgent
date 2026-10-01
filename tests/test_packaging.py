@@ -1,17 +1,21 @@
 """The image installs a complete, hash-pinned lock on a digest-pinned base.
 
-The Dockerfile runs ``pip install --require-hashes --no-deps -r
-requirements.lock``, so a runtime import whose distribution is missing from
-the lock (or pinned without a hash) only fails when the image is built or,
-worse, when the code path first runs on Cloud Run. These tests catch that
+pyproject.toml lists the dependencies, uv.lock pins them with hashes, and the
+Dockerfile installs ``uv export --frozen --no-dev`` of it with ``pip install
+--require-hashes --no-deps``. A runtime import whose distribution is missing
+from the lock (or pinned without a hash) only fails when the image is built
+or, worse, when the code path first runs on Cloud Run. These tests catch that
 from the source tree.
 """
 
 from __future__ import annotations
 
 import ast
+import functools
 import re
+import shutil
 import sys
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -70,26 +74,61 @@ _REQUIRED_RUNTIME_IMPORTS = (
 # uploads it), standard library only.
 _FIRST_PARTY = frozenset({"src", "main", "colab"})
 _DIGEST_PINNED_BASE = re.compile(r"python:3\.12-slim@sha256:[0-9a-f]{64}")
-_HASH = re.compile(r"--hash=sha256:([0-9a-f]{64})")
+_DIGEST_PINNED_UV = re.compile(r"ghcr\.io/astral-sh/uv:[0-9.]+@sha256:[0-9a-f]{64}")
+_PROJECT = "linebot-cloud-agent"
 
 
 def _normalize(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _parse_lock(path: Path) -> dict[str, tuple[str, list[str]]]:
-    """Return ``{normalized name: (pinned version, sha256 hashes)}``."""
-    text = path.read_text(encoding="utf-8").replace("\\\n", " ")
+@functools.cache
+def _pyproject() -> dict:
+    return tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+
+@functools.cache
+def _uv_lock() -> dict:
+    return tomllib.loads((_REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+
+
+def _locked() -> dict[str, tuple[str, list[str]]]:
+    """``{name: (pinned version, sha256 hashes)}`` for every package in uv.lock."""
     pins: dict[str, tuple[str, list[str]]] = {}
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
+    for package in _uv_lock()["package"]:
+        if package["name"] == _PROJECT:
             continue
-        match = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?==([^\s;]+)", line)
-        if match is None:
-            raise AssertionError(f"{path.name}: not an exact pin: {line[:80]}")
-        pins[_normalize(match.group(1))] = (match.group(2), _HASH.findall(line))
+        files = [*package.get("wheels", []), *([package["sdist"]] if "sdist" in package else [])]
+        pins[package["name"]] = (package["version"], [f["hash"] for f in files if "hash" in f])
     return pins
+
+
+def _closure(*, dev: bool) -> set[str]:
+    """Names uv export installs: the project's dependencies (and the dev group)."""
+    packages = {package["name"]: package for package in _uv_lock()["package"]}
+    root = packages[_PROJECT]
+    todo = [dep["name"] for dep in root.get("dependencies", [])]
+    if dev:
+        todo += [dep["name"] for deps in root.get("dev-dependencies", {}).values() for dep in deps]
+    seen: set[str] = set()
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        package = packages[name]
+        todo += [dep["name"] for dep in package.get("dependencies", [])]
+        for extra in package.get("optional-dependencies", {}).values():
+            todo += [dep["name"] for dep in extra]
+    return seen
+
+
+def _floor(name: str) -> tuple[int, ...]:
+    for spec in _pyproject()["project"]["dependencies"]:
+        match = re.fullmatch(rf"{re.escape(name)}>=([0-9.]+)", spec)
+        if match:
+            return tuple(int(part) for part in match.group(1).split("."))
+    raise AssertionError(f"pyproject.toml has no {name} floor")
 
 
 def _third_party_imports() -> dict[str, set[str]]:
@@ -120,20 +159,16 @@ def _dist_for(module: str) -> str | None:
     return None
 
 
-def _non_comment_lines(path: Path) -> list[str]:
-    lines = (line.strip() for line in path.read_text(encoding="utf-8").splitlines())
-    return [line for line in lines if line and not line.startswith("#")]
-
-
 class RequirementsLockTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.lock = _parse_lock(_REPO_ROOT / "requirements.lock")
+        self.lock = _locked()
+        self.runtime = _closure(dev=False)
 
     def test_runtime_imports_are_pinned_with_hashes(self) -> None:
         for module in _REQUIRED_RUNTIME_IMPORTS:
             with self.subTest(module=module):
                 dist = _normalize(_IMPORT_TO_DIST[module])
-                self.assertIn(dist, self.lock, f"{dist} (import {module}) is not locked")
+                self.assertIn(dist, self.runtime, f"{dist} (import {module}) is not a runtime dependency")
                 _, hashes = self.lock[dist]
                 self.assertTrue(hashes, f"{dist} is pinned without a hash")
 
@@ -144,49 +179,64 @@ class RequirementsLockTests(unittest.TestCase):
                 self.assertIsNotNone(
                     dist,
                     f"import {module} ({', '.join(sorted(files))}) has no entry in "
-                    "_IMPORT_TO_DIST; add its package to requirements.in and re-lock",
+                    "_IMPORT_TO_DIST; add its package to pyproject.toml and re-lock",
                 )
-                self.assertIn(_normalize(dist), self.lock, f"{dist} is not in requirements.lock")
+                self.assertIn(_normalize(dist), self.runtime, f"{dist} is not a runtime dependency in uv.lock")
 
     def test_every_lock_entry_has_a_hash(self) -> None:
         # --require-hashes rejects the whole install if any single entry lacks one.
-        for name in ("requirements.lock", "requirements-dev.lock"):
-            for dist, (_, hashes) in _parse_lock(_REPO_ROOT / name).items():
-                with self.subTest(lock=name, dist=dist):
-                    self.assertTrue(hashes)
-
-    def test_dev_lock_pins_runtime_packages_like_the_image(self) -> None:
-        dev = _parse_lock(_REPO_ROOT / "requirements-dev.lock")
-        for dist, (version, _) in self.lock.items():
+        for dist, (_, hashes) in self.lock.items():
             with self.subTest(dist=dist):
-                self.assertIn(dist, dev)
-                self.assertEqual(dev[dist][0], version)
+                self.assertTrue(hashes)
 
-    def test_requirements_txt_files_only_include_the_locks(self) -> None:
+    def test_dev_tools_stay_out_of_the_image(self) -> None:
+        dev_only = _closure(dev=True) - self.runtime
+        self.assertLessEqual({"pytest", "pytest-asyncio", "ruff"}, dev_only)
+
+    def test_the_lock_matches_pyproject(self) -> None:
+        # Cloud Build and the Dockerfile export with --frozen: a dependency
+        # edited in pyproject.toml without `uv lock` must fail here instead.
+        from packaging.requirements import Requirement
+        from packaging.specifiers import SpecifierSet
+
+        def key(spec: str | dict) -> tuple[str, tuple[str, ...], str]:
+            if isinstance(spec, dict):
+                specifier = str(SpecifierSet(spec.get("specifier", "")))
+                return (spec["name"], tuple(sorted(spec.get("extras", []))), specifier)
+            req = Requirement(spec)
+            return (_normalize(req.name), tuple(sorted(req.extras)), str(req.specifier))
+
+        project = _pyproject()
+        self.assertEqual(project["project"]["requires-python"], _uv_lock()["requires-python"])
+        root = next(p for p in _uv_lock()["package"] if p["name"] == _PROJECT)
+        metadata = root["metadata"]
         self.assertEqual(
-            _non_comment_lines(_REPO_ROOT / "requirements.txt"), ["-r requirements.lock"]
+            sorted(map(key, project["project"]["dependencies"])),
+            sorted(map(key, metadata["requires-dist"])),
+            "pyproject.toml changed since uv.lock was made: run `uv lock`",
         )
         self.assertEqual(
-            _non_comment_lines(_REPO_ROOT / "requirements-dev.txt"), ["-r requirements-dev.lock"]
+            {group: sorted(map(key, specs)) for group, specs in project["dependency-groups"].items()},
+            {group: sorted(map(key, specs)) for group, specs in metadata.get("requires-dev", {}).items()},
+            "pyproject.toml changed since uv.lock was made: run `uv lock`",
+        )
+        self.assertEqual(
+            sorted(project["tool"]["uv"]["exclude-dependencies"]),
+            sorted(_uv_lock()["manifest"]["excludes"]),
+            "pyproject.toml changed since uv.lock was made: run `uv lock`",
         )
 
-    def test_requirements_in_allows_no_pydantic_settings_without_no_decode(self) -> None:
+    def test_pyproject_allows_no_pydantic_settings_without_no_decode(self) -> None:
         # src/config.py imports NoDecode, new in pydantic-settings 2.7.
-        text = (_REPO_ROOT / "requirements.in").read_text(encoding="utf-8")
-        floor = re.search(r"^pydantic-settings>=([0-9.]+)$", text, re.MULTILINE)
-        self.assertIsNotNone(floor, "requirements.in has no pydantic-settings floor")
-        self.assertGreaterEqual(tuple(int(part) for part in floor.group(1).split(".")), (2, 7))
+        self.assertGreaterEqual(_floor("pydantic-settings"), (2, 7))
 
-    def test_requirements_in_allows_no_pydantic_without_use_default(self) -> None:
+    def test_pyproject_allows_no_pydantic_without_use_default(self) -> None:
         # src/config.py raises pydantic_core's PydanticUseDefault from a
         # before-validator; checked on pydantic 2.10.3 (pydantic-core 2.27.1).
-        text = (_REPO_ROOT / "requirements.in").read_text(encoding="utf-8")
-        floor = re.search(r"^pydantic>=([0-9.]+)$", text, re.MULTILINE)
-        self.assertIsNotNone(floor, "requirements.in has no pydantic floor")
-        floor_version = tuple(int(part) for part in floor.group(1).split("."))
-        self.assertGreaterEqual(floor_version, (2, 10, 3))
+        floor = _floor("pydantic")
+        self.assertGreaterEqual(floor, (2, 10, 3))
         locked = tuple(int(part) for part in self.lock["pydantic"][0].split("."))
-        self.assertGreaterEqual(locked, floor_version, "requirements.lock is below the pydantic floor")
+        self.assertGreaterEqual(locked, floor, "uv.lock is below the pydantic floor")
 
 
 # Imports too heavy for a cold start: only ever inside a function body, so
@@ -261,8 +311,10 @@ def _imports_in(path: Path) -> set[str]:
 
 
 # What colab_cli's CLI and optional paths need but colab_cli.client, .runtime
-# and .contents never import: left out of both locks with --no-emit-package
-# (DEPLOY.md), pyarrow above all (~157 MB, through jupyter-mimetypes).
+# and .contents never import: left out of the resolution by pyproject.toml's
+# [tool.uv] exclude-dependencies, pyarrow above all (~157 MB, through
+# jupyter-mimetypes). Only the first five are listed there; the rest are
+# reached only through them.
 _NOT_SHIPPED = (
     "fastjsonschema",
     "google-auth-oauthlib",
@@ -302,15 +354,20 @@ _FORBIDDEN_COLAB_MODULES = ("colab_cli.common", "colab_cli.auth", "colab_cli.com
 
 
 class ColabLibraryTests(unittest.TestCase):
-    def test_the_locks_leave_out_what_the_used_modules_never_import(self) -> None:
-        for name in ("requirements.lock", "requirements-dev.lock"):
-            lock = _parse_lock(_REPO_ROOT / name)
-            for dist in _NOT_SHIPPED:
-                with self.subTest(lock=name, dist=dist):
-                    self.assertNotIn(dist, lock)
+    def test_the_lock_leaves_out_what_the_used_modules_never_import(self) -> None:
+        lock = _locked()
+        for dist in _NOT_SHIPPED:
+            with self.subTest(dist=dist):
+                self.assertNotIn(dist, lock)
+        excluded = set(_pyproject()["tool"]["uv"]["exclude-dependencies"])
+        self.assertEqual(
+            excluded,
+            {"google-auth-oauthlib", "nbformat", "prompt-toolkit", "pyarrow", "typer"},
+        )
+        self.assertLessEqual(excluded, set(_NOT_SHIPPED))
 
     def test_the_colab_libraries_are_pinned_where_it_matters(self) -> None:
-        lock = _parse_lock(_REPO_ROOT / "requirements.lock")
+        lock = _locked()
         # 0.7.4's metadata pins jupyter-kernel-client==0.9.0 (the PyPI package,
         # not the googlecolab fork); its runtime.py handles both.
         self.assertEqual(lock["google-colab-cli"][0], "0.7.4")
@@ -338,7 +395,7 @@ class ColabLibraryTests(unittest.TestCase):
         import subprocess
 
         if importlib.util.find_spec("colab_cli") is None:
-            self.skipTest("google-colab-cli is not installed (see requirements.lock)")
+            self.skipTest("google-colab-cli is not installed (see DEPLOY.md, 本機測試)")
         code = (
             "import importlib.abc, sys\n"
             "class Block(importlib.abc.MetaPathFinder):\n"
@@ -367,24 +424,72 @@ class ImagePinningTests(unittest.TestCase):
             for line in self.dockerfile.splitlines()
             if line.upper().startswith("FROM ")
         ]
-        self.assertTrue(from_lines)
+        self.assertEqual(len(from_lines), 2, from_lines)
         for image in from_lines:
             self.assertRegex(image.strip(), _DIGEST_PINNED_BASE)
+        # Both stages on the same base: the export and the install agree on
+        # the interpreter.
+        self.assertEqual(len(set(_DIGEST_PINNED_BASE.findall(self.dockerfile))), 1)
 
     def test_dependencies_install_with_require_hashes(self) -> None:
         installs = [
             line for line in self.dockerfile.splitlines() if re.search(r"\bpip install\b", line)
         ]
         self.assertEqual(len(installs), 1, installs)
-        for flag in ("--require-hashes", "--no-deps", "-r requirements.lock"):
+        for flag in ("--require-hashes", "--no-deps", "-r /tmp/requirements.txt"):
             self.assertIn(flag, installs[0])
+        # The exported file does not stay in the image.
+        self.assertIn("&& rm /tmp/requirements.txt", self.dockerfile)
+        exports = [line for line in self.dockerfile.splitlines() if "uv export" in line]
+        self.assertEqual(len(exports), 1, exports)
+        for flag in ("--frozen", "--no-dev", "--no-emit-project", "-o /requirements.txt"):
+            self.assertIn(flag, exports[0])
+
+    def test_uv_is_pinned_by_digest_and_only_in_the_build_stage(self) -> None:
+        stages = re.split(r"(?m)^FROM ", self.dockerfile)[1:]
+        self.assertEqual(len(stages), 2)
+        self.assertRegex(stages[0], _DIGEST_PINNED_UV)
+        self.assertNotIn("astral-sh/uv", stages[1])
+        # Nothing in the image stage runs or copies uv (comments may name uv.lock).
+        instructions = [line for line in stages[1].splitlines() if not line.lstrip().startswith("#")]
+        self.assertEqual([line for line in instructions if re.search(r"\buv\b(?!\.lock)", line)], [])
+        # The pinned uv is one pyproject.toml's required-version accepts
+        # (exclude-dependencies needs it).
+        from packaging.specifiers import SpecifierSet
+
+        version = re.search(r"astral-sh/uv:([0-9.]+)@", stages[0]).group(1)
+        self.assertIn(version, SpecifierSet(_pyproject()["tool"]["uv"]["required-version"]))
 
     def test_cloud_build_tests_on_the_image_base(self) -> None:
         base = _DIGEST_PINNED_BASE.search(self.dockerfile)
+        uv = _DIGEST_PINNED_UV.search(self.dockerfile)
         self.assertIsNotNone(base)
+        self.assertIsNotNone(uv)
         cloudbuild = (_REPO_ROOT / "cloudbuild.yaml").read_text(encoding="utf-8")
         self.assertIn(f"name: '{base.group(0)}'", cloudbuild)
-        self.assertIn("--require-hashes --no-deps -r requirements-dev.lock", cloudbuild)
+        self.assertIn(f"name: '{uv.group(0)}'", cloudbuild)
+        # One uv and one base everywhere: bumping one without the other fails.
+        self.assertEqual(set(_DIGEST_PINNED_UV.findall(cloudbuild)), {uv.group(0)})
+        self.assertEqual(set(_DIGEST_PINNED_BASE.findall(cloudbuild)), {base.group(0)})
+        # The export step keeps the dev group (pytest, ruff); the image's has --no-dev.
+        export = re.search(r"args: \[export, [^\]]*\]", cloudbuild)
+        self.assertIsNotNone(export)
+        self.assertIn("--frozen", export.group(0))
+        self.assertNotIn("--no-dev", export.group(0))
+        self.assertIn("--require-hashes --no-deps -r /deps/dev.txt", cloudbuild)
+
+    def test_the_lock_reaches_the_build(self) -> None:
+        # The image's first stage and Cloud Build's export step read both.
+        from tests.test_ignore_files import _docker_excludes, _git_ignored
+
+        kept = ("pyproject.toml", "uv.lock")
+        self.assertEqual([path for path in kept if _docker_excludes(path)], [])
+        gcloudignore = _REPO_ROOT / ".gcloudignore"
+        if not gcloudignore.is_file():  # it ignores itself, so Cloud Build has no copy
+            self.skipTest(".gcloudignore is not part of this checkout")
+        if shutil.which("git") is None:
+            self.skipTest("needs git")
+        self.assertEqual(_git_ignored(gcloudignore, kept), [])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,0 @@
-# Compatibility shim for `pip install -r requirements-dev.txt`. Versions and
-# hashes live only in requirements-dev.lock (generated from requirements-dev.in);
-# do not add packages here. See DEPLOY.md, "依賴鎖定與本機驗證".
--r requirements-dev.lock

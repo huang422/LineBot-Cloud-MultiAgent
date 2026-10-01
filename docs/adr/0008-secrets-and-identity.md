@@ -106,9 +106,11 @@ who can read them.
   `source/**` (clearing it does not affect objects already soft-deleted, so
   the other order would keep the secrets restorable for 7 days), then adds a
   1-day lifecycle rule. It needs `--yes-purge`.
-- Until `linebot-builder`, the staging bucket, `linebot-runtime` and the
-  secret exist, the deploy falls back to the old path and warns: build as
-  the default account, deploy with a temporary env-vars file. Only a
+- Until `linebot-runtime` and the secret exist, the deploy falls back to
+  the old path and warns: deploy with a temporary env-vars file. Without
+  `linebot-builder` and the staging bucket it builds nothing (since
+  2026-10-01; it used to fall back to the default account and bucket):
+  the default bucket is US multi-region, outside the free tier. Only a
   NOT_FOUND answer counts as "does not exist": any other lookup error
   (permission denied, API disabled, expired login, network) stops the deploy
   and the provisioning steps, so a failed read never downgrades a deploy or

@@ -50,7 +50,7 @@ from src.services.colab.control_plane import (
 
 HAS_COLAB_CLI = importlib.util.find_spec("colab_cli") is not None
 needs_colab_cli = unittest.skipUnless(
-    HAS_COLAB_CLI, "google-colab-cli is not installed (see requirements.lock)"
+    HAS_COLAB_CLI, "google-colab-cli is not installed (see DEPLOY.md, 本機測試)"
 )
 HAS_REQUESTS = importlib.util.find_spec("requests") is not None
 HAS_GOOGLE_AUTH = importlib.util.find_spec("google.auth") is not None
@@ -951,6 +951,37 @@ class LogScrubTests(_PlaneMixin, unittest.IsolatedAsyncioTestCase):
         for forbidden in ("Bearer ", "colab-runtime-proxy-token", "token=", *SECRETS):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, logged)
+
+    def test_a_kernel_client_that_never_connected_leaves_no_cleanup_traceback(self) -> None:
+        # jupyter-kernel-client 0.9: when the constructor raises (here the
+        # saved kernel cannot be looked up), __del__ logs "Failed to stop the
+        # kernel client" with an AttributeError on _manager at ERROR, once
+        # per failed connect. The failed call reports itself.
+        import gc
+        import socket
+
+        import jupyter_kernel_client
+
+        ColabControlPlane("/nonexistent/adc.json")
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
+        try:
+            jupyter_kernel_client.KernelClient(server_url=closed, token="t", kernel_id="k")
+        except Exception:
+            pass
+        else:
+            self.fail(f"a kernel client connected to {closed}")
+        gc.collect()
+        # The same message with any other error still gets through.
+        logging.getLogger("jupyter_kernel_client").error(
+            "Failed to stop the kernel client", exc_info=RuntimeError("socket gone")
+        )
+
+        logged = "\n".join(self.capture.lines)
+        self.assertEqual(logged.count("Failed to stop the kernel client"), 1, logged)
+        self.assertIn("RuntimeError: socket gone", logged)
+        self.assertNotIn("_manager", logged)
 
 
 class HelperTests(unittest.TestCase):

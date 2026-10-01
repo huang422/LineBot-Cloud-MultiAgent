@@ -25,7 +25,7 @@ from src.services.colab.state import (
     clip,
 )
 
-try:  # google-cloud-firestore is in requirements.lock; skip cleanly without it.
+try:  # google-cloud-firestore is in uv.lock; skip cleanly without it.
     from google.api_core import exceptions as gexc
     from google.cloud.firestore_v1.client import Client as RealClient
     from google.cloud.firestore_v1.document import DocumentReference as RealDocument

@@ -220,7 +220,8 @@ exists() {
 }
 
 # $ENV_FILE as `envfile.py dump` reads it, loaded once by load_env_file (a
-# python3 start per key read adds up). Never exported. The file must pass
+# python3 start per key read adds up), keys in upper case as the app reads
+# them (case-insensitively). Never exported. The file must pass
 # the secrets step's check (readable UTF-8, every line KEY=VALUE, nothing
 # python-dotenv would read differently) before anything reads it: a key it
 # silently dropped would take its default, GCP_PROJECT_ID included. Only an
@@ -458,11 +459,11 @@ step_staging_bucket() {
     return
   fi
   # The name is predictable; if someone else's project holds it, builds must
-  # never stage their source there (the deploy then keeps the default bucket).
+  # never stage their source there (the deploy then builds nothing).
   probe storage buckets describe "$STAGING_BUCKET" --project "$PROJECT_ID" --format='value(name)' || rc=$?
   if [[ "$rc" -ne 1 ]]; then
     [[ "$rc" -eq 2 ]] && cat "$LOOKUP_ERR" >&2
-    fail "$STAGING_BUCKET exists outside project $PROJECT_ID (bucket names are global) or cannot be read, so it is not used. If it is yours, move it into $PROJECT_ID or delete it; otherwise report it and keep deploying without it (the deploy then stages in gs://${PROJECT_ID}_cloudbuild)"
+    fail "$STAGING_BUCKET exists outside project $PROJECT_ID (bucket names are global) or cannot be read, so it is not used. If it is yours, move it into $PROJECT_ID or delete it; otherwise report it: the deploy builds nothing without it, as the default gs://${PROJECT_ID}_cloudbuild is outside the free tier"
   fi
   run gcloud storage buckets create "$STAGING_BUCKET" \
     --project "$PROJECT_ID" \
@@ -739,7 +740,7 @@ step_drop_editor() {
   sa_exists "$BUILDER_SA" \
     || problems="$problems"$'\n'"       - $BUILDER_SA does not exist: run --step builder-sa --apply"
   bucket_in_project "$STAGING_BUCKET" \
-    || problems="$problems"$'\n'"       - $STAGING_BUCKET is not a bucket of $PROJECT_ID, so the deploy's Cloud Build runs as the default service account: run --step staging-bucket --apply"
+    || problems="$problems"$'\n'"       - $STAGING_BUCKET is not a bucket of $PROJECT_ID, so the deploy builds nothing: run --step staging-bucket --apply"
   if lookup run services describe "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
     --format='value(spec.template.spec.serviceAccountName)'; then
     service_sa="$LOOKUP_OUT"

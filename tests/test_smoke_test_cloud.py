@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import httpx
 
-from tests import smoke_test_cloud
+from scripts import smoke_test_cloud
 
 _SECRET = "line-channel-secret-for-tests"
 _BASE_URL = "https://linebot.example.run.app"

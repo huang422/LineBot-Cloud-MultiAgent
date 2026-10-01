@@ -385,6 +385,11 @@ def handle(argv: list[str], state: dict) -> tuple[int, str] | tuple[int, str, st
             pair.split("=", 1) for pair in values.get("--substitutions", "").split(",") if "=" in pair
         )
         state.setdefault("images", []).insert(0, _digest(substitutions.get("_IMAGE_TAG", "")))
+        # [path, text]: someone edits a file (the env file) while the build runs.
+        if state.get("edit_during_build"):
+            path, text = state["edit_during_build"]
+            with open(path, "a", encoding="utf-8") as handle_:
+                handle_.write(text)
         return 0, ""
 
     if cmd == ("run", "services", "list"):
@@ -423,20 +428,34 @@ def handle(argv: list[str], state: dict) -> tuple[int, str] | tuple[int, str, st
                 state["env_vars_file"] = handle_.read()
         if "--service-account" in values:
             state["service_account_on_service"] = values["--service-account"]
-        volumes = state.get("service_volumes", [])
-        if "--clear-secrets" in bare:
+        # The template's volumes, and the names of those its container mounts
+        # (all of them unless state["service_mounts"] says otherwise).
+        volumes = list(state.get("service_volumes", []))
+        mounts = list(state.get("service_mounts", [volume["name"] for volume in volumes]))
+        # gcloud applies these before the secret flags.
+        if "--clear-volume-mounts" in bare:
+            mounts = []
+        if "--clear-volumes" in bare:
             volumes = []
+        if "--clear-secrets" in bare or "--set-secrets" in values:
+            # Like gcloud 561: the secret mounts go, and so does every secret
+            # volume nothing mounted, but the ones the container mounted until
+            # now stay in the template, unmounted (a live template, 2026-10-01:
+            # four secret volumes, two of them mounted).
+            secret_volumes = {volume["name"] for volume in volumes if volume.get("secret")}
+            volumes = [v for v in volumes if not v.get("secret") or v["name"] in mounts]
+            mounts = [name for name in mounts if name not in secret_volumes]
         if "--set-secrets" in values:
             # PATH=SECRET:VERSION[,PATH=SECRET:VERSION...]: one volume each.
-            volumes = []
             for number, mapping in enumerate(values["--set-secrets"].split(","), 1):
                 path, _, ref = mapping.partition("=")
                 secret, _, pinned = ref.partition(":")
                 item = {"key": pinned, "path": path.rsplit("/", 1)[-1]}
-                volumes.append(
-                    {"name": f"secret-{number}", "secret": {"secretName": secret, "items": [item]}}
-                )
+                name = f"{secret}-d{len(state['deploys'])}-{number}"
+                volumes.append({"name": name, "secret": {"secretName": secret, "items": [item]}})
+                mounts.append(name)
         state["service_volumes"] = volumes
+        state["service_mounts"] = mounts
         revisions = state.setdefault("revisions", [])
         image = values["--image"]
         revisions.append(
@@ -445,6 +464,7 @@ def handle(argv: list[str], state: dict) -> tuple[int, str] | tuple[int, str, st
                 "name": f"{words[2]}-deploy{len(state['deploys'])}",
                 "image": f"{image.rsplit(':', 1)[0]}@{_digest(image)}",
                 "volumes": volumes,
+                "mounts": mounts,
             }
         )
         return 0, ""
@@ -452,7 +472,8 @@ def handle(argv: list[str], state: dict) -> tuple[int, str] | tuple[int, str, st
         # Every service's revisions in the region, or one service's with
         # --service; a revision without "service" belongs to every service,
         # one without "region" to every region. "ready": False marks one
-        # that never became Ready (a failed deploy).
+        # that never became Ready (a failed deploy); "mounts" names the
+        # volumes its container mounts (without it, every volume).
         service = values.get("--service")
         region = values.get("--region")
         newest_first = [
@@ -469,7 +490,19 @@ def handle(argv: list[str], state: dict) -> tuple[int, str] | tuple[int, str, st
             [
                 {
                     "metadata": {"name": revision["name"]},
-                    "spec": {"volumes": revision["volumes"]},
+                    "spec": {
+                        "volumes": revision["volumes"],
+                        "containers": [
+                            {
+                                "volumeMounts": [
+                                    {"name": name, "mountPath": f"/mnt/{name}"}
+                                    for name in revision.get(
+                                        "mounts", [volume["name"] for volume in revision["volumes"]]
+                                    )
+                                ]
+                            }
+                        ],
+                    },
                     "status": {
                         "conditions": [
                             {"type": "Ready", "status": "True" if revision.get("ready", True) else "False"}

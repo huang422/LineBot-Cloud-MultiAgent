@@ -1,8 +1,9 @@
 """Manual live contract gate for the v3 model line-up.
 
 A human runs this before a deploy, with the real keys and settings from .env.
-It needs Python 3.12+ and the project deps, so run it from the .venv312 built
-from requirements-dev.lock (see DEPLOY.md):
+It needs Python 3.12+ and the project deps, so run it from the .venv312 that
+`UV_PROJECT_ENVIRONMENT=.venv312 uv sync --locked -p 3.12` builds from uv.lock
+(see DEPLOY.md):
 
     .venv312/bin/python scripts/live_gate.py                    # every check
     .venv312/bin/python scripts/live_gate.py --path nvidia      # NVIDIA NIM only

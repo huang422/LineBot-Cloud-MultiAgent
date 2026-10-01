@@ -35,9 +35,11 @@ Every agent call goes through a fallback chain of model tiers. Each tier has its
 
 ### Colab Ollama tier
 
-With `COLAB_ENABLED`, the bot runs its own models on the owner's Colab A100: `qwen3.8:27b-mtp-q4_K_M` answers chat, vision and thinking requests (thinking on: `COLAB_CHAT_THINK=low` for chat and vision, `COLAB_DEEP_THINK=medium` for the thinking role), and `nimble:9b` (Bespoke Nimble 9B) routes on Ollama's `/v1/systemone`. Every user is served from Colab first (`MODEL_PATH_PREFERENCE=colab`), but **no message ever waits for it**: a session starts on demand in 4–8 minutes, and until it is READY every message is answered at once by NVIDIA → OpenRouter. Once READY, Colab answers first within the same window as every request, event time + `REPLY_WINDOW_SECONDS` (90 s, 20 s of it kept for an API backup); the reply is still tried first, and an answer whose reply token LINE refuses goes out by push; a quoted image that reaches the bot as a URL goes straight to the API vision tiers (Colab takes inline images only). When the bot gives up on a Colab call (its time ran out), it closes the connection and the VM's auth proxy aborts the Ollama request, so an abandoned answer does not keep the GPU busy; from the next Colab boot (the VM files are uploaded at launch) `auth_proxy.log` records it as `cancelled after N s`, which also shows whether Cloudflare passes the hang-up through. A Colab model already busy with a request is skipped (Ollama would only queue it), three failed chat calls in a row skip Colab for two minutes (the router's failures cool only the router down), and nimble routes only when confident (`COLAB_ROUTER_CONFIDENCE`, a provisional 0.75 until the routing eval re-tunes it); otherwise the API router decides. The VM registers its Cloudflare tunnel through a signed `POST /internal/colab/register`, and the bot probes it (Ollama 0.35.0, the pinned qwen3.8 digest wholly in VRAM, think levels) before using it; a nimble digest other than its pin, or a nimble not loaded or not wholly in VRAM (at the probe or a later health check), only turns Colab routing off for that session (`/health/detail` `colab.unpinned` / `colab.off_gpu`); qwen3.8 chat goes on. Owners (`LINE_ADMIN_USER_IDS`) can send `!colab on`, `!colab off` or `!colab status`; `!whoami` in a 1:1 chat shows your LINE userId. The Colab FAQ forbids serving a web service and third-party access from a runtime; the owner accepted that risk. See [ADR-0010](docs/adr/0010-colab-ollama-tier.md).
+With `COLAB_ENABLED`, the bot also runs its own models on the owner's Colab A100 under Ollama 0.35.0: `qwen3.8:27b-mtp-q4_K_M` answers chat, vision and thinking requests, and `nimble:9b` (Bespoke Nimble 9B) routes on Ollama's `/v1/systemone`, only when confident. Every user is served from Colab first (`MODEL_PATH_PREFERENCE=colab`), but **no message ever waits for it**: a session starts on demand in 4–8 minutes, and until it is READY every message is answered at once by NVIDIA → OpenRouter; once READY, a Colab tier stops 20 s before the reply deadline so an API tier can still answer. The per-minute cron drives the session (start on demand within a compute-unit floor and daily cap, keep-alive, release after 15 idle minutes), the slow Colab calls run as `colab` Cloud Tasks, the VM registers its Cloudflare tunnel through a signed `POST /internal/colab/register`, and owners (`LINE_ADMIN_USER_IDS`) control it with `!colab on` / `off` / `status`. The Colab FAQ forbids serving a web service and third-party access from a runtime; the owner accepted that risk.
 
-The session's lifecycle runs in the per-minute cron: it starts a session on demand (only with enough compute units left, under a daily cap), keeps the kernel alive while it is in use, and releases it after 15 idle minutes or 11 hours; the slow Colab calls (assign, launch, keep-alive, release, reconcile) run as `colab` Cloud Tasks through the pinned `google-colab-cli` library, never inside a webhook. Refused assigns cool down (5 → 60 minutes), and a dead token or a refused account disables the tier until `!colab on`. The VM's own watchdog releases a runtime the bot lost track of. The control plane signs in as the Colab account with a refresh token that a person mints once with `./scripts/mint_colab_adc.sh` (preferably on a dedicated Google account with no project roles); it lives in the Secret Manager secret `linebot-colab-adc`, which the deploy mounts at `/secrets/colab/adc.json`, pinned, only while `COLAB_ENABLED=true`, and is never exported as `GOOGLE_APPLICATION_CREDENTIALS`. First-time setup, the CPU dry run (`COLAB_DRY_RUN=true`) and the first A100 run are in [DEPLOY.md](DEPLOY.md) (Colab 層); `.venv312/bin/python scripts/live_gate.py --path colab` checks a READY session end to end; the VM side is described in [colab/README.md](colab/README.md).
+- Why, and the guards: [ADR-0010](docs/adr/0010-colab-ollama-tier.md)
+- First-time setup, the CPU dry run, the first A100 run and token re-minting: [DEPLOY.md](DEPLOY.md), "Colab 層"
+- The VM side (bootstrap, auth proxy, protocol, pinned digests, VRAM, troubleshooting): [colab/README.md](colab/README.md)
 
 ### Image Generation with Description
 
@@ -76,7 +78,7 @@ Tool rounds are capped by `tool_loop_max_iterations` (default 4); after the last
 
 ### Config-First Behavior
 
-System prompts live in `prompts/*.md`, and most runtime tuning lives in `.env`. Models, temperatures, token limits, rate limits, cost controls, and scheduling are configurable without touching code, while some fast-routing, safety, and output heuristics intentionally stay in Python for deterministic behavior.
+System prompts live in `prompts/*.md`, and most runtime tuning lives in `.env` (every key is explained in [.env.example](.env.example)). Models, temperatures, token limits, rate limits, cost controls, and scheduling are configurable without touching code, while some fast-routing, safety, and output heuristics intentionally stay in Python for deterministic behavior.
 
 ---
 
@@ -147,14 +149,14 @@ Which models answer what, and in what order, is one declarative table ([src/runt
 | `embed` | episodic recall | NVIDIA `nvidia/nemotron-3-embed-1b` (first `EMBEDDING_DIMENSIONS` of 2048 kept, 10 s) |
 | `image` | image generation | NVIDIA FLUX.2 klein 4B (60 s) → FLUX.1-dev (50 steps, 90 s) |
 
-- **Colab tiers** are on with `COLAB_ENABLED` (see [Colab Ollama tier](#colab-ollama-tier)); otherwise they stay disabled and `/health/detail` shows why. `MODEL_PATH_PREFERENCE=colab` (default) puts Colab tiers first in every role, `api` puts them last. Colab never holds up a reply: a session starts on demand and is released after 15 idle minutes, and until it is READY its tiers are skipped at once, so every message is answered right away by the NVIDIA → OpenRouter tiers. Once READY and first in line, Colab works to the same deadline as every plain answer, event time + `REPLY_WINDOW_SECONDS` (90 s), in 1:1 chats and groups alike (the reply is tried first; one LINE refuses goes out by push). A Colab tier with a usable API tier after it must stop 20 s before the deadline (`COLAB_API_RESERVE_SECONDS`), or halfway to it when that is later, whatever its think level, and a request that needs thinking tries it only once, so a slow session cannot use up the window before the API tiers get their turn.
+- **Colab tiers** are on with `COLAB_ENABLED` (see [Colab Ollama tier](#colab-ollama-tier)); otherwise they stay disabled and `/health/detail` shows why. `MODEL_PATH_PREFERENCE=colab` (default) puts Colab tiers first in every role, `api` puts them last. Until a session is READY its tiers are skipped at once, with no network call. Once READY, Colab works to the same deadline as every plain answer, event time + `REPLY_WINDOW_SECONDS` (90 s); a Colab tier with a usable API tier after it must stop 20 s before the deadline (`COLAB_API_RESERVE_SECONDS`), or halfway to it when that is later, whatever its think level, and a request that needs thinking tries it only once, so a slow session cannot use up the window before the API tiers get their turn.
 - **Sampling:** a tier's own `temperature` wins, then the model card's sampling from the model profile (Nemotron 3 Ultra and Super on NVIDIA: temperature 1.0, top_p 0.95; muse-glimmer: 0.6), then the agent's setting (`CHAT_TEMPERATURE`, `VISION_TEMPERATURE`, …), which therefore reaches only the models without card sampling (OpenRouter). Colab's qwen3.8 always samples as Qwen recommends (0.7 / top_p 0.8 / top_k 20 / presence penalty 1.5 without thinking, 1.0 / 0.95 / 20 with it) unless its tier sets a `temperature`. The router tiers on Super and Ultra and the utility tier on Super keep a deliberately low temperature (0.1 and 0.2): routing JSON, search queries and memory summaries should come out the same for the same input, and the card's 1.0 is untested for them.
 - **Override a role** with `MODEL_ROLES`, a JSON object that replaces only the roles it names, for example `MODEL_ROLES='{"utility": [{"provider": "nvidia", "model": "nvidia/nemotron-3-super-120b-a12b", "thinking": false, "temperature": 0.2, "timeout_s": 30}, {"provider": "openrouter", "model": "qwen/qwen3.8-27b:free", "effort": "none"}]}'` (keep the Super tier's own `temperature`: without it the card's 1.0 applies, not `MEMORY_SUMMARY_TEMPERATURE`). Tier fields: `provider`, `model`, and optionally `timeout_s`, `thinking`, `think` (Colab), `effort` (OpenRouter), `reasoning_budget`, `json_mode`, `max_tokens`, `temperature`, `dim` (embed), `steps` (image).
 - **Validation never drops a tier silently:** invalid JSON, an unknown role or provider, a paid OpenRouter id (unless `OPENROUTER_ALLOW_PAID=true`), a retired id, or a model that cannot do its role (a text-only vision tier, an unsupported `json_mode`, an embed width other than `EMBEDDING_DIMENSIONS`) fails startup. A tier whose provider has no key is disabled with its reason; an id without a profile gets the provider's generic protocol and a config warning (an unprofiled Colab id fails startup).
 - `FORCE_TIER=nvidia` (or `openrouter`, `colab`, `provider:model`) is **for testing only**: it disables every other tier so one path can be exercised end to end, and fails startup if it would leave the router, chat, vision or utility role without a tier.
 - Model health (`src/services/model_health.py`) skips dead, cooling-down and over-budget models before sending a request, so a `429` can move to the next provider without waiting for a failed full response cycle. A daily check (`src/services/model_lifecycle.py`) marks a retired model dead before live traffic hits its 410.
 
-The per-model keys of earlier releases (`NVIDIA_MODEL`, `ROUTER_MODEL`, `*_FALLBACK_MODEL`, `IMAGE_GEN_*_MODEL`, `NVIDIA_EMBEDDING_MODEL`, the reasoning switches and so on) are no longer read; startup names any that are still set, and `python3 scripts/envfile.py migrate-v3 --file .env` deletes them. See [ADR-0007](docs/adr/0007-model-role-table-and-lifecycle.md).
+Why one table, and how retired models are caught before users find them: [ADR-0007](docs/adr/0007-model-role-table-and-lifecycle.md). The per-model keys of earlier releases are no longer read (see [Configuration](#configuration)).
 
 ---
 
@@ -543,7 +545,7 @@ Cloud Scheduler ──(1 / min · X-Cron-Token)──→ POST /internal/cron
 
 One command (`./scripts/deploy_cloud_run.sh`) refuses retired models, a media bucket outside the Always Free locations and secret uploads, enables APIs, has Cloud Build test (on the same digest-pinned `python:3.12-slim` base as the image), build and push the image, deploys it from your machine, routes traffic to the new revision, runs smoke checks, and prunes old revisions/images — no local Docker build required.
 
-Settings reach Cloud Run as one Secret Manager secret, `linebot-dotenv`: `.env` without the deploy-only keys, written by `python3 scripts/envfile.py to-dotenv` (every value single-quoted, so python-dotenv reads back exactly what `.env` holds). A new version is added only when `.env` changed (the SHA-256s are compared, never printed), mounted at `/secrets/app/app.env` and pinned to its number, so each revision rolls back with its own settings; `Settings` reads `.env`, then that file, and real environment variables win over both. The only plain variable is `APP_VERSION`. After a passing smoke check, versions no kept revision needs are destroyed (disabled versions are still billed). With `COLAB_ENABLED=true` the deploy also mounts the newest enabled version of `linebot-colab-adc` (the Colab account's token, minted by `./scripts/mint_colab_adc.sh`) at `/secrets/colab/adc.json`, pinned the same way and never read by the deploy; without it, that secret is neither mounted nor touched. The service runs as `linebot-runtime` and builds run as `linebot-builder`, each with only the roles it uses. Until `./scripts/provision_gcp.sh` has created them, the deploy falls back to the default service account and a temporary env file in `$TMPDIR`, and says so. Only a NOT_FOUND answer triggers that fallback: any other lookup error stops the deploy, and a service that already reads the secret is never moved back to plain variables without `--allow-env-fallback`. See [ADR-0008](docs/adr/0008-secrets-and-identity.md).
+Settings reach Cloud Run as one Secret Manager secret, `linebot-dotenv` (`.env` without the deploy-only keys), mounted at `/secrets/app/app.env` and pinned to its version number, so each revision rolls back with its own settings; the only plain variable is `APP_VERSION`. With `COLAB_ENABLED=true` the Colab account's token (`linebot-colab-adc`) is mounted the same way at `/secrets/colab/adc.json`. The service runs as `linebot-runtime` and builds run as `linebot-builder`, each with only the roles it uses, and Cloud Build stages the source in a regional bucket inside the free tier. How the deploy uploads, mounts, prunes and falls back: [DEPLOY.md](DEPLOY.md), "標準部署"; why: [ADR-0008](docs/adr/0008-secrets-and-identity.md).
 
 ---
 
@@ -569,45 +571,14 @@ Settings reach Cloud Run as one Secret Manager secret, `linebot-dotenv`: `.env` 
 | Text conversion | OpenCC |
 | Image processing | Pillow |
 | Delivery pipeline | Cloud Build -> Artifact Registry -> Cloud Run |
-
----
-
-## Repository layout
-
-```text
-LineBot-Cloud-MultiAgent/
-├── main.py
-├── Dockerfile
-├── cloudbuild.yaml
-├── .gcloudignore
-├── pyproject.toml            # ruff + pytest settings
-├── requirements.in           # runtime deps: edit this, then re-lock
-├── requirements.lock         # generated, hash-pinned; the image installs it
-├── requirements-dev.in       # + pytest, ruff
-├── requirements-dev.lock     # generated; Cloud Build and local tests install it
-├── requirements*.txt         # shims that only include the locks
-├── .env.example
-├── prompts/
-├── scripts/
-│   ├── deploy_cloud_run.sh
-│   ├── provision_gcp.sh      # one-time GCP setup (dry run unless --apply)
-│   ├── mint_colab_adc.sh     # mint and store the Colab tier's token (dry run unless --apply)
-│   ├── envfile.py            # env parsing, check-v3 / migrate-v3, to-dotenv, upload guard
-│   ├── live_gate.py          # manual live checks of every model path (--path tiers: every tier once; --path colab: a READY session)
-│   ├── migrate_embeddings.py # re-embed Firestore episodes after a model change
-│   └── evals/                # routing_eval.py on routing_zh_tw.jsonl (labelled zh-TW messages); re-tunes COLAB_ROUTER_*
-├── infra/gcp/                # lifecycle and Artifact Registry cleanup policies
-├── colab/                    # the Colab VM package: bootstrap, auth proxy, register, pins
-├── src/
-└── tests/
-```
+| Dependencies | `pyproject.toml` + `uv.lock` (uv; every file sha256-pinned) |
 
 ---
 
 ## Quick start
 
 ```bash
-# 1. Copy and fill in your credentials
+# 1. Copy the settings template and fill in the keys listed under Configuration below
 cp .env.example .env
 
 # 2. First-time GCP login
@@ -618,257 +589,44 @@ gcloud config set project YOUR_PROJECT_ID
 ./scripts/provision_gcp.sh
 ./scripts/provision_gcp.sh --step apis --apply   # ... and so on, see --list
 
-# 4. Deploy (one command does everything)
+# 4. Deploy (one command does everything; run it again after every change)
 ./scripts/deploy_cloud_run.sh
 
 # 5. Set your LINE webhook URL to:
 #    https://YOUR_CLOUD_RUN_URL/webhook
 ```
 
-Minimum `.env` values: `LINE_CHANNEL_SECRET`, `LINE_CHANNEL_ACCESS_TOKEN`, `OPENROUTER_API_KEY`, `GCP_PROJECT_ID`, and `INTERNAL_TASKS_SECRET` (`openssl rand -hex 32`; the deploy refuses to run without it unless `TASKS_MODE=inline`)
+Going live for the first time, or coming from v2: follow the checklist "上線前檢查清單（需要你本人操作）" at the top of [DEPLOY.md](DEPLOY.md). It includes the steps only the owner can do (rotating the leaked keys, the budget alert, LINE webhook redelivery, the optional Colab runs, removing `roles/editor` last), and its section "從 v2 升級到 v3" has the details of the upgrade. DEPLOY.md also covers the deploy options, logs, rollback, Firestore and troubleshooting.
 
-If you want the bot to **deliver generated images or voice replies back to LINE**, also set `GCS_BUCKET_NAME` (a STANDARD bucket in `us-west1`, `us-central1` or `us-east1`, the Always Free locations; the deploy refuses any other). Without GCS, text chat still works, but media delivery falls back to text-only responses.
-
-Redeploy after code changes — same command: `./scripts/deploy_cloud_run.sh`
-
-Optional but recommended before a deploy: `.venv312/bin/python scripts/live_gate.py` (needs Python 3.12+ and the project deps; build `.venv312` as shown below) sends a few requests through the bot's own clients with your keys and prints PASS/FAIL per model path (it never prints keys or full replies); `--path tiers` makes one minimal call to every tier of the configured role table and prints a role / tier / model / result / latency table.
-
-For detailed deployment options, GCS/scheduler setup, log monitoring, and troubleshooting, see **[DEPLOY.md](DEPLOY.md)**.
-
-Local checks on the image's Python (3.12), from the same hash-pinned lock Cloud Build uses (re-lock steps are in DEPLOY.md, "依賴鎖定與本機驗證"):
+Local checks run on the image's Python (3.12), from the same `uv.lock` Cloud Build installs (editing and upgrading dependencies: DEPLOY.md, "依賴鎖定與本機驗證"):
 
 ```bash
-uv venv -p python3.12 .venv312
-uv pip sync --python .venv312/bin/python requirements-dev.lock
+UV_PROJECT_ENVIRONMENT=.venv312 uv sync --locked -p 3.12
 .venv312/bin/python -m ruff check . && .venv312/bin/python -m pytest -q
 ```
 
-### Upgrading from v2
-
-v2's `qwen/qwen3.5-397b-a17b` and `nvidia/nv-embedqa-e5-v5` are retired (HTTP 410), and `ORCHESTRATOR_MODEL` / `ORCHESTRATOR_FALLBACK_MODEL` are no longer read. The deploy script refuses an `.env` that still sets them. In order:
-
-1. `python3 scripts/envfile.py migrate-v3 --file .env` (backs up to `.env.bak.<timestamp>` first and prints key names only), then `python3 scripts/envfile.py check-v3 --file .env`.
-2. Optional: `.venv312/bin/python scripts/live_gate.py`.
-3. `./scripts/deploy_cloud_run.sh`.
-4. With Firestore enabled: `python3 scripts/migrate_embeddings.py` (dry run), then `--apply`. Until then recall ignores the old e5 vectors ([ADR-0011](docs/adr/0011-embedding-migration.md)).
-5. Rotate the secrets older deploys uploaded to Cloud Build and delete the old source archives (`./scripts/provision_gcp.sh --step purge-cloudbuild --apply --yes-purge`, which clears soft delete first); see "從 v2 升級到 v3" in [DEPLOY.md](DEPLOY.md).
-
-The complete go-live order, including the steps only the owner can do (rotating the leaked keys, the budget alert, LINE webhook redelivery, the optional Colab runs and removing `roles/editor` last), is the checklist "上線前檢查清單（需要你本人操作）" at the top of [DEPLOY.md](DEPLOY.md).
+Optional but recommended before a deploy: `.venv312/bin/python scripts/live_gate.py` sends a few requests through the bot's own clients with your keys and prints PASS/FAIL per model path (never keys or full replies); `--path tiers` calls every tier of the configured role table once and prints a role / tier / model / result / latency table.
 
 ---
 
-## Current runtime notes
+## Configuration
 
-- `/health` reports `ready_for_webhook` when the LINE credentials are set and at least one chat tier that does not wait on Colab is enabled, so either `NVIDIA_API_KEY` or `OPENROUTER_API_KEY` is enough; set both for the full fallback chain.
-- Incoming audio is **not** transcribed yet. The bot currently supports **voice replies only**, not speech-to-text input.
-- The main prompt memory is `1 long-term summary + up to 6 recent text messages` per chat. It defaults to in-memory per instance; set `FIRESTORE_ENABLED=true` to persist chat memory, user profile, and episodic recall across redeploys / cold starts.
-- Quoted-message cache, model health (cooldowns, dead models, provider budgets) and the Colab busy gate and breaker are still **in-memory per instance**; the busy gate is correct only with one instance (`--max-instances=1`). The Colab session state itself is in Firestore.
-- Search has no app-side quota (`WEB_SEARCH_MONTHLY_QUOTA` is no longer read). Each search costs 1 Tavily credit (1,000 free a month), and `/health/detail` shows the credits it reported, its cooldown and its last error. When Tavily cannot answer, the reply goes without search and says so.
-- Relative search phrases like `today`, `latest` and `recent` are handled through the query planner plus topic/time-range targeting rather than by prefixing the raw query with a timestamp. A past calendar period (Asia/Taipei) gets the shortest time range that holds all of it (yesterday → week, last week → month, last month → year, last year → none), and yesterday, last month and last year also add their date to the query.
-- Every handled message (answered or not; `!new`, `!colab` and blocked messages excepted) logs one INFO summary line after delivery: `[<req>] summary pref=<colab|api|api-only> path=<colab|api|none> route=<rules|colab:nimble:9b|<API router tier>|fallback> agent=… out=… think=… answer=<tier> <s>s …`, with how it went out (`delivery=reply|push`), nimble's probabilities (`router_p=[…]`) and every tier tried (`tiers=[…]`, a skip as `skip(<why>)`, e.g. `skip(by design: url image)` for Colab and a quoted image URL, an error as `error(<Kind> <status>)`, e.g. `error(ContentFilteredError 200)` for a filtered image). DEPLOY.md (〈只看每則訊息的摘要〉) explains the fields and gives the `gcloud logging read` filter.
-- Users can send `!new` in DM, group, or room chats to clear the current chat memory scope. `!colab on` / `off` / `status` are for `LINE_ADMIN_USER_IDS` and also trigger in groups without a mention; `!whoami` answers only in a 1:1 chat.
+Every setting lives in `.env`, and [.env.example](.env.example) is the reference for all of them: each key with its default and what it does (the comments are in zh-TW). The keys to know first; everything else has a working default:
 
----
-
-## Configuration reference
-
-All settings are loaded from `.env`. See [.env.example](.env.example) for a ready-to-copy template.
-
-An empty value (`KEY=`) means the default, as it does for the deploy, for `TASKS_MODE`, `TASK_DISPATCH_DEADLINE_SECONDS`, `TASK_HANDLER_BUDGET_SECONDS`, `CLOUD_TASKS_QUEUE`, `CLOUD_TASKS_COLAB_QUEUE`, `SCHEDULED_MESSAGES_ENABLED`, `SCHEDULED_WEEKLY_MESSAGES` / `SCHEDULED_YEARLY_MESSAGES` (no jobs), `SCHEDULED_MESSAGES_TIMEZONE`, `PASSIVE_GROUP_RECORDING_ENABLED`, `COLAB_ENABLED` and `COLAB_ADC_PATH` (`src/config.py` `EMPTY_MEANS_DEFAULT`). Other keys read it as an empty string; an empty `CLOUD_TASKS_LOCATION`, for one, means the Cloud Run region.
-
-### Required
-
-| Variable | Description |
+| Key | Why |
 | --- | --- |
-| `LINE_CHANNEL_SECRET` | LINE Messaging API channel secret |
-| `LINE_CHANNEL_ACCESS_TOKEN` | LINE Messaging API access token |
-| `OPENROUTER_API_KEY` | [OpenRouter](https://openrouter.ai/keys) API key (free tier available); the fallback tier of every text role. Readiness needs this or `NVIDIA_API_KEY` |
-| `GCP_PROJECT_ID` | GCP project ID for Cloud Run deployment |
-| `INTERNAL_TASKS_SECRET` | Shared secret for `/internal/tasks/{kind}` (see [Post-webhook work](#post-webhook-work-cloud-tasks)); the deploy refuses to run without it unless `TASKS_MODE=inline` |
+| `LINE_CHANNEL_SECRET`, `LINE_CHANNEL_ACCESS_TOKEN` | The LINE Messaging API channel; the deploy stops without them |
+| `OPENROUTER_API_KEY` | The free fallback tiers of every text role; the deploy stops without it |
+| `NVIDIA_API_KEY` | Recommended: the first API tier of every role, and the only path to image generation and episodic-recall embeddings. Readiness needs this key or the OpenRouter one |
+| `GCP_PROJECT_ID` | The deploy's project; stays on your machine |
+| `INTERNAL_TASKS_SECRET` | `openssl rand -hex 32`; authenticates the Cloud Tasks callbacks. The deploy stops without it unless `TASKS_MODE=inline` |
+| `INTERNAL_CRON_SECRET` | `openssl rand -hex 32`; without it there is no per-minute cron (scheduled messages, stale group-buffer flushes, the daily end-of-life check, the Colab controller) and `/health/detail` answers 403 |
+| `GCS_BUCKET_NAME` | Needed for image and voice replies (text works without it): a STANDARD bucket in `us-west1`, `us-central1` or `us-east1`, the Always Free locations; the deploy refuses any other |
+| `FIRESTORE_ENABLED` | `true` keeps chat memory, profiles and episodes across cold starts (setup in DEPLOY.md); the default is in-memory per instance |
+| `TAVILY_API_KEY` / `TAVILY_KEYLESS_ENABLED` | Web search; without a key, Tavily's keyless mode runs only when enabled (the template enables it) |
+| `COLAB_ENABLED` | The optional [Colab Ollama tier](#colab-ollama-tier); needs Firestore, `COLAB_SHARED_SECRET`, `INTERNAL_CRON_SECRET`, Cloud Tasks and the minted Colab token |
 
-### Recommended
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `NVIDIA_API_KEY` | — | [NVIDIA](https://build.nvidia.com) API key; enables the NVIDIA chat, vision, router and utility models, embeddings, and image generation (budgeted at 40 requests/min and 10,000/day across all NVIDIA models) |
-| `TAVILY_API_KEY` | — | [Tavily](https://tavily.com) key for web search and the URL-extract fallback; without one, Tavily runs keyless only with `TAVILY_KEYLESS_ENABLED=true`, else it is off |
-| `GCS_BUCKET_NAME` | — | GCS bucket for voice/image delivery; required if you want generated images or TTS audio to reach LINE |
-| `GOOGLE_APPLICATION_CREDENTIALS` | — | Optional local-only GCP SDK credential JSON path; leave empty on Cloud Run |
-
-### Model roles & thinking
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `MODEL_ROLES` | — | JSON object `{role: [tier, ...]}`; each role given replaces that role's default (see [Model role table](#model-role-table)) |
-| `MODEL_PATH_PREFERENCE` | `colab` | Only matters with `COLAB_ENABLED=true`. `colab`: every role tries its Colab tier first once the session is READY, nimble routes before the API router, and every triggered message that passes the rate limit records demand, which starts a session on its own. `api`: the NVIDIA → OpenRouter path and API router first; Colab tiers come last and are used only when a session is already READY (started with `!colab on`), nimble only when the API router fails, and messages never start a session. Either way, no reply waits for Colab |
-| `COLAB_CHAT_THINK` / `COLAB_DEEP_THINK` | `low` / `medium` | Ollama think level (`false` / `low` / `medium` / `xhigh`) of the Colab qwen3.8 tiers for chat and vision, and for the thinking role |
-| `NVIDIA_THINKING_BUDGET` | `4096` | Thinking budget of a thinking tier that sets none: extra `max_tokens` for the thoughts on every provider, also sent as `reasoning_budget` to models that take one (Nemotron Super; not Ultra, which rejects it); at most 32768 |
-| `TURN_DEADLINE_SECONDS` | `240` | Hard limit for one turn, counted from when work on the event starts (so a late or redelivered event is still answered, by push): thinking requests and image generation in any chat, and requests that start with less than `MIN_TIER_SECONDS` of the reply window left; an answer that outlives the reply token goes out by push. Keep it below `TASK_HANDLER_BUDGET_SECONDS` − 10 s: an event turn is cut off 10 s before the budget, so a turn that has not answered still gets a failure notice |
-| `MIN_TIER_SECONDS` | `5` | Least reply-window time worth starting on; below it the request works to the turn deadline. Also the least time a tier must have had before a deadline timeout counts against its model |
-| `OPENROUTER_FREE_DAILY_LIMIT` | `50` | Account-wide `:free` requests per day (1000 once the account has bought $10 of credits) |
-| `FORCE_TIER` | — | **Testing only**: keep only the tiers of this provider (`nvidia`, `openrouter`, `colab`) or `provider:model`; startup fails if that leaves the router, chat, vision or utility role empty |
-| `OPENROUTER_ALLOW_PAID` | `false` | Allow OpenRouter ids without `:free`; when `false` the role table refuses them at startup |
-
-Thinking is decided per request by the orchestrator for downstream agents. **The orchestrator's own routing classification stays non-thinking to keep JSON output stable.** By default, downstream requests use Nemotron 3 Ultra without thinking (after a READY Colab tier, which thinks at `COLAB_CHAT_THINK`). Only clearly reasoning-heavy tasks — such as step-by-step debugging, traceback / exception troubleshooting, proofs / derivations, deep planning, or full-length writing / translation — run the thinking role first (the thinking tiers together get at most half of the time left), then the chat tiers with thinking off. Every NVIDIA request says explicitly whether to think (`chat_template_kwargs.enable_thinking`, or `reasoning_effort` on muse-glimmer); OpenRouter models get an explicit `reasoning` object where they need one: the tier's `effort` when thinking, `{"effort": "none"}` otherwise.
-
-### Model routing
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `ORCHESTRATOR_TEMPERATURE` | `0.1` | Sampling temperature for LLM-based routing (NVIDIA NIM rejects `0`), for router tiers that set none on a model without card sampling (OpenRouter) |
-| `ORCHESTRATOR_MAX_TOKENS` | `384` | Max tokens for the routing JSON, for router tiers that set none |
-
-The router models are the `router` role's tiers. A tier's own `max_tokens` / `temperature` win: the default NVIDIA Super and Ultra tiers use 256 / 0.1, so these two settings apply to the OpenRouter Super `:free` fallback (and to any `MODEL_ROLES` router tier without its own, except that an NVIDIA Nemotron tier without its own `temperature` runs at its card's 1.0). The Colab router (nimble) is a scoring call and uses neither. `ORCHESTRATOR_MODEL` and `ORCHESTRATOR_FALLBACK_MODEL` are no longer read, and the deploy refuses an `.env` that still sets them.
-
-### Colab tier
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `COLAB_ENABLED` | `false` | The Colab Ollama tiers ([ADR-0010](docs/adr/0010-colab-ollama-tier.md)); needs `FIRESTORE_ENABLED=true`, `COLAB_SHARED_SECRET`, `INTERNAL_CRON_SECRET` (the controller runs from `/internal/cron`) and a readable `COLAB_ADC_PATH`, otherwise startup logs a warning and the tier stays off (`/health/detail` `colab.reason`) |
-| `COLAB_SHARED_SECRET` | — | At least 32 random characters; each session's registration key and Ollama bearer are derived from it and the session id, so nothing else secret is stored |
-| `COLAB_ADC_PATH` | `/secrets/colab/adc.json` | The Colab account's `authorized_user` refresh token (Secret Manager `linebot-colab-adc`, minted by `./scripts/mint_colab_adc.sh`; the deploy mounts it here, so leave the default); read by the control plane only, never exported as `GOOGLE_APPLICATION_CREDENTIALS` |
-| `COLAB_TUNNEL_MODE` | `quick` | `quick` (`https://<name>.trycloudflare.com`) or `named` (needs `COLAB_TUNNEL_HOST` and `COLAB_TUNNEL_TOKEN`) |
-| `COLAB_TUNNEL_HOST` / `COLAB_TUNNEL_TOKEN` | — | A named Cloudflare tunnel's hostname and token; empty with quick tunnels |
-| `COLAB_ROUTER_ENABLED` | `true` | Route with nimble on the Colab session (before the API router with `MODEL_PATH_PREFERENCE=colab`, after it with `api`) |
-| `COLAB_ROUTER_CONFIDENCE` | `0.75` | Least router confidence (normalised entropy, 0.5–0.99; 0.75 ≈ a top probability of 0.93 with four options) for both the agent and the output format; below it the API router decides. Provisional for the uncalibrated nimble: re-tune with `scripts/evals/routing_eval.py` |
-| `COLAB_ROUTER_THINK_ON` / `COLAB_ROUTER_THINK_OFF` | `0.85` / `0.15` | `needs_thinking` probability at or above THINK_ON (0.5–0.99) turns thinking on, at or below THINK_OFF (0.01–0.5) off; in between the rulebook decides. THINK_ON must be above THINK_OFF. Provisional, re-tuned by the routing eval |
-| `COLAB_IDLE_TTL_SECONDS` | `900` | Release the session this long after the latest of the last triggered message that wanted Colab, the last `!colab on` and READY |
-| `COLAB_MAX_SESSION_SECONDS` | `39600` | Release the session at this age (11 h) |
-| `COLAB_MIN_CU_BALANCE` | `10` | Start no session below this compute-unit balance (and release a booting or READY one) |
-| `COLAB_DAILY_CU_CAP` | `30` | Compute units Colab sessions may use per Asia/Taipei day (ccu-info's hourly rate × the time held). A start also needs room, above the floor and under the cap, for one session nobody uses: a boot as long as `COLAB_BOOT_TIMEOUT_SECONDS` plus one idle TTL (about 2.7 CU on the A100) |
-| `COLAB_BOOT_TIMEOUT_SECONDS` | `900` | Release a session not READY this long after its assign (a boot failure; three in a row disable the tier until `!colab on`) |
-| `COLAB_HEARTBEAT_SECONDS` | `300` | Keep-alive cell interval (60–900) while booting or in use: Colab keeps a runtime only while its kernel is active |
-| `COLAB_ACCOUNT_DEDICATED` | `false` | `true`: release runtimes on the account the bot does not know; `false`: only log them |
-| `COLAB_DRY_RUN` | `false` | A CPU runtime and `DRYRUN=1` on the VM (a stub Ollama that passes the readiness probe), to exercise the control path cheaply |
-| `LINE_ADMIN_USER_IDS` | — | Comma-separated LINE user ids allowed to run `!colab on` / `off` / `status`; send `!whoami` to the bot in a 1:1 chat to see yours |
-
-### Per-agent tuning
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `CHAT_TEMPERATURE` / `CHAT_MAX_TOKENS` | `0.7` / `2048` | Chat agent |
-| `VISION_TEMPERATURE` / `VISION_MAX_TOKENS` | `0.5` / `1024` | Vision agent |
-| `WEB_SEARCH_TEMPERATURE` / `WEB_SEARCH_MAX_TOKENS` | `0.2` / `3072` | Web search agent |
-| `IMAGE_GEN_TEMPERATURE` / `IMAGE_GEN_MAX_TOKENS` | `0.7` / `1024` | Image gen prompt refinement |
-
-These temperatures reach only the tiers whose model has no card sampling and that set no `temperature` of their own (see **Sampling** under the model role table): NVIDIA Nemotron Ultra answers at its card's 1.0 / top_p 0.95 and muse-glimmer at 0.6, and the utility tier on Super at its own 0.2. The `*_MAX_TOKENS` limits apply to every tier, Colab's qwen3.8 included (a tier's own `max_tokens` wins); while thinking, `NVIDIA_THINKING_BUDGET` is added on top.
-
-### Image generation (Stage 2)
-
-The `image` role: NVIDIA FLUX.2 klein 4B (Apache 2.0; 4 steps, fixed guidance) within 60 s, then FLUX.1-dev (non-commercial license; 50 steps, guidance 5) within 90 s, both inside `TURN_DEADLINE_SECONDS` in any chat (reply first, push if the reply token has expired). A prompt FLUX.2 klein's safety filter blocks (NVIDIA's `CONTENT_FILTERED` result) goes to FLUX.1-dev once; when every tier filtered it, the user is told in zh-TW that the image model's safety filter blocked it and to rephrase, not the generic failure text. Change the models or the steps with `MODEL_ROLES` (`{"image": [{"provider": "nvidia", "model": "...", "steps": 4}]}`); image generation needs `NVIDIA_API_KEY`.
-
-### Cost controls
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `GCS_SIGNED_URL_EXPIRY_HOURS` | `48` | Signed URL expiry; objects are deleted by the bucket's 3-day lifecycle rule (the old `GCS_MEDIA_CLEANUP_DELAY_SECONDS` is no longer read) |
-| `RATE_LIMIT_MAX_REQUESTS` | `30` | Per-user request limit |
-| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit sliding window |
-
-### Web search
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `SEARCH_FETCH_TOP_N` | `3` | How many top results are read for their page text (`0` = snippets only) |
-| `SEARCH_FETCH_MAX_BYTES` | `2000000` | Byte cap per page (after decompression) |
-| `SEARCH_FETCH_BUDGET_SECONDS` | `6` | Time all page reads of one search, or of the URLs in one message, share; whatever finished by then is used. It never runs past the search stage, which ends 20 s before the reply deadline (before the turn's for an answer that goes by push anyway and would otherwise have no time to search) |
-| `SEARCH_RERANK_ENABLED` | `false` | Reorder results by embedding similarity (the embed role; two more NVIDIA calls per search, 3 s budget) before reading them |
-| `TAVILY_KEYLESS_ENABLED` | `false` | Without `TAVILY_API_KEY`, use Tavily's keyless mode (free, rate-limited). Off unless set, so a v2 `.env` whose empty `TAVILY_API_KEY` meant "no web search" keeps Tavily off; `.env.example` sets it to `true` |
-
-### Conversation memory
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `MEMORY_RECENT_MESSAGE_LIMIT` | `6` | Recent text-message window size before compaction |
-| `MEMORY_SUMMARY_TIMEOUT_SECONDS` | `180` | Summary (compaction task) timeout; on timeout the memory keeps the latest 6-message recent window |
-| `MEMORY_SUMMARY_TEMPERATURE` | `0.2` | Summary compaction temperature, for utility tiers that set none on a model without card sampling (the default Super tier uses its own 0.2; a Super tier without one runs at the card's 1.0) |
-| `MEMORY_SUMMARY_MAX_TOKENS` | `768` | Max tokens for long-term summary updates; a summary cut off at this limit moves on to the next utility tier, and when none gives a usable one the recent window is kept and the chat waits 15 minutes before another try (1 minute once its window reached half the safety cap). Below `768` startup logs a warning |
-| `COMPACTION_DEBOUNCE_SECONDS` | `120` | A chat compacted this recently waits for a later message before compacting again (unless its window reached half the safety cap); `0` = off |
-| `EPISODE_MIN_INTERVAL_SECONDS` | `3600` | At most one recall episode per chat in this period; compactions in between join the next one, which keeps their newest 2000 characters (older ones reach only the summary); `0` = one per compaction |
-
-### Passive group recording
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `PASSIVE_GROUP_RECORDING_ENABLED` | `true` | Buffer untriggered group / room text so a later `!hej` / @mention turn sees the thread; `false` stores only the turns the bot answers |
-| `PASSIVE_GROUP_FLUSH_THRESHOLD` | `8` | A buffer this full is written by a `passive_flush` task |
-| `PASSIVE_GROUP_FLUSH_DELAY_SECONDS` | `30` | A buffer whose oldest message is older than this is written on the chat's next message or by the per-minute cron sweep (which needs `INTERNAL_CRON_SECRET`) |
-
-### Persistent memory / episodic recall (optional)
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `FIRESTORE_ENABLED` | `false` | Keep `false` for free/local in-memory mode; set `true` to persist memory in Firestore Native |
-| `FIRESTORE_PROJECT_ID` | — | Firestore project; leave empty on Cloud Run to use the runtime project |
-| `FIRESTORE_DATABASE` | `(default)` | Firestore database name |
-| `FIRESTORE_COLLECTION_PREFIX` | `linebot` | Prefix for chat memory, user profile, and episode collections |
-| `MEMORY_CACHE_TTL_SECONDS` | `60` | Local read-through cache TTL to reduce Firestore reads |
-| `LINE_PROFILE_CACHE_TTL_SECONDS` | `86400` | LINE displayName cache TTL |
-| `EMBEDDING_DIMENSIONS` | `1024` | Leading dimensions kept (and re-normalized) from the 2048-dim vectors; must match the Firestore vector index. The model is the `embed` role (`nvidia/nemotron-3-embed-1b`, needs `NVIDIA_API_KEY`); after changing it in `MODEL_ROLES`, run `scripts/migrate_embeddings.py` ([ADR-0011](docs/adr/0011-embedding-migration.md)) |
-| `NVIDIA_EMBEDDING_ENDPOINT` | NVIDIA embeddings API | Optional custom embeddings endpoint |
-
-### Bot & conversation
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `BOT_NAME` | `Assistant` | Bot display name in prompts |
-| `LINE_BOT_USER_ID` | — | Bot's LINE userId for precise @mention detection |
-| `TTS_ENABLED` | `true` | Enable voice replies (incoming audio transcription is not included) |
-| `TTS_VOICE` | `zh-TW-HsiaoChenNeural` | [edge-tts](https://github.com/rany2/edge-tts) voice |
-| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
-
-### Scheduled messages
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `SCHEDULED_MESSAGES_ENABLED` | `false` | Enable scheduled message delivery |
-| `SCHEDULED_GROUP_ID` | — | Target LINE group ID |
-| `SCHEDULED_WEEKLY_MESSAGES` | `[]` | Weekly jobs (JSON array) |
-| `SCHEDULED_YEARLY_MESSAGES` | `[]` | Yearly jobs (JSON array); a `02-29` job fires on `02-28` in other years ([ADR-0002](docs/adr/0002-leap-day-yearly-jobs.md)) |
-| `SCHEDULED_MESSAGES_TIMEZONE` | `Asia/Taipei` | Time zone the weekly / yearly jobs are matched in |
-| `INTERNAL_CRON_SECRET` | — | Shared secret for `/internal/cron` and `/health/detail` (`X-Cron-Token`); when set, the deploy keeps a per-minute Cloud Scheduler job (even with scheduled messages off: it also flushes stale passive group buffers, queues the daily model end-of-life check and runs the Colab controller's tick), when empty it deletes the job and both endpoints return 403 |
-
-### Post-webhook work (Cloud Tasks)
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `TASKS_MODE` | `auto` | `auto`: Cloud Tasks on Cloud Run when `INTERNAL_TASKS_SECRET` is set, else inline; `cloud`; `inline` (local dev) |
-| `INTERNAL_TASKS_SECRET` | — | Shared secret Cloud Tasks sends in `X-Tasks-Token` to `/internal/tasks/{kind}`; separate from `INTERNAL_CRON_SECRET`; required by the deploy unless `TASKS_MODE=inline` |
-| `CLOUD_TASKS_QUEUE` | `linebot-events` | Queue name (created by the deploy with one attempt per task); empty means the default |
-| `CLOUD_TASKS_COLAB_QUEUE` | `linebot-colab` | The Colab controller's `colab` tasks (seconds to minutes each) go here, so they never take the event queue's dispatch slots; created by the deploy (2 concurrent dispatches) only with `COLAB_ENABLED=true`; must differ from `CLOUD_TASKS_QUEUE`; empty means the default |
-| `CLOUD_TASKS_LOCATION` | `us-west1` | Queue location; empty uses the Cloud Run region |
-| `PUBLIC_BASE_URL` | — | Task callback URL (`https://` only); empty derives it from the `Host` of the first authenticated request, always as https |
-| `TASK_DISPATCH_DEADLINE_SECONDS` | `300` | How long Cloud Tasks waits for a task (15–1800); the deploy sets Cloud Run's `--timeout` to max(300, this) |
-| `TASK_HANDLER_BUDGET_SECONDS` | `280` | Per-task time budget inside the app; must be below the dispatch deadline (the deploy refuses otherwise) |
-| `REPLY_WINDOW_SECONDS` | `90` | Seconds after the LINE event by which every plain answer must be done, in 1:1 chats and groups, Colab or API (see [Reply window rules](#5-provider-fallback-chain--deadlines)); must be below `TURN_DEADLINE_SECONDS`. The reply is tried first and an answer whose token LINE refuses goes out by push; a task starting later logs that the token has likely expired. `COLAB_REPLY_WINDOW_SECONDS` is no longer read |
-
-### Deployment
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `CLOUD_RUN_SERVICE_NAME` | `linebot-cloud-agent` | Cloud Run service name |
-| `CLOUD_RUN_REGION` | `us-west1` | Cloud Run region |
-| `DEPLOY_KEEP_REVISIONS` | `2` | Ready revisions to keep after deploy (a never-Ready one takes no slot); `1` keeps only the serving revision (no rollback). Secret versions keep at least the newest 2 either way |
-| `DEPLOY_KEEP_IMAGES` | `2` | Container images to keep (an image a kept revision uses is never deleted); `1` keeps only the serving image. Above 2 adds no rollback room once `ar-cleanup-enforce` has run |
-| `DEPLOY_ENABLE_APIS` | `true` | Auto-enable required GCP APIs |
-| `CLOUD_RUN_SERVICE_ACCOUNT` | — | Runtime service account; empty = `linebot-runtime` once provisioned, else the service's current one (a custom one needs read access to `linebot-dotenv`) |
-
-These keys stay on your machine: the deploy leaves them out of the secret (`scripts/envfile.py DEPLOY_ONLY_KEYS`, together with `GCP_PROJECT_ID`, `PORT`, `HOST` and `GOOGLE_APPLICATION_CREDENTIALS`).
-
-### Removed and legacy keys
-
-`python3 scripts/envfile.py check-v3 --file .env` runs first in every deploy (it prints key names, never values). `python3 scripts/envfile.py migrate-v3 --file .env` deletes the offending keys (it backs up `.env` first); a retired id inside `MODEL_ROLES` and a broken quote are yours to fix.
-
-| The deploy refuses | Why |
-| --- | --- |
-| Any key, or a `MODEL_ROLES` tier, naming `qwen/qwen3.5-397b-a17b`, `qwen/qwen3.5-122b-a10b` or `nvidia/nv-embedqa-e5-v5` | Retired by NVIDIA (HTTP 410); `src/config.py` `RETIRED_MODEL_IDS` |
-| `ORCHESTRATOR_MODEL`, `ORCHESTRATOR_FALLBACK_MODEL` | No longer read; routing is the `router` role (`LEGACY_ENV_KEYS`) |
-| `REQUIRE_REASONING_MODELS=true` | The v2 filter that silently dropped fallback models |
-| `MODEL_ROLES` that is not a JSON object, or a quoted value python-dotenv cannot parse | The app would refuse to start, or silently skip the key |
-
-Only noted, and deleted by `migrate-v3` (`REMOVED_ENV_KEYS`; startup also names any that are set): the per-model keys `NVIDIA_MODEL`, `NVIDIA_VISION_MODEL`, `NVIDIA_UTILITY_MODEL`, `NVIDIA_EMBEDDING_MODEL`, `NVIDIA_THINKING_MODEL`, `ROUTER_MODEL`, `ROUTER_FALLBACK_MODEL`, `AGENT_FALLBACK_MODEL(_2)`, `VISION_FALLBACK_MODEL(_2)`, `UTILITY_FALLBACK_MODEL`, `IMAGE_GEN_PRIMARY_MODEL`, `IMAGE_GEN_FALLBACK_MODEL`, `IMAGE_GEN_STEPS`, `IMAGE_GEN_CFG_SCALE`; the reasoning switches `NVIDIA_THINKING_ENABLED`, `OPENROUTER_REASONING_ENABLED`, `OPENROUTER_REASONING_EFFORT`, `OPENROUTER_REASONING_EXCLUDE`, `OPENROUTER_THINKING_BUDGET`, `REQUIRE_REASONING_MODELS` (when not `true`), `REQUIRE_REASONING_TOKENS`; `THINKING_TIMEOUT_SECONDS`, `GCS_MEDIA_CLEANUP_DELAY_SECONDS`, `WEB_SEARCH_MONTHLY_QUOTA`, `FIRESTORE_LOCATION`; the self-hosted search keys `SEARXNG_BASE_URL`, `SEARXNG_TIMEOUT_SECONDS`, `SEARXNG_TIMEOUT_LIMIT_SECONDS` (SearXNG was removed on 2026-10-01 to stay in the GCP free tier); the push budget keys `LINE_PUSH_FALLBACK_ENABLED`, `LINE_REPLY_FALLBACK_PUSH_ENABLED`, `LINE_PUSH_RESERVE`, `LINE_PUSH_MONTHLY_LIMIT`; and `COLAB_REPLY_WINDOW_SECONDS` (one `REPLY_WINDOW_SECONDS` since 2026-10-01). `check-v3` also notes, without failing, a `MODEL_ROLES` that still names a Gemma model, which the defaults dropped on 2026-10-01 (it hung on NVIDIA NIM and was rate limited on OpenRouter).
-
-The deploy also stops on settings that would break at runtime: an empty `INTERNAL_TASKS_SECRET` unless `TASKS_MODE=inline`, `TASK_HANDLER_BUDGET_SECONDS` not below `TASK_DISPATCH_DEADLINE_SECONDS`, `CLOUD_TASKS_COLAB_QUEUE` equal to `CLOUD_TASKS_QUEUE`, and a `GCS_BUCKET_NAME` outside the Always Free locations.
+Models are not set key by key: they come from the [model role table](#model-role-table), overridden with `MODEL_ROLES`; the per-model keys of earlier releases (`NVIDIA_MODEL`, `ROUTER_MODEL`, `*_FALLBACK_MODEL`, …) are no longer read, and startup names any still set. Every deploy first runs `python3 scripts/envfile.py check-v3 --file .env`, which refuses retired model ids and the keys that would break (it prints key names, never values); `python3 scripts/envfile.py migrate-v3 --file .env` deletes those keys after backing `.env` up (a retired id inside `MODEL_ROLES` is yours to fix; the full list is at the end of `.env.example`). The deploy uploads `.env`, minus its deploy-only keys, as one Secret Manager secret ([ADR-0008](docs/adr/0008-secrets-and-identity.md)).
 
 ---
 

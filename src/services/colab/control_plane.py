@@ -68,7 +68,10 @@ with tokens scrubbed from the message:
 At DEBUG the libraries log the Google bearer header, proxy tokens in
 response bodies and in URLs, and the kernel client logs its websocket URL,
 token included, even at ERROR. :func:`quiet_library_loggers` holds their
-loggers at WARNING and scrubs whatever they still log.
+loggers at WARNING and scrubs whatever they still log. It also drops the
+kernel client's "Failed to stop the kernel client" traceback for a client
+that never got its manager (a connect that failed, which the call itself
+reports): jupyter-kernel-client 0.9 logs it from ``__del__`` at ERROR.
 """
 
 from __future__ import annotations
@@ -527,6 +530,9 @@ def quiet_library_loggers() -> None:
         library_logger = logging.getLogger(name)
         if not any(isinstance(f, _ScrubFilter) for f in library_logger.filters):
             library_logger.addFilter(_ScrubFilter())
+    kernel_logger = logging.getLogger("jupyter_kernel_client")
+    if not any(isinstance(f, _UnbuiltKernelClientFilter) for f in kernel_logger.filters):
+        kernel_logger.addFilter(_UnbuiltKernelClientFilter())
 
 
 def adc_file_problem(path: str | os.PathLike[str]) -> str:
@@ -556,6 +562,20 @@ class _ScrubFilter(logging.Filter):
         if record.stack_info:
             record.stack_info = redact(record.stack_info)
         return True
+
+
+class _UnbuiltKernelClientFilter(logging.Filter):
+    """Drops the kernel client's cleanup error for a client whose constructor
+    raised: its ``__del__`` calls ``stop()``, which reads the ``_manager`` the
+    constructor never set. Every other record passes."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        error = record.exc_info[1] if record.exc_info else None
+        return not (
+            record.msg == "Failed to stop the kernel client"
+            and isinstance(error, AttributeError)
+            and "'_manager'" in str(error)
+        )
 
 
 class _Deadline:

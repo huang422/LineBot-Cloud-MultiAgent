@@ -96,11 +96,27 @@ class _StubService(BaseHTTPRequestHandler):
         pass
 
 
+# provision_gcp.sh --step secrets: linebot-runtime reads linebot-dotenv.
+_DOTENV_READS = ["linebot-dotenv", "roles/secretmanager.secretAccessor", f"serviceAccount:{_RUNTIME_SA}"]
+
+
 def provisioned(**overrides) -> dict:
     state = {
         "service_accounts": [_RUNTIME_SA, _BUILDER_SA],
         "buckets": {_STAGING: {"location": "US-WEST1", "default_storage_class": "STANDARD"}},
         "secrets": {"linebot-dotenv": []},
+        "repos": {"linebot-cloud-agent": {}},
+        "bindings": [_DOTENV_READS],
+    }
+    state.update(overrides)
+    return state
+
+
+def builder_only(**overrides) -> dict:
+    """Only the build side provisioned: the deploy uses a temporary env-vars file."""
+    state = {
+        "service_accounts": [_BUILDER_SA],
+        "buckets": {_STAGING: {"location": "US-WEST1", "default_storage_class": "STANDARD"}},
         "repos": {"linebot-cloud-agent": {}},
     }
     state.update(overrides)
@@ -270,6 +286,7 @@ class SecretsModeTests(DeployHarness):
         for flag in ("--env-vars-file", "--clear-env-vars", "--update-env-vars", "--clear-secrets"):
             self.assertNotIn(flag, deploy)
         self.assertIn("linebot-dotenv version 2 at /secrets/app/app.env", result.stdout)
+        self.assertNotIn("Could not confirm", result.stderr)
         # The tokenCreator grant moved to provisioning.
         self.assertFalse(
             [c for c in self.calls("iam service-accounts add-iam-policy-binding") if "tokenCreator" in c]
@@ -322,16 +339,85 @@ class SecretsModeTests(DeployHarness):
         states = {v["id"]: v["state"] for v in self.state["secrets"]["linebot-dotenv"]}
         self.assertEqual(states, {1: "DESTROYED", 2: "ENABLED", 3: "ENABLED", 4: "ENABLED"})
 
-    def test_skipping_the_smoke_check_keeps_every_version(self) -> None:
-        state = provisioned(secrets={"linebot-dotenv": [version(n, f"A='{n}'\n") for n in (1, 2, 3)]})
+    def test_skipping_the_smoke_check_keeps_every_revision_image_and_version(self) -> None:
+        # Nothing tells this deploy is healthy, so every rollback target stays.
+        state = provisioned(
+            secrets={"linebot-dotenv": [version(n, f"A='{n}'\n") for n in (1, 2, 3)]},
+            revisions=[revision(f"linebot-cloud-agent-old{n}", f"sha256:old{n}", pinned=str(n)) for n in (1, 2)],
+            images=["sha256:old2", "sha256:old1", "sha256:unused"],
+        )
 
         result = self.deploy(state, (), "--skip-smoke")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls("secrets versions destroy"), [])
+        self.assertEqual(self.calls("run revisions delete"), [])
+        self.assertEqual(self.calls("artifacts docker images delete"), [])
         self.assertIn("smoke checks were skipped", result.stdout)
         # Versions pile up while smoke checks are skipped; say so.
         self.assertIn("linebot-dotenv has 4 active versions", result.stderr)
+
+    def test_a_volume_no_container_mounts_pins_nothing_and_leaves_the_template(self) -> None:
+        # The live template on 2026-10-01: four secret volumes, two mounted.
+        # gcloud's --set-secrets had left the previous deploy's volumes in it,
+        # unmounted, every revision carried them, and version 2 was never
+        # destroyed while each deploy added one.
+        def volume(name: str, secret: str, pinned: str) -> dict:
+            path = "app.env" if secret == "linebot-dotenv" else "adc.json"
+            return {"name": name, "secret": {"secretName": secret, "items": [{"key": pinned, "path": path}]}}
+
+        volumes = [
+            volume("linebot-dotenv-lac-cid", "linebot-dotenv", "3"),
+            volume("linebot-colab-adc-fig-gox", "linebot-colab-adc", "2"),
+            volume("linebot-dotenv-vic-peq", "linebot-dotenv", "2"),
+            volume("linebot-colab-adc-cug-fol", "linebot-colab-adc", "1"),
+        ]
+        mounted = ["linebot-dotenv-lac-cid", "linebot-colab-adc-fig-gox"]
+        live = {**revision("linebot-cloud-agent-00052", "sha256:live"), "volumes": volumes, "mounts": mounted}
+        # A listing that shows no mount at all is not trusted to mean unmounted.
+        staging = {**revision("staging-live", "sha256:staging", pinned="1", service="linebot-staging"), "mounts": []}
+        state = provisioned(
+            secrets={"linebot-dotenv": [version(n, f"A='{n}'\n") for n in (1, 2, 3)]},
+            service_volumes=volumes,
+            service_mounts=mounted,
+            revisions=[staging, live],
+            images=["sha256:live", "sha256:staging"],
+        )
+
+        result = self.deploy(state)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [deploy] = self.calls("run deploy")
+        self.assertIn("--clear-volume-mounts", deploy)
+        self.assertIn("--clear-volumes", deploy)
+        # The template holds what this deploy mounts and nothing else.
+        template = self.state["service_volumes"]
+        self.assertEqual(self.state["service_mounts"], [v["name"] for v in template])
+        self.assertEqual(
+            [(v["secret"]["secretName"], v["secret"]["items"][0]["key"]) for v in template],
+            [("linebot-dotenv", "4")],
+        )
+        states = {v["id"]: v["state"] for v in self.state["secrets"]["linebot-dotenv"]}
+        # 4 is deployed, 3 is what the rollback target mounts, 1 is staging's;
+        # only an unmounted volume names 2.
+        self.assertEqual(states, {1: "ENABLED", 2: "DESTROYED", 3: "ENABLED", 4: "ENABLED"})
+
+    def test_an_env_edit_during_the_build_is_not_deployed(self) -> None:
+        # .env is checked before the build; what was checked is what deploys.
+        lines = ["BOT_NAME=Checked"]
+        checked = envfile.to_dotenv(envfile.parse_env_text("\n".join([*_BASE_ENV, *lines]) + "\n"))
+        edit = [str(self.env_file), "BOT_NAME=Edited-during-the-build\n"]
+        for mode, state in (("secrets", provisioned()), ("env file", builder_only())):
+            with self.subTest(mode):
+                result = self.deploy({**state, "edit_during_build": edit}, lines)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if mode == "secrets":
+                    [deployed] = self.state["secrets"]["linebot-dotenv"]
+                    self.assertEqual(base64.b64decode(deployed["data"]).decode(), checked)
+                else:
+                    self.assertIn('BOT_NAME: "Checked"', self.state["env_vars_file"])
+                    self.assertNotIn("Edited", self.state["env_vars_file"])
 
     def test_a_version_a_kept_revision_pins_is_never_destroyed(self) -> None:
         # Version 6 came from a deploy that failed before making a revision,
@@ -500,6 +586,10 @@ class SecretsModeTests(DeployHarness):
         [deploy] = self.calls("run deploy")
         self.assertIn(f"--service-account {custom}", deploy)
         self.assertIn("--set-secrets=", deploy)
+        # Provisioning grants linebot-runtime only. A project-level or group
+        # grant would also do, so the deploy only warns and goes on.
+        self.assertIn(f"Could not confirm that {custom} can read secret linebot-dotenv", result.stderr)
+        self.assertIn("provision_gcp.sh --step secrets --apply", result.stderr)
 
     def test_values_python_dotenv_would_expand_stop_the_deploy_before_the_build(self) -> None:
         result = self.deploy(provisioned(), ["BOT_NAME=hi-${USER}-do-not-print"])
@@ -573,18 +663,6 @@ class LookupFailureTests(DeployHarness):
         self.assertIn("--env-vars-file", deploy)
         self.assert_no_secret_printed(allowed)
 
-    def test_a_staging_bucket_of_another_project_is_never_used(self) -> None:
-        # Bucket names are global and this one is predictable.
-        state = provisioned(buckets={_STAGING: {"location": "US-WEST1", "project": "squatter"}})
-
-        result = self.deploy(state)
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"{_STAGING} does not exist in project {_PROJECT}", result.stderr)
-        [build] = self.calls("builds submit")
-        self.assertNotIn("--gcs-source-staging-dir", build)
-        self.assertNotIn("--service-account", build)
-
 
 class ArtifactCleanupPolicyTests(DeployHarness):
     def _deploy(self, dry_run: bool) -> subprocess.CompletedProcess:
@@ -629,17 +707,35 @@ class FailedSmokeTests(DeployHarness):
 
 
 class FallbackTests(DeployHarness):
-    def test_without_provisioning_it_deploys_the_old_way_and_says_so(self) -> None:
+    def test_nothing_is_built_without_the_builder_and_its_staging_bucket(self) -> None:
+        # Cloud Build would stage the source in gs://<project>_cloudbuild, a
+        # US multi-region bucket outside the free tier.
+        for name, state in (
+            ("nothing provisioned", {"repos": {"linebot-cloud-agent": {}}, "service_missing": True}),
+            ("no staging bucket", provisioned(buckets={})),
+            ("no builder account", provisioned(service_accounts=[_RUNTIME_SA])),
+            # Bucket names are global and this one is predictable.
+            ("another project's bucket", provisioned(buckets={_STAGING: {"location": "US-WEST1", "project": "squatter"}})),
+        ):
+            with self.subTest(name):
+                result = self.deploy(state)
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"{_STAGING} does not exist in project {_PROJECT}", result.stderr)
+                self.assertIn(f"gs://{_PROJECT}_cloudbuild", result.stderr)
+                self.assertIn("provision_gcp.sh --step staging-bucket --apply", result.stderr)
+                self.assertIn("--step builder-sa --apply", result.stderr)
+                self.assertEqual(self.calls("builds submit"), [])
+                self.assertEqual(self.calls("run deploy"), [])
+
+    def test_without_the_runtime_side_it_deploys_from_an_env_file_and_says_so(self) -> None:
         # A first deploy: the Cloud Run service does not exist yet either.
-        result = self.deploy(
-            {"repos": {"linebot-cloud-agent": {}}, "service_missing": True}, ["BOT_NAME=Bot"]
-        )
+        result = self.deploy(builder_only(service_missing=True), ["BOT_NAME=Bot"])
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stderr.count("Run ./scripts/provision_gcp.sh first"), 2)
+        self.assertEqual(result.stderr.count("Run ./scripts/provision_gcp.sh first"), 1)
         [build] = self.calls("builds submit")
-        self.assertNotIn("--service-account", build)
-        self.assertNotIn("--gcs-source-staging-dir", build)
+        self.assertIn(f"--gcs-source-staging-dir={_STAGING}/source", build)
         [deploy] = self.calls("run deploy")
         self.assertIn("--env-vars-file", deploy)
         self.assertIn("--clear-secrets", deploy)
@@ -653,19 +749,6 @@ class FallbackTests(DeployHarness):
         # The env-vars file never outlives the deploy.
         self.assertEqual(list(self.tmp.glob("linebot-deploy.*")), [])
         self.assert_no_secret_printed(result)
-
-    def test_the_builder_needs_both_its_account_and_the_staging_bucket(self) -> None:
-        state = provisioned(buckets={})
-
-        result = self.deploy(state)
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        [build] = self.calls("builds submit")
-        self.assertNotIn("--service-account", build)
-        self.assertIn(f"{_STAGING} does not exist", result.stderr)
-        # The runtime side is provisioned, so it still deploys from the secret.
-        [deploy] = self.calls("run deploy")
-        self.assertIn("--set-secrets=", deploy)
 
     def test_a_missing_secret_falls_back_to_the_env_file(self) -> None:
         state = provisioned(secrets={})
@@ -728,8 +811,8 @@ class MediaBucketTests(DeployHarness):
                 custom,
             ),
             (
-                "not provisioned",
-                {"repos": {"linebot-cloud-agent": {}}, "buckets": dict(media), "service_account_on_service": compute},
+                "runtime side not provisioned",
+                builder_only(buckets={**staging, **media}, service_account_on_service=compute),
                 [],
                 compute,
             ),
@@ -749,7 +832,8 @@ class MediaBucketTests(DeployHarness):
 
     def test_an_unknown_runtime_account_is_named_for_the_signing_role(self) -> None:
         media = {"gs://media": {"location": "US-WEST1", "default_storage_class": "STANDARD"}}
-        state = {"repos": {"linebot-cloud-agent": {}}, "buckets": media}
+        state = builder_only()
+        state["buckets"].update(media)
 
         result = self.deploy(state, ["GCS_BUCKET_NAME=media"])
 
@@ -788,7 +872,7 @@ class ColabSecretTests(DeployHarness):
     def _state(self, colab_versions: list[dict], *, readable: bool = True, **overrides) -> dict:
         return provisioned(
             secrets={"linebot-dotenv": [version(1, "A='1'\n")], self._COLAB: colab_versions},
-            bindings=[self._READS] if readable else [],
+            bindings=[_DOTENV_READS, self._READS] if readable else [_DOTENV_READS],
             **overrides,
         )
 
@@ -873,19 +957,21 @@ class ColabSecretTests(DeployHarness):
         [deploy] = self.calls("run deploy")
         self.assertNotIn(self._COLAB, deploy)
 
-    def test_a_runtime_account_that_cannot_read_it_stops_the_deploy_before_the_build(self) -> None:
+    def test_a_runtime_account_without_a_direct_grant_is_only_warned_about(self) -> None:
+        # A project-level or group grant also lets it read the secret, which
+        # the secret's own policy does not show; Cloud Run has the last word.
         result = self.deploy(self._state([version(1, "{}")], readable=False), self._ON)
 
-        self.assertEqual(result.returncode, 1)
-        self.assertIn(f"{_RUNTIME_SA} cannot read secret linebot-colab-adc", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"Could not confirm that {_RUNTIME_SA} can read secret linebot-colab-adc", result.stderr)
         self.assertIn("provision_gcp.sh --step colab-secret --apply", result.stderr)
-        self.assertEqual(self.calls("builds submit"), [])
-        self.assertEqual(self.calls("run deploy"), [])
+        [deploy] = self.calls("run deploy")
+        self.assertIn("/secrets/colab/adc.json=linebot-colab-adc:1", deploy)
 
     def test_colab_stays_off_without_an_enabled_version_or_provisioning(self) -> None:
         for state, warning in (
             (self._state([version(1, "{}", "DISABLED"), version(2, "{}", "DESTROYED")]), "has no enabled version"),
-            ({"secrets": {self._COLAB: [version(1, "{}")]}}, "only a provisioned deploy"),
+            (builder_only(secrets={self._COLAB: [version(1, "{}")]}), "only a provisioned deploy"),
         ):
             with self.subTest(warning=warning):
                 result = self.deploy(state, self._ON)
@@ -915,7 +1001,7 @@ class ColabQueueTests(DeployHarness):
     def _state(self) -> dict:
         return provisioned(
             secrets={"linebot-dotenv": [version(1, "A='1'\n")], ColabSecretTests._COLAB: [version(1, "{}")]},
-            bindings=[ColabSecretTests._READS],
+            bindings=[_DOTENV_READS, ColabSecretTests._READS],
         )
 
     def _queue_calls(self, queue: str) -> list[str]:
@@ -993,6 +1079,35 @@ class EnvFileTests(DeployHarness):
         self.assertNotIn("nvapi-do-not-print", result.stdout + result.stderr)
         self.assertEqual(self.calls("builds submit"), [])
         self.assert_no_secret_printed(result)
+
+    def test_a_lowercase_key_counts_as_the_app_reads_it(self) -> None:
+        # pydantic-settings reads .env case-insensitively: the app runs the
+        # cron endpoint with this secret, so the deploy must create its job.
+        result = self.deploy(provisioned(), ["internal_cron_secret=" + "c0" * 32])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [created] = self.calls("scheduler jobs create")
+        self.assertIn("X-Cron-Token=" + "c0" * 32, created)
+
+    def test_an_edit_after_the_checks_stops_the_deploy_before_the_build(self) -> None:
+        # The edit lands after the checks read the env file and before the
+        # deploy takes the settings it ships: they would go out unchecked.
+        (self.tmp / "bin" / "gcloud").write_text(
+            "#!/bin/sh\n"
+            'if [ "$1 $2" = "meta list-files-for-upload" ]; then\n'
+            f"  echo OPENROUTER_API_KEY= >> '{self.env_file}'\n"
+            "fi\n"
+            f'exec "{sys.executable}" -S "{_FAKE}" "$@"\n',
+            encoding="utf-8",
+        )
+        for mode, state in (("secrets", provisioned()), ("env-file", builder_only())):
+            with self.subTest(mode=mode):
+                result = self.deploy(state)
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"{self.env_file} changed while the deploy checked it", result.stderr)
+                self.assertEqual(self.calls("builds submit"), [])
+                self.assertEqual(self.calls("secrets versions add"), [])
 
     def test_the_tasks_queue_location_follows_the_app(self) -> None:
         # A missing key means us-west1 (the Settings default), an empty one

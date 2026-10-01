@@ -1,10 +1,10 @@
 # Files `gcloud builds submit` must not upload (gitignore syntax; the last
 # matching pattern wins). Check with: gcloud meta list-files-for-upload .
 #
-# Cloud Build runs ruff, pytest and compileall on the upload, so never ignore
-# requirements*.lock (installed with --require-hashes), requirements*.in,
-# requirements*.txt, Dockerfile, pyproject.toml, main.py, src/, prompts/,
-# scripts/, tests/ or infra/ (the provisioning tests read infra/gcp) here.
+# Cloud Build exports uv.lock and runs ruff, pytest and compileall on the
+# upload, so never ignore pyproject.toml or uv.lock (exported, then installed
+# with --require-hashes), Dockerfile, main.py, src/, prompts/, scripts/,
+# tests/ or infra/ (the provisioning tests read infra/gcp) here.
 .gcloudignore
 .git
 .gitignore

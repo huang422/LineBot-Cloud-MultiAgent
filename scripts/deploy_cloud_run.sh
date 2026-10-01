@@ -68,31 +68,37 @@ The script will:
      Cloud Tasks queues (unless TASKS_MODE=inline) exist: CLOUD_TASKS_QUEUE,
      and CLOUD_TASKS_COLAB_QUEUE while COLAB_ENABLED=true,
   6. submit Cloud Build to run ruff + pytest and build/push the image
-     (no secrets are uploaded and Cloud Build does not deploy); once
-     scripts/provision_gcp.sh has run, the build runs as linebot-builder
-     and stages the source in gs://<project>-cb-src-usw1,
-  7. deploy the pushed image to Cloud Run from this machine. Provisioned:
-     as linebot-runtime, with .env as the Secret Manager secret
-     linebot-dotenv (a new version only when .env changed) mounted at
+     (no secrets are uploaded and Cloud Build does not deploy) as
+     linebot-builder, staging the source in gs://<project>-cb-src-usw1;
+     while either is missing (scripts/provision_gcp.sh creates them) the
+     deploy stops before the build, as the default bucket
+     gs://<project>_cloudbuild is outside the free tier,
+  7. deploy the pushed image to Cloud Run from this machine, with exactly
+     the volumes it mounts. Provisioned: as linebot-runtime, with .env as
+     the Secret Manager secret linebot-dotenv (a new version only when
+     .env changed; the one checked before the build) mounted at
      /secrets/app/app.env, and APP_VERSION as the only plain variable.
-     Not provisioned yet: with an env-vars file created in $TMPDIR and
-     deleted right after the deploy. A service that already reads
-     linebot-dotenv is never moved back to plain variables unless
+     Not provisioned yet: with an env-vars file created in $TMPDIR before
+     the build and deleted right after the deploy. A service that already
+     reads linebot-dotenv is never moved back to plain variables unless
      --allow-env-fallback is given, and a lookup that fails for any
-     reason but NOT_FOUND stops the deploy,
+     reason but NOT_FOUND stops the deploy.
      With COLAB_ENABLED=true, the newest enabled version of
      linebot-colab-adc is pinned and mounted at /secrets/colab/adc.json
      (never read by the deploy); a missing secret leaves the Colab tier
-     off with a warning, and a runtime account that cannot read it stops
-     the deploy,
+     off with a warning. A runtime account with no secretAccessor binding
+     on a mounted secret gets a warning (a project or group grant also
+     works; Cloud Run rejects a revision that cannot read it),
   8. apply the GCS lifecycle, signing role (a runtime account other than
      linebot-runtime), Cloud Tasks enqueuer, public access and Cloud
      Scheduler settings, then run smoke checks,
-  9. delete the revisions behind the newest --keep-revisions Ready ones (a
-     revision that never became Ready takes no slot), images beyond
-     --keep-images that no revision in the region uses and, after a
-     passing smoke check, linebot-dotenv (and, when mounted,
-     linebot-colab-adc) versions no revision in any region still uses.
+  9. after a passing smoke check, delete the revisions behind the newest
+     --keep-revisions Ready ones (a revision that never became Ready takes
+     no slot), images beyond --keep-images that no revision in the region
+     uses, and linebot-dotenv (and, when mounted, linebot-colab-adc)
+     versions no revision in any region still mounts.
+
+Env keys are read case-insensitively, as the app reads them.
 
 Deploy settings supported in .env:
   GCP_PROJECT_ID
@@ -114,8 +120,8 @@ Options:
   --keep-revisions N         How many revisions to keep (default from .env or 2)
   --keep-images N            How many image digests to keep (default from .env or 2)
   --skip-tests               Skip the Cloud Build lint, unit tests and compile checks
-  --skip-smoke               Skip the post-deploy cloud smoke checks (old secret
-                             versions are then kept)
+  --skip-smoke               Skip the post-deploy cloud smoke checks (old revisions,
+                             images and secret versions are then kept)
   --skip-enable-apis         Do not auto-enable required GCP APIs
   --allow-env-fallback       Deploy with plain environment variables even though the
                              service reads linebot-dotenv (the runtime account or the
@@ -180,8 +186,9 @@ normalize_bool() {
 
 # $ENV_FILE as `envfile.py dump` reads it, loaded once by load_env_file: a
 # python3 start per key read was most of the deploy's local time. Never
-# exported. ENV_PLACEHOLDER_KEYS lists the keys whose value is an example
-# placeholder, space-separated.
+# exported. Keys are in upper case, so KEY and key read alike, as the app
+# reads them (pydantic-settings, case-insensitive). ENV_PLACEHOLDER_KEYS
+# lists the keys whose value is an example placeholder, space-separated.
 ENV_KEYS=()
 ENV_VALUES=()
 ENV_PLACEHOLDER_KEYS=" "
@@ -336,16 +343,29 @@ for service in json.loads(raw) if raw else []:
 print("\n".join(sorted(regions)))
 '
 
-# stdin: `gcloud run revisions list --format='json(metadata.name,spec.volumes)'`
-# of every service in a region: linebot-dotenv and linebot-colab-adc are
-# one per project, so another service (a staging copy) may pin them too.
-# Prints the versions of secret argv[1] the revisions pin, one per line.
+# stdin: `gcloud run revisions list --format='json(metadata.name,spec.volumes,
+# spec.containers[].volumeMounts)'` of every service in a region:
+# linebot-dotenv and linebot-colab-adc are one per project, so another
+# service (a staging copy) may pin them too. Prints the versions of secret
+# argv[1] the revisions mount, one per line. A volume no container mounts
+# pins nothing: gcloud --set-secrets alone leaves the previous deploy's
+# volumes in the template, unmounted (seen 2026-10-01), and the revisions
+# made from it carry them. A revision that lists no mount at all keeps
+# every volume (a listing that left the mounts out must not free a version).
 PINNED_SECRET_VERSIONS_PY='
 import json, sys
 secret = sys.argv[1]
 raw = sys.stdin.read().strip()
 for revision in json.loads(raw) if raw else []:
-    for volume in ((revision or {}).get("spec") or {}).get("volumes") or []:
+    spec = (revision or {}).get("spec") or {}
+    mounted = {
+        (mount or {}).get("name")
+        for container in spec.get("containers") or []
+        for mount in (container or {}).get("volumeMounts") or []
+    }
+    for volume in spec.get("volumes") or []:
+        if mounted and (volume or {}).get("name") not in mounted:
+            continue
         source = (volume or {}).get("secret") or {}
         name = source.get("secretName") or ""
         if name != secret and not name.endswith("/secrets/" + secret):
@@ -369,7 +389,7 @@ pinned_secret_versions() {
     gcloud run revisions list \
       --project "$PROJECT_ID" \
       --region "$region" \
-      --format='json(metadata.name,spec.volumes)' \
+      --format='json(metadata.name,spec.volumes,spec.containers[].volumeMounts)' \
       | python3 -c "$PINNED_SECRET_VERSIONS_PY" "$1" || return 1
   done
 }
@@ -460,6 +480,20 @@ for binding in (policy or {}).get("bindings") or []:
         sys.exit(0)
 sys.exit(1)
 ' "$1" "$2"
+}
+
+# warn_unless_secret_reader SECRET STEP: Cloud Run rejects a revision whose
+# account cannot read a secret it mounts. The secret's own policy shows only
+# direct grants, not a project-level or group one, so this only warns (an
+# unreadable policy too); STEP is the provision_gcp.sh step that grants it.
+warn_unless_secret_reader() {
+  local policy
+  policy="$(CLOUDSDK_CORE_DISABLE_PROMPTS=1 gcloud secrets get-iam-policy "$1" \
+    --project "$PROJECT_ID" \
+    --format=json 2>/dev/null || true)"
+  if ! printf '%s' "$policy" | policy_has_binding roles/secretmanager.secretAccessor "serviceAccount:$DEPLOY_RUNTIME_SA"; then
+    warn "Could not confirm that $DEPLOY_RUNTIME_SA can read secret $1: its policy grants it no secretAccessor role (a project-level or group grant does not show there). If it cannot read it, Cloud Run rejects the revision after the build; ./scripts/provision_gcp.sh --step $2 --apply grants it to ${RUNTIME_SA_NAME}"
+  fi
 }
 
 # stdin: `gcloud run revisions list --format='json(metadata.name,status.conditions)'`,
@@ -655,6 +689,9 @@ require_cmd curl
 if [[ ! -f "$ENV_FILE" ]]; then
   fail "Env file not found: $ENV_FILE"
 fi
+# Its checksum before any read: the settings are checked here and taken
+# again before the build, and must be the same file both times.
+ENV_FILE_CKSUM="$(cksum < "$ENV_FILE")"
 load_env_file
 
 if [[ -z "$PROJECT_ID" ]]; then
@@ -927,30 +964,37 @@ PY
   echo "       Bucket is STANDARD in an Always Free location"
 fi
 
-# Provisioned resources (scripts/provision_gcp.sh, ADR-0008). Each part
-# falls back to the pre-provisioning behaviour while gcloud reports its
-# resource NOT_FOUND; any other lookup error stops the deploy.
+# Provisioned resources (scripts/provision_gcp.sh, ADR-0008). Only a
+# NOT_FOUND answer counts as "not provisioned"; any other lookup error stops
+# the deploy.
 echo "[step] Checking provisioned service accounts, staging bucket and secret"
 BUILDER_SA="${BUILDER_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 STAGING_BUCKET="gs://${PROJECT_ID}-cb-src-usw1"
 DEPLOY_RUNTIME_SA="${SERVICE_ACCOUNT:-${RUNTIME_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com}"
 
-BUILD_MODE="default"
-if sa_exists "$BUILDER_SA" && bucket_in_project "$STAGING_BUCKET"; then
-  BUILD_MODE="builder"
-  echo "       Cloud Build runs as $BUILDER_SA and stages the source in $STAGING_BUCKET"
-else
-  warn "$BUILDER_SA or $STAGING_BUCKET does not exist in project $PROJECT_ID, so Cloud Build runs as the default service account and stages the source in gs://${PROJECT_ID}_cloudbuild. Run ./scripts/provision_gcp.sh first"
+# Without both, Cloud Build would stage the source in its default bucket,
+# which is US multi-region and outside the free tier.
+if ! { sa_exists "$BUILDER_SA" && bucket_in_project "$STAGING_BUCKET"; }; then
+  fail "$BUILDER_SA or $STAGING_BUCKET does not exist in project $PROJECT_ID, and without them Cloud Build would stage the source in gs://${PROJECT_ID}_cloudbuild (US multi-region, outside the free tier), so nothing was built. Create them with ./scripts/provision_gcp.sh --step staging-bucket --apply, then --step builder-sa --apply, and deploy again"
 fi
+echo "       Cloud Build runs as $BUILDER_SA and stages the source in $STAGING_BUCKET"
 
+# The settings are taken from $ENV_FILE once, here, before the build, and
+# only if it is still the file checked above: an edit after the checks or
+# during the build cannot ship settings nobody checked.
 DEPLOY_MODE="env-file"
 if sa_exists "$DEPLOY_RUNTIME_SA" && secret_exists "$DOTENV_SECRET"; then
   DEPLOY_MODE="secrets"
   echo "       Cloud Run runs as $DEPLOY_RUNTIME_SA and reads $ENV_FILE from secret $DOTENV_SECRET"
-  # Refuses, by key name, values python-dotenv would not read back as-is.
-  if ! LOCAL_DOTENV_SHA="$(python3 "$ROOT_DIR/scripts/envfile.py" to-dotenv --file "$ENV_FILE" --sha256)"; then
+  # The blob this deploy uploads, kept in memory, never in a file. to-dotenv
+  # refuses, by key name, values python-dotenv would not read back as-is.
+  # The blob ends with a quote and a newline: $(...) drops the newline, and
+  # printf '%s\n' puts it back.
+  if ! DOTENV_BLOB="$(python3 "$ROOT_DIR/scripts/envfile.py" to-dotenv --file "$ENV_FILE")"; then
     fail "Fix the keys and lines listed above in $ENV_FILE, then deploy again"
   fi
+  LOCAL_DOTENV_SHA="$(printf '%s\n' "$DOTENV_BLOB" | python3 "$ROOT_DIR/scripts/envfile.py" sha256)"
+  warn_unless_secret_reader "$DOTENV_SECRET" secrets
 else
   # Moving a service that reads the secret back to plain variables would
   # expose every secret to anyone who can view the service (ADR-0008).
@@ -961,14 +1005,24 @@ else
     warn "--allow-env-fallback: service '$SERVICE_NAME' leaves secret $DOTENV_SECRET for plain environment variables"
   fi
   warn "$DEPLOY_RUNTIME_SA or secret $DOTENV_SECRET does not exist, so the deploy puts every .env value in plain Cloud Run environment variables and keeps the service's current service account. Run ./scripts/provision_gcp.sh first"
+  if ! (
+    umask 077
+    python3 "$ROOT_DIR/scripts/envfile.py" to-cloudrun-yaml \
+      --file "$ENV_FILE" \
+      --set "APP_VERSION=$IMAGE_TAG" \
+      "$TEMP_ENV_YAML"
+  ); then
+    fail "Fix the keys and lines listed above in $ENV_FILE, then deploy again"
+  fi
+fi
+if [[ "$(cksum < "$ENV_FILE")" != "$ENV_FILE_CKSUM" ]]; then
+  fail "$ENV_FILE changed while the deploy checked it, so nothing was built or uploaded; deploy again"
 fi
 
 # The Colab credential (ADR-0010). The app keeps the tier off, with a
-# warning, whenever the file is missing, so a missing secret only warns;
-# a runtime account that cannot read an existing one stops the deploy
-# before the build, since Cloud Run would reject the revision. The newest
-# enabled version is pinned like the dotenv secret, so a rollback keeps
-# its token; the deploy never reads the payload.
+# warning, whenever the file is missing, so a missing secret only warns.
+# The newest enabled version is pinned like the dotenv secret, so a
+# rollback keeps its token; the deploy never reads the payload.
 COLAB_ENABLED_VALUE="$(read_env_key COLAB_ENABLED)"
 [[ -z "$COLAB_ENABLED_VALUE" ]] && COLAB_ENABLED_VALUE="false"
 COLAB_ENABLED_VALUE="$(normalize_bool "$COLAB_ENABLED_VALUE" 'COLAB_ENABLED')"
@@ -997,12 +1051,7 @@ if [[ "$COLAB_ENABLED_VALUE" == "true" ]]; then
       COLAB_ADC_VERSION=""
       warn "COLAB_ENABLED=true, but $COLAB_SECRET has no enabled version, so the Colab tier stays off. Mint a new token with ./scripts/mint_colab_adc.sh --apply, then deploy again"
     else
-      gcloud_lookup secrets get-iam-policy "$COLAB_SECRET" \
-        --project "$PROJECT_ID" \
-        --format=json || true
-      if ! printf '%s' "$LOOKUP_OUT" | policy_has_binding roles/secretmanager.secretAccessor "serviceAccount:$DEPLOY_RUNTIME_SA"; then
-        fail "$DEPLOY_RUNTIME_SA cannot read secret $COLAB_SECRET, so Cloud Run would reject the revision. Grant it with ./scripts/provision_gcp.sh --step colab-secret --apply (or set COLAB_ENABLED=false), then deploy again"
-      fi
+      warn_unless_secret_reader "$COLAB_SECRET" colab-secret
       echo "       Mounting $COLAB_SECRET version $COLAB_ADC_VERSION at $COLAB_MOUNT_PATH"
       COLAB_ADC_PATH_VALUE="$(read_env_key COLAB_ADC_PATH)"
       if [[ -n "$COLAB_ADC_PATH_VALUE" ]] && [[ "$COLAB_ADC_PATH_VALUE" != "$COLAB_MOUNT_PATH" ]]; then
@@ -1135,20 +1184,16 @@ if gcloud_beta_installed; then
   build_submit=(gcloud beta builds submit)
 fi
 
+# cloudbuild.yaml logs to Cloud Logging only, which a user-specified build
+# service account requires.
 build_args=(
   "$ROOT_DIR"
   --project "$PROJECT_ID"
   --config "$ROOT_DIR/cloudbuild.yaml"
   --substitutions "$SUBSTITUTIONS"
+  "--service-account=projects/${PROJECT_ID}/serviceAccounts/${BUILDER_SA}"
+  "--gcs-source-staging-dir=${STAGING_BUCKET}/source"
 )
-if [[ "$BUILD_MODE" == "builder" ]]; then
-  # cloudbuild.yaml logs to Cloud Logging only, which a user-specified
-  # build service account requires.
-  build_args+=(
-    "--service-account=projects/${PROJECT_ID}/serviceAccounts/${BUILDER_SA}"
-    "--gcs-source-staging-dir=${STAGING_BUCKET}/source"
-  )
-fi
 
 echo "[step] Submitting Cloud Build (ruff + pytest, then build and push the image)"
 echo "       project=$PROJECT_ID region=$REGION image=$IMAGE_URI"
@@ -1168,13 +1213,20 @@ deploy_args=(
   --timeout "$CLOUD_RUN_TIMEOUT_SECONDS"
   --memory 512Mi
   --cpu 1
+  # The deploy owns every volume. --set-secrets / --clear-secrets alone
+  # leave the volumes the container mounted until now in the template,
+  # unmounted (seen 2026-10-01: four secret volumes, two mounted), and every
+  # later revision carries them. gcloud clears these first, then adds back
+  # only what the secret flags mount.
+  --clear-volume-mounts
+  --clear-volumes
   --quiet
 )
 if [[ "$DEPLOY_MODE" == "secrets" ]]; then
-  # A new version only when the blob changed; the hashes are compared,
-  # never printed. The payload travels through a pipe, never a file, and
-  # the read runs with file logging off: gcloud copies whatever it prints
-  # into ~/.config/gcloud/logs (kept about 30 days).
+  # A new version only when the blob checked before the build changed; the
+  # hashes are compared, never printed. The payload travels through a pipe,
+  # never a file, and the read runs with file logging off: gcloud copies
+  # whatever it prints into ~/.config/gcloud/logs (kept about 30 days).
   echo "[step] Syncing $ENV_FILE to Secret Manager secret '$DOTENV_SECRET'"
   if REMOTE_DOTENV_SHA="$(CLOUDSDK_CORE_DISABLE_FILE_LOGGING=true gcloud secrets versions access latest \
     --secret "$DOTENV_SECRET" \
@@ -1188,7 +1240,7 @@ if [[ "$DEPLOY_MODE" == "secrets" ]]; then
       --format='value(name)')"
     echo "       Unchanged since the latest version"
   else
-    DOTENV_VERSION="$(python3 "$ROOT_DIR/scripts/envfile.py" to-dotenv --file "$ENV_FILE" \
+    DOTENV_VERSION="$(printf '%s\n' "$DOTENV_BLOB" \
       | gcloud secrets versions add "$DOTENV_SECRET" \
         --project "$PROJECT_ID" \
         --data-file=- \
@@ -1216,14 +1268,8 @@ if [[ "$DEPLOY_MODE" == "secrets" ]]; then
     "--set-env-vars=APP_VERSION=${IMAGE_TAG}"
   )
 else
-  (
-    umask 077
-    python3 "$ROOT_DIR/scripts/envfile.py" to-cloudrun-yaml \
-      --file "$ENV_FILE" \
-      --set "APP_VERSION=$IMAGE_TAG" \
-      "$TEMP_ENV_YAML"
-  )
-  # The revision must not depend on a secret mount the env file replaces.
+  # The env-vars file was made before the build. The revision must not
+  # depend on a secret the env file replaces.
   deploy_args+=(--env-vars-file "$TEMP_ENV_YAML" --clear-secrets)
   if [[ -n "$SERVICE_ACCOUNT" ]]; then
     deploy_args+=(--service-account "$SERVICE_ACCOUNT")
@@ -1439,17 +1485,22 @@ if [[ "$SKIP_SMOKE" != "true" ]]; then
 
   # The secret goes through the environment, not argv, so `ps` cannot show it.
   SMOKE_WEBHOOK_SECRET="$(read_env_key LINE_CHANNEL_SECRET)" \
-    python3 "$ROOT_DIR/tests/smoke_test_cloud.py" \
+    python3 "$ROOT_DIR/scripts/smoke_test_cloud.py" \
     --base-url "$SERVICE_URL" \
     --expect-ready
 fi
 
-# Cleanup runs only after a healthy deploy, so a failed smoke check keeps the
-# previous revisions and images around for a rollback.
-echo "[step] Cleaning up old revisions (keeping the ${KEEP_REVISION_COUNT} newest Ready ones)"
-cleanup_old_revisions
-echo "[step] Cleaning up old images (keeping ${KEEP_IMAGE_COUNT})"
-cleanup_old_images
+# Cleanup runs only after a passing smoke check (a failed one stops the
+# deploy above), so a failed or skipped check keeps the previous revisions,
+# images and secret versions around for a rollback.
+if [[ "$SKIP_SMOKE" == "true" ]]; then
+  echo "[step] Keeping every old revision and image (smoke checks were skipped)"
+else
+  echo "[step] Cleaning up old revisions (keeping the ${KEEP_REVISION_COUNT} newest Ready ones)"
+  cleanup_old_revisions
+  echo "[step] Cleaning up old images (keeping ${KEEP_IMAGE_COUNT})"
+  cleanup_old_images
+fi
 if [[ "$DEPLOY_MODE" == "secrets" ]]; then
   # Destroying is permanent, so it waits for a smoke check that passed. The
   # Colab secret is cleaned only by a deploy that mounts it.

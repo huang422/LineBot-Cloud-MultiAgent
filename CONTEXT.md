@@ -64,6 +64,10 @@ handler inline rather than drop it. See ADR-0006.
 | Assembly | `src/runtime/composition.py` | builds providers, binds the role table, hands each agent its role's tiers, wires the tool registry |
 | Model roles | `src/runtime/model_roles.py` | `RoleTable`: which models serve router / chat / thinking / vision / utility / embed / image, in order; code defaults + `MODEL_ROLES`, validated at startup (ADR-0007) |
 | Built app | `src/runtime/container.py` | `AppContainer`: what composition produced |
+| Webhook triage | `src/handlers/webhook_handler.py` | trigger detection (`!hej`, @mention, 1:1 chat), memory enrichment, rate limit |
+| Request and reply shapes | `src/models/agent_request.py`, `agent_response.py` | `AgentRequest` / `AgentResponse`, the plain data every step passes |
+| Input | `src/processors/input_processor.py` | LINE event → `AgentRequest`: input type, image download, sanitising, quoted context |
+| Output | `src/processors/output_processor.py`, `tts_processor.py` | text / voice / image delivery through `LineService`; plain text for LINE, then OpenCC; edge-tts audio uploaded to GCS |
 | Request handling | `src/pipeline/event_pipeline.py` | one event → one reply; deps injected via `PipelineDeps` |
 | Task handlers | `src/pipeline/task_handlers.py` | one handler per task kind; never raises; dedupes `event` |
 | Cron maintenance | `src/pipeline/maintenance.py` | `run_cron_tick`: stale passive-buffer sweep; queues the daily `eol` task; runs the Colab controller's tick (state only; it queues `colab` tasks) |
@@ -72,29 +76,42 @@ handler inline rather than drop it. See ADR-0006.
 | Routing (rules) | `src/agents/routing_rules.py` | the regex rulebook; pure, no I/O; also the shared URL helpers |
 | Agents | `src/agents/` | all extend `BaseAgent`, prompts load from `prompts/*.md` |
 | Tool loop | `src/agents/tool_runner.py` | chat's tool calls; works on a copy, ends with a `tool_choice="none"` answer |
+| Tools | `src/agents/tools.py` | `recall_memory`, `update_user_profile`, `web_search`: their schemas and executors, and the per-turn search cap |
 | Search planning | `src/services/search/query.py` | `SearchQueryPlanner`: the web search's query, topic and time range; rewrites follow-ups on the utility tiers |
-| Search backends | `src/services/search/backend.py`, `tavily.py` | `ChainedSearchBackend`: Tavily (key or keyless) → an empty `degraded` answer; the seam another backend plugs into; shared by the web search agent and the `web_search` tool (ADR-0009) |
+| Search backends | `src/services/search/backend.py`, `tavily.py`, `types.py` | `ChainedSearchBackend`: Tavily (key or keyless) → an empty `degraded` answer; the seam another backend plugs into; shared by the web search agent and the `web_search` tool (ADR-0009) |
 | Page reading | `src/services/search/page_fetcher.py`, `extract.py`, `rerank.py` | SSRF-safe fetch (public addresses only, pinned connection, checked redirects, byte cap); trafilatura in its own threads, a simple extractor as fallback; optional embedding rerank |
-| Providers | `src/providers/` | NVIDIA + OpenRouter + Colab (`ollama_provider.py`, Ollama's native `/api/chat`) behind `FallbackChain`, which walks model tiers; shared errors and parser in `base.py`, HTTP status mapping in `openai_compat.py` |
+| Providers | `src/providers/` | NVIDIA (`nvidia_provider.py`, chat and image generation) + OpenRouter (`openrouter_provider.py`, `:free` ids only unless allowed) + Colab (`ollama_provider.py`, Ollama's native `/api/chat`) behind `FallbackChain` (`fallback_chain.py`), which walks model tiers; shared errors and parser in `base.py`, HTTP status mapping in `openai_compat.py`, role alternation for strict chat templates in `messages.py` |
 | Colab router | `src/providers/systemone.py` | `SystemOneRouter`: nimble on `/v1/systemone`, three scored questions in Nimble's schema style, `RouterGates` (COLAB_ROUTER_CONFIDENCE / THINK_ON / THINK_OFF, provisional until the routing eval); None whenever unsure, not READY, or the session's router is off its pin or not wholly in VRAM |
 | Colab tier | `src/services/colab/` | `protocol` (key derivation, signature, tunnel rule, pins), `state` (the Firestore session document, optimistic writes), `endpoint` (READY, busy gates, breaker, tunnel client, probe), `registration` (`/internal/colab/register`), `admin` (`!colab`, `!whoami`), `control_plane` (the colab_cli library facade: assign, list, unassign, ccu-info, cells, uploads; budgets, error classes, token scrubbing), `controller` (pure lifecycle decisions + the cron tick and `colab` tasks), `launcher` (upload, silent env file, detached bootstrap); ADR-0010 |
 | Colab VM | `colab/` | what the launcher uploads to the runtime: `bootstrap` (GPU check, pinned Ollama and cloudflared, model pulls with digest checks, warm-up qwen3.8 first and VRAM record, tunnel, signed `ready`/`failed`), `auth_proxy` (bearer, path allowlist, Host rewrite, idle watchdog that releases the runtime), `register` (the bot's protocol mirrored in the standard library), pins in `versions.json` and the proxy's hash-pinned `proxy-requirements.lock`; runbook in `colab/README.md` |
-| Ops scripts | `scripts/` | `deploy_cloud_run.sh`, `provision_gcp.sh`, `mint_colab_adc.sh` (a person mints the Colab token into `linebot-colab-adc`), `live_gate.py` (live checks through the bot's own clients; `--path tiers` calls every tier of the configured role table once; `--path colab` needs a READY session), `envfile.py`, `migrate_embeddings.py` |
+| Ops scripts | `scripts/` | `deploy_cloud_run.sh` (the one deploy command), `provision_gcp.sh` (one-time GCP setup, dry run unless `--apply`), `mint_colab_adc.sh` (a person mints the Colab token into `linebot-colab-adc`), `smoke_test_cloud.py` (the deploy's post-deploy check of `/health` and a signed `/webhook` with no events), `envfile.py` (`.env` parsing, `check-v3` / `migrate-v3`, `to-dotenv`, the upload leak guard), `live_gate.py` (live checks through the bot's own clients; `--path tiers` calls every tier of the configured role table once; `--path colab` needs a READY session), `migrate_embeddings.py` (re-embeds Firestore episodes after a model change), `evals/` (`routing_eval.py` on the labelled `routing_zh_tw.jsonl`; re-tunes `COLAB_ROUTER_*`) |
+| Build and dependencies | `pyproject.toml`, `uv.lock`, `Dockerfile`, `cloudbuild.yaml` | runtime dependencies and the `dev` group in `pyproject.toml`, resolved by `uv lock` into `uv.lock` (every file sha256-pinned); the image and Cloud Build's test step install from that lock on the same digest-pinned `python:3.12-slim`; ruff and pytest settings live in `pyproject.toml` too |
+| Ignore lists | `.gcloudignore`, `.dockerignore`, `.gitignore` | what never reaches Cloud Build or the image (`.env*`, credentials, backups); the deploy also refuses an upload that would carry one |
+| GCP policies | `infra/gcp/` | the bucket lifecycle rules (1 and 3 days) and the Artifact Registry cleanup policy that `provision_gcp.sh` applies |
+| Tests | `tests/` | the offline suite (see Testing); `fake_gcloud.py`, `colab_fakes.py` and `script_rehearsal.py` are its fakes |
 | Model profiles | `src/providers/model_profiles.py` | exact-id facts per model: protocol, modalities, thinking and JSON modes, limits, model-card sampling; the payload builders and the role table read them |
 | Model health | `src/services/model_health.py` | per-model cooldowns and dead models, per-provider request budgets (chat, image and embedding calls); only an account-level OpenRouter 429 cools the whole provider |
 | Model lifecycle | `src/services/model_lifecycle.py` | daily end-of-life check against the public catalogs (`eol` task); results for `/health/detail` |
 | Memory | `src/services/memory_service.py` | recent window (time-ordered, ids) + long-term summary + episodes + cached user profile |
+| Embeddings | `src/services/embedding_service.py` | the embed role's client: 2048-dim vectors cut to `EMBEDDING_DIMENSIONS` and re-normalised (ADR-0011) |
 | Write batching | `src/services/passive_buffer.py` | per-chat coalescing; reports ready / due keys, never schedules; restores a failed flush |
 | Persistence | `src/services/memory_backends.py` | in-memory (tests) or Firestore (a fake client in `tests/test_firestore_backend_fake.py`) |
 | Scheduling | `src/services/scheduler_service.py` | pull-style, driven by Cloud Scheduler |
+| Media | `src/services/image_service.py`, `storage_service.py` | LINE image download, resize, base64; GCS uploads with signed URLs (the bucket's lifecycle rule deletes them) |
+| Quoted messages | `src/services/message_cache_service.py` | short-lived in-process cache of recent text and images, so a quote can be recovered (LINE sends only its id) |
+| Rate limit | `src/services/rate_limit_service.py` | per-user sliding window, in process |
 | LINE delivery | `src/services/line_service.py` | reply first (free), push only when the reply certainly failed; an unclear outcome counts as sent; no push is counted, capped or refused (LINE's own monthly quota is the only limit); notes `delivery=reply\|push` for the summary line |
 | Request summary | `src/utils/request_trace.py` | one log line per event: route, every tier walked with its outcome (`skip(<why>)`, `error(<Kind> <status>)`), the answering tier, `delivery` |
-| Settings | `src/config.py` | reads `.env`, then the mounted secret `/secrets/app/app.env`, then the environment (ADR-0008) |
+| Settings | `src/config.py`, `.env.example` | reads `.env`, then the mounted secret `/secrets/app/app.env`, then the environment (ADR-0008); `.env.example` is the one reference for every key, its default and what it does (zh-TW comments); tests check that each of its keys exists in `Settings` (or is deploy-only) and that its Colab and role-table values are the code defaults |
 | JSON recovery | `src/utils/jsonish.py` | pulls a dict out of LLM prose; valid JSON is parsed as is first |
 | Input cleaning | `src/utils/validators.py` | signature check; `sanitize_input` (newlines kept, injection markers stripped) for every incoming text |
+| Prompt fences | `src/utils/fence_labels.py`, `speaker_lines.py` | the labels untrusted text loses before it enters a fenced block; the `〔同一則訊息〕` marker for lines that look like a speaker tag (invariant 13) |
 | LINE text | `src/utils/line_text.py` | Markdown/LaTeX in a reply → plain text (LINE shows markup raw); runs before OpenCC in `output_processor` |
 | GCP metadata | `src/utils/gcp_metadata.py` | access token (cached), project, region, SA email |
 | Dedupe | `src/utils/dedupe.py` | in-process TTL/LRU key set |
+| Logging | `src/utils/logger.py` | the `linebot` logger and its one-line format |
+| Prompts | `prompts/*.md` | the system prompts of the router and the four agents; loaded at startup, not in code |
+| Docs | `README.md`, `CONTEXT.md`, `DEPLOY.md`, `colab/README.md`, `docs/adr/` | one role each: README what it is, the architecture and a quick start; this file how it works; DEPLOY.md operations (zh-TW); colab/README.md the VM side; the ADRs why. Settings are explained only in `.env.example` |
 
 ## Invariants worth knowing
 
@@ -329,7 +346,9 @@ These are load-bearing and easy to break by accident:
 
 ## Testing
 
-`python3 -m pytest -q` — no network, no GCP credentials required;
+`.venv312/bin/python -m pytest -q` (the environment comes from
+`UV_PROJECT_ENVIRONMENT=.venv312 uv sync --locked -p 3.12`; DEPLOY.md,
+"依賴鎖定與本機驗證") — no network, no GCP credentials required;
 `tests/conftest.py` enforces it (sockets reach loopback only, and Settings
 environment variables are dropped at start). The
 `InMemoryBackend` stands in for Firestore; seed it through
@@ -354,6 +373,6 @@ The live gate's Colab path runs against a scripted tunnel, and the control
 plane's contract tests against Colab answers shaped from the pinned
 library's source. None of them reach Google.
 
-`python3 -m ruff check .` must be clean. Config in `pyproject.toml`; the rule
+`.venv312/bin/python -m ruff check .` must be clean. Config in `pyproject.toml`; the rule
 set is deliberately narrow (correctness over style) and each `ignore` carries
 its reason.

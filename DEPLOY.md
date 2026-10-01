@@ -10,7 +10,7 @@
 
 它會自動完成：**檢查 env（含已下架模型 / 舊版 key）、檢查媒體 bucket 是否在免費額度內、確認不會上傳任何密鑰檔、確認 GCP API、Artifact Registry 與 Cloud Tasks queue、送出 Cloud Build（ruff + pytest + 建置並推送 image）、把 `.env` 同步到 Secret Manager 並部署到同一個 Cloud Run service、設定 Cloud Scheduler、smoke check、清理舊 revision / image / secret 版本**。
 
-第一次使用（或還沒做過 GCP 強化）請先跑一次〈GCP 佈建與強化（第一次）〉的 `./scripts/provision_gcp.sh`：它建立最小權限的 service account、Cloud Build 暫存 bucket 與存放 `.env` 的 secret。網路搜尋只用 Tavily，不需要 VM 或 VPC，整個專案維持在 GCP 免費額度內。還沒佈建時部署腳本仍可運作，但會用舊方式（預設 service account、暫存 env 檔）並印出警告。設計理由見 [ADR-0008](docs/adr/0008-secrets-and-identity.md)。
+第一次使用（或還沒做過 GCP 強化）請先跑一次〈GCP 佈建與強化（第一次）〉的 `./scripts/provision_gcp.sh`：它建立最小權限的 service account、Cloud Build 暫存 bucket 與存放 `.env` 的 secret。網路搜尋只用 Tavily，不需要 VM 或 VPC，整個專案維持在 GCP 免費額度內。沒有 `linebot-builder` 與 Cloud Build 暫存 bucket 時部署腳本會在建置前停止（不會改用 US 多區域、不在免費額度內的預設 `gs://<專案>_cloudbuild`）；只缺 runtime 帳號或 secret 時仍可部署，但會用舊方式（service 原本的 service account、暫存 env 檔）並印出警告。設計理由見 [ADR-0008](docs/adr/0008-secrets-and-identity.md)。
 
 > 從 v2（Qwen3.5 / nv-embedqa-e5-v5 / `ORCHESTRATOR_MODEL`）升級？照下面的〈上線前檢查清單〉依序做一次；〈從 v2 升級到 v3〉有其中幾步的細節。
 
@@ -96,13 +96,13 @@ gcloud config set project YOUR_PROJECT_ID
 | `budget` | 只印出主控台建立預算警報的步驟（見〈預算警報〉） |
 | `summary` | 列出還需要你手動處理的事：輪替密鑰、預算警報、LINE webhook redelivery、purge、ar-cleanup-enforce、Colab（選用）的第一次設定，以及最後的 `drop-editor`（見下） |
 
-佈建完成後照常執行 `./scripts/deploy_cloud_run.sh`：它偵測到 `linebot-builder` 與 staging bucket 就用它們跑 Cloud Build，偵測到 `linebot-runtime` 與 `linebot-dotenv` 就改用 secret 部署（見〈標準部署〉）。
+佈建完成後照常執行 `./scripts/deploy_cloud_run.sh`：它用 `linebot-builder` 與 staging bucket 跑 Cloud Build（缺一就在建置前停止），偵測到 `linebot-runtime` 與 `linebot-dotenv` 就改用 secret 部署（見〈標準部署〉）。
 
 ### 最後一步：`drop-editor`（Phase 9）
 
 只能單獨用 `--step` 執行，全部步驟一起跑時不會執行。它移除 Compute Engine 預設 service account（`<專案編號>-compute@developer.gserviceaccount.com`）的專案層級 `roles/editor`，**帳號本身不會刪除**。移除前先確認替代的帳號都已就位，缺任何一項就全部列出並停止（dry-run 也一樣）：
 
-- `linebot-runtime`、`linebot-builder` 都存在，staging bucket 也在本專案（否則部署的 Cloud Build 會改用預設 service account）
+- `linebot-runtime`、`linebot-builder` 都存在，staging bucket 也在本專案（否則部署會在建置前停止）
 - Cloud Run service `linebot-cloud-agent`（`CLOUD_RUN_SERVICE_NAME`）以 `linebot-runtime` 執行
 - 沒有其他 Cloud Run service（所有 region；沒指定 service account 的也算）、`CLOUD_RUN_REGION` 的 Cloud Scheduler job 或 VM（包括已停止的）以 compute 預設 service account 執行
 
@@ -167,7 +167,7 @@ cp .env.example .env
 注意：
 
 - 帶 `:free` 的模型走 OpenRouter，不帶的走 build.nvidia.com；`OPENROUTER_ALLOW_PAID=false`（預設）時角色表裡的付費 OpenRouter id 會讓啟動直接失敗
-- Colab 層要設定 `COLAB_ENABLED=true` 才會啟用（見下方〈Colab 層〉），否則一律停用（`/health/detail` 會列出原因）；`MODEL_PATH_PREFERENCE=colab`（預設）讓各角色先走 Colab、nimble 在 API router 之前路由，而且通過限流的觸發訊息會記錄需求並自動開機；`api` 則先走 NVIDIA → OpenRouter 與原本的 API router，Colab 層排到最後、只在 session 已經 READY（例如管理員 `!colab on`）時使用，nimble 只在 API router 失敗時使用，訊息不會自動開機。Colab 隨需開機、閒置 15 分鐘釋放；開機完成（READY）前 Colab 層一律立刻略過（不發任何網路請求），每則訊息都由 NVIDIA → OpenRouter 直接回覆，不會等 Colab；READY 之後 Colab 先回答，期限和其他請求一樣是事件時間 + `REPLY_WINDOW_SECONDS`（90 秒，私訊與群組都一樣），後面還有 API 層的 Colab 層最多用到期限前 20 秒（`COLAB_API_RESERVE_SECONDS`；期限短時最多一半，不論思考等級），Colab 變慢時 API 層仍有時間回覆；送出一律先試 reply，LINE 拒絕（reply token 已失效）才改用 push
+- Colab 層要設定 `COLAB_ENABLED=true` 才會啟用（見下方〈Colab 層〉），否則一律停用（`/health/detail` 會列出原因）。`MODEL_PATH_PREFERENCE=colab`（預設）讓各角色先走 Colab、通過限流的觸發訊息自動開機；`api` 讓 Colab 層排到最後、只在已 READY 時使用，只有 `!colab on` 會開機。READY 前 Colab 層一律立刻略過，回覆不會等它；READY 後 Colab 層最多用到回答期限（`REPLY_WINDOW_SECONDS`）前 20 秒（期限短時最多一半），留給 API 層
 - 取樣：層自己的 `temperature` 優先，其次是模型卡建議值（NVIDIA Nemotron Ultra / Super：temperature 1.0、top_p 0.95；muse-glimmer：0.6），最後才是 `CHAT_TEMPERATURE` 等 agent 設定（只影響 OpenRouter 這些沒有模型卡取樣的層）。Colab 的 qwen3.8 固定用 Qwen 建議的取樣（不思考 0.7 / top_p 0.8 / top_k 20 / presence penalty 1.5，思考 1.0 / 0.95 / 20），除非該層自己設 `temperature`。router 的 Super 與 Ultra 層、utility 的 Super 層刻意維持低溫（0.1 / 0.1 / 0.2），讓路由 JSON、搜尋查詢與記憶摘要穩定
 - OpenRouter 的 `nvidia/nemotron-3-*:free` 由 NVIDIA 託管，可能與 NIM 同時失效，所以排在各角色最後
 - 2026-10-01 起預設不再使用 Gemma（NIM 的 Gemma 4 31B 實測每次都卡住，OpenRouter 的 Gemma `:free` 每次都回 429）：router、chat、utility 改由 Nemotron 3 Ultra 備援；Ultra 只收文字、沒有結構化輸出，所以 vision 的備援改為 OpenRouter qwen3.8，router 的 Ultra 層只靠 prompt 要求 JSON，由 orchestrator 的容錯解析器（加一次修復提示）讀取。`MODEL_ROLES` 若還寫著 Gemma 的 id，`check-v3` 會提醒（不擋部署），請自行改掉
@@ -260,14 +260,19 @@ Cloud Run 用 request-based 計費（`--cpu-throttling`）：只有在處理 req
 設定怎麼進到 Cloud Run（已佈建時）：
 
 - `.env` 去掉部署用的 key（`GCP_PROJECT_ID`、`CLOUD_RUN_*`、`DEPLOY_*`、`PORT`、`HOST`、`GOOGLE_APPLICATION_CREDENTIALS`）後轉成單引號 dotenv blob（`python3 scripts/envfile.py to-dotenv`），比對 `linebot-dotenv` 最新版本的 SHA-256（不印出任何一方），**只有內容改變時才新增版本**
+- `.env` 只在建置前讀取與檢查一次：blob 留在記憶體（不寫檔），上傳的就是檢查過的那一份；建置的幾分鐘內改了 `.env` 不會被部署，要部署新內容請再跑一次部署
+- `.env` 的 key 不分大小寫，與程式（pydantic-settings）相同：`internal_cron_secret=...` 等同 `INTERNAL_CRON_SECRET=...`；同一個 key 寫成幾種大小寫時，以最後一行為準
 - Cloud Run 以 `linebot-runtime` 執行，secret 掛載在 `/secrets/app/app.env` 並**釘住版本號**（`--set-secrets=/secrets/app/app.env=linebot-dotenv:N`）；唯一的一般環境變數是 `APP_VERSION`（`--set-env-vars`，它會清掉舊版部署留下的所有明文環境變數）
+- service 的 volume 全由部署決定：每次都加上 `--clear-volume-mounts --clear-volumes`，template 裡只留下這次掛載的 secret。只用 `--set-secrets` 時，gcloud 會把上一次部署掛載的 secret volume 留在 template 裡（不再掛載），之後每個 revision 都帶著它們（2026-10-01 線上的 template 有 4 個 secret volume、只掛載 2 個）
+- runtime 帳號在 `linebot-dotenv`（與要掛載的 `linebot-colab-adc`）上沒有直接的 `roles/secretmanager.secretAccessor` 時只**警告**：專案層級或群組的授權也有效，但 secret 的 IAM policy 看不出來；真的讀不到時 Cloud Run 會在建置後拒絕這個 revision。`provision_gcp.sh --step secrets --apply` / `--step colab-secret --apply` 會授權給 `linebot-runtime`
 - 程式依序讀 `.env`（本機）→ `/secrets/app/app.env`（後者優先，不存在就略過），真正的環境變數永遠最優先
 - `.env` 的值若含 `${`（python-dotenv 會把它當變數展開）、以反斜線結尾或含 CR，或引號寫壞（引號沒有關上、關閉引號後面還有非註解文字；python-dotenv 會直接略過這個 key），部署會在建置前停止並列出 key 名稱
 - 讀取最新版本比對時關閉 gcloud 的檔案 log（`CLOUDSDK_CORE_DISABLE_FILE_LOGGING=true`）：gcloud 會把自己印出的所有內容複製到 `~/.config/gcloud/logs`（保留約 30 天）
-- smoke check 通過後，銷毀「任何 region 的任何 Cloud Run service 的 revision 都沒有釘住、也不在最新 max(2, `DEPLOY_KEEP_REVISIONS`) 個之內」的 secret 版本（釘住的版本直接從 revision 讀出：先用 `gcloud run services list` 找出所有有 service 的 region，再逐一讀它們的 revision，讀不到就整個略過清理。所以部署失敗留下的版本不會把上一個 revision 回滾要用的版本擠掉；`linebot-dotenv` 整個專案只有一個，用 `--service-name` 或在其他 region 部署的另一個 service 也不會銷毀別的 service 釘住的版本）；`--skip-smoke` 時不會銷毀任何版本，有效版本超過 3 個時會警告。停用（disabled）的版本仍會計費，只有銷毀才免費
+- smoke check 通過後，銷毀「任何 region 的任何 Cloud Run service 的 revision 都沒有掛載、也不在最新 max(2, `DEPLOY_KEEP_REVISIONS`) 個之內」的 secret 版本（版本直接從 revision 讀出：先用 `gcloud run services list` 找出所有有 service 的 region，再逐一讀它們的 revision，讀不到就整個略過清理；只算容器真正掛載（`volumeMounts`）的 volume，沒有掛載的殘留 volume 不算，但完全讀不到掛載資訊的 revision 會保守地把它所有 volume 都算進去。所以部署失敗留下的版本不會把上一個 revision 回滾要用的版本擠掉；`linebot-dotenv` 整個專案只有一個，用 `--service-name` 或在其他 region 部署的另一個 service 也不會銷毀別的 service 掛載的版本）；`--skip-smoke` 時不會銷毀任何版本，有效版本超過 3 個時會警告。停用（disabled）的版本仍會計費，只有銷毀才免費
 - 部署不接 VPC（不加 `--network`、`--subnet`、`--vpc-egress`）：LINE、NVIDIA、OpenRouter、Tavily 都走 Cloud Run 自己的對外連線。先前曾以 Direct VPC egress 部署過的 service 不會因此斷開，需要時手動 `gcloud run services update SERVICE --region REGION --clear-network`
-- `.env` 有 `COLAB_ENABLED=true` 時（見〈Colab 層〉）：把 `linebot-colab-adc` 最新一個 **enabled** 版本**釘住版本號**掛載在 `/secrets/colab/adc.json`（與 dotenv 放在同一個 `--set-secrets`，例如 `--set-secrets=/secrets/app/app.env=linebot-dotenv:N,/secrets/colab/adc.json=linebot-colab-adc:M`），回滾時 token 跟著 revision 走；部署本身**從不讀取** token 內容。secret 不存在、沒有 enabled 版本或尚未佈建時只警告（Colab 層維持停用，服務照常部署）；`linebot-runtime` 讀不到它時在建置前停止（Cloud Run 會拒絕這個 revision），提示 `provision_gcp.sh --step colab-secret --apply`。`COLAB_ENABLED` 關閉時不掛載、也不碰這個 secret。smoke check 通過後，同樣銷毀沒有 revision 釘住、也不在最新 max(2, `DEPLOY_KEEP_REVISIONS`) 個之內的 `linebot-colab-adc` 版本
-- 尚未佈建時：改用 `$TMPDIR` 裡只有自己可讀的 env-vars YAML（`--env-vars-file`，含 `APP_VERSION`，部署完立即刪除），並印出「Run ./scripts/provision_gcp.sh first」警告。只有 gcloud 回報 NOT_FOUND 才會退回舊方式；權限、API、登入或網路錯誤會直接停止部署。Cloud Run service 已經掛載 `linebot-dotenv` 時（例如 secret 或 `linebot-runtime` 被誤刪），部署會拒絕改回明文環境變數，除非加上 `--allow-env-fallback`
+- `.env` 有 `COLAB_ENABLED=true` 時（見〈Colab 層〉）：把 `linebot-colab-adc` 最新一個 **enabled** 版本**釘住版本號**掛載在 `/secrets/colab/adc.json`（與 dotenv 放在同一個 `--set-secrets`，例如 `--set-secrets=/secrets/app/app.env=linebot-dotenv:N,/secrets/colab/adc.json=linebot-colab-adc:M`），回滾時 token 跟著 revision 走；部署本身**從不讀取** token 內容。secret 不存在、沒有 enabled 版本或尚未佈建時只警告（Colab 層維持停用，服務照常部署）；runtime 帳號在它上面沒有直接的讀取授權時也只警告（見上面），提示 `provision_gcp.sh --step colab-secret --apply`。`COLAB_ENABLED` 關閉時不掛載、也不碰這個 secret。smoke check 通過後，同樣銷毀沒有 revision 掛載、也不在最新 max(2, `DEPLOY_KEEP_REVISIONS`) 個之內的 `linebot-colab-adc` 版本
+- `linebot-builder` 或 `gs://<專案>-cb-src-usw1` 不存在時，部署在建置前**停止**，不會退回 Cloud Build 預設的 `gs://<專案>_cloudbuild`（US 多區域，不在免費額度內）：先跑 `./scripts/provision_gcp.sh --step staging-bucket --apply`，再跑 `--step builder-sa --apply`
+- `linebot-runtime` 或 `linebot-dotenv` 尚未佈建時：改用 `$TMPDIR` 裡只有自己可讀的 env-vars YAML（`--env-vars-file`，含 `APP_VERSION`，建置前產生、部署完立即刪除），並印出「Run ./scripts/provision_gcp.sh first」警告。只有 gcloud 回報 NOT_FOUND 才會退回舊方式；權限、API、登入或網路錯誤會直接停止部署。Cloud Run service 已經掛載 `linebot-dotenv` 時（例如 secret 或 `linebot-runtime` 被誤刪），部署會拒絕改回明文環境變數，除非加上 `--allow-env-fallback`
 
 如果你想明確指定專案、區域、service：
 
@@ -332,6 +337,8 @@ Cloud Run 用 request-based 計費（`--cpu-throttling`）：只有在處理 req
 ./scripts/deploy_cloud_run.sh --skip-smoke
 ```
 
+沒有 smoke check 就無法確認新 revision 正常，所以這次不刪除任何舊 revision、image，也不銷毀任何 secret 版本（留給下一次 smoke check 通過的部署清理）。
+
 ### 不重新 enable API
 
 ```bash
@@ -356,15 +363,15 @@ Cloud Run 用 request-based 計費（`--cpu-throttling`）：只有在處理 req
 2. 驗證必要 env key 是否存在
 3. 上傳檢查：`gcloud meta list-files-for-upload` 列出的檔案只要含 `.env*`（`.env.example` 除外）、`.cloudrun-env*`、`settings.local.json`、`.claude/`、`credentials.json`、`*.bak` 或 migrate-v3 的備份檔（`<檔名>.bak.<時間>`）就停止；`--env-file` 指到 repo 裡的檔案（不論檔名，例如 `prod.env`）時，它也不能在上傳清單裡，而且必須被 git 忽略，否則停止（放到 repo 外面，或加進 `.gitignore` 與 `.gcloudignore`）
 4. 若有設定 `GCS_BUCKET_NAME`：bucket 必須是 `US-WEST1` / `US-CENTRAL1` / `US-EAST1` 的 STANDARD bucket（Always Free 5 GB），否則停止並印出建立新 bucket 的指令
-5. 偵測佈建結果：`linebot-builder` 存在且本專案列得出 `gs://<專案>-cb-src-usw1` → Cloud Build 以 `linebot-builder` 執行並把原始碼放到該 bucket；`linebot-runtime`（或 `CLOUD_RUN_SERVICE_ACCOUNT`）與 `linebot-dotenv` 都存在 → secret 部署（並先檢查 `.env` 能否轉成 dotenv blob）。gcloud 回報 NOT_FOUND 時各自退回舊方式並警告（service 已掛載 `linebot-dotenv` 時則拒絕，除非 `--allow-env-fallback`）；其他查詢錯誤直接停止
+5. 偵測佈建結果：`linebot-builder` 存在且本專案列得出 `gs://<專案>-cb-src-usw1` → Cloud Build 以 `linebot-builder` 執行並把原始碼放到該 bucket；兩者缺一就**停止**（不會退回預設的 `gs://<專案>_cloudbuild`：US 多區域，不在免費額度內），提示先跑 `provision_gcp.sh --step staging-bucket --apply` 再跑 `--step builder-sa --apply`。`linebot-runtime`（或 `CLOUD_RUN_SERVICE_ACCOUNT`）與 `linebot-dotenv` 都存在 → secret 部署：此時就把 `.env` 轉成 dotenv blob（留在記憶體、不寫檔，之後上傳的就是這一份），並檢查 runtime 帳號在 secret 上有沒有直接的 `roles/secretmanager.secretAccessor`（沒有只警告）；gcloud 回報 NOT_FOUND 時退回 env-vars YAML 並警告（YAML 也在此時產生；service 已掛載 `linebot-dotenv` 時則拒絕，除非 `--allow-env-fallback`）；其他查詢錯誤直接停止。產生 blob 或 YAML 後再比對 `.env` 的 checksum：第 1 步之後有人改過 `.env` 就停止（不建置、不上傳），重新部署即可
 6. 自動確保 `cloudbuild.googleapis.com`、`run.googleapis.com`、`artifactregistry.googleapis.com`、`iamcredentials.googleapis.com`、`cloudresourcemanager.googleapis.com`、`cloudscheduler.googleapis.com`、`cloudtasks.googleapis.com` 已啟用，並確保 Artifact Registry repository 與 Cloud Tasks queue 存在（`TASKS_MODE=inline` 時略過 queue）
-7. 送出 `cloudbuild.yaml`：在與 image 相同的 `python:3.12-slim`（digest 固定）上以 `--require-hashes` 安裝 `requirements-dev.lock`，跑 `ruff` + `pytest` + `compileall`，然後建置並推送 image（不上傳密鑰、不部署）
-8. secret 部署：`.env` 有變才新增 `linebot-dotenv` 版本，`gcloud run deploy --service-account linebot-runtime@... --set-secrets=/secrets/app/app.env=linebot-dotenv:N --set-env-vars=APP_VERSION=<tag>`（`COLAB_ENABLED=true` 時同一個旗標再加上 `,/secrets/colab/adc.json=linebot-colab-adc:M`，建置前先確認版本與讀取權限）；尚未佈建：在 `$TMPDIR` 產生只有自己可讀的 env-vars YAML，`gcloud run deploy --env-vars-file ... --clear-secrets`（關閉 gcloud 的檔案 log：gcloud 會把解析後的每個旗標寫進 `~/.config/gcloud/logs` 的 DEBUG log，`--env-vars-file` 解析出來就是 `.env` 的每個值），部署完立即刪除。
+7. 送出 `cloudbuild.yaml`：把 `uv.lock`（含 `dev` group）export 成 hash 鎖定的清單，在與 image 相同的 `python:3.12-slim`（digest 固定）上以 `--require-hashes --no-deps` 安裝，跑 `ruff` + `pytest` + `compileall`，然後建置並推送 image（不上傳密鑰、不部署；見〈依賴鎖定與本機驗證〉）
+8. secret 部署：建置前那份 blob 有變才新增 `linebot-dotenv` 版本，`gcloud run deploy --service-account linebot-runtime@... --set-secrets=/secrets/app/app.env=linebot-dotenv:N --set-env-vars=APP_VERSION=<tag>`（`COLAB_ENABLED=true` 時同一個旗標再加上 `,/secrets/colab/adc.json=linebot-colab-adc:M`，建置前先確認版本與讀取權限）；尚未佈建：用建置前產生、只有自己可讀的 env-vars YAML，`gcloud run deploy --env-vars-file ... --clear-secrets`（關閉 gcloud 的檔案 log：gcloud 會把解析後的每個旗標寫進 `~/.config/gcloud/logs` 的 DEBUG log，`--env-vars-file` 解析出來就是 `.env` 的每個值），部署完立即刪除。兩種都加上 `--clear-volume-mounts --clear-volumes`：gcloud 先清掉所有掛載與 volume，再只加回 `--set-secrets` 要掛的。
 9. 將 100% 流量切到最新 revision
 10. 若有設定 `GCS_BUCKET_NAME`，檢查 / 補上 bucket 的 3 天 lifecycle 保底刪除規則；簽 URL 需要 runtime service account 對自己的 `roles/iam.serviceAccountTokenCreator`：`linebot-runtime` 由 `provision_gcp.sh --step runtime-sa` 授權一次，其他帳號（`CLOUD_RUN_SERVICE_ACCOUNT`，或尚未佈建時 service 原本的帳號）缺少時由部署補上（沒有它，圖片與語音回覆會退回文字）
 11. 給 runtime service account queue 的 `roles/cloudtasks.enqueuer`，開放 LINE webhook 的公開存取，建立 / 更新或刪除 Cloud Scheduler job
 12. 對 `/health` 和 `/webhook` 做 smoke check
-13. 清理舊 revision（只數 Ready 的）/ image（Artifact Registry 清理政策已強制執行、而保留中的 revision 用到的 image 不在最新 2 個之內時會警告）；smoke check 通過後銷毀任何 region 都沒有 revision 釘住的舊 `linebot-dotenv` 版本（有掛載時也包括 `linebot-colab-adc`）
+13. smoke check 通過後才清理：舊 revision（只數 Ready 的）/ image（Artifact Registry 清理政策已強制執行、而保留中的 revision 用到的 image 不在最新 2 個之內時會警告），以及任何 region 都沒有 revision 掛載的舊 `linebot-dotenv` 版本（有掛載時也包括 `linebot-colab-adc`）。`--skip-smoke` 時三者都保留
 
 ---
 
@@ -876,7 +883,7 @@ gcloud run services update-traffic "${SERVICE_NAME}" \
 ## 運行注意事項
 
 - `/health` 可能回 `200` 但 `ready_for_webhook=false`，要看 payload 不能只看 HTTP status。ready 的條件是 LINE 憑證齊全，且 chat 角色至少有一個不依賴 Colab 的可用層（`NVIDIA_API_KEY` 或 `OPENROUTER_API_KEY` 其一即可）；原因列在 `/health/detail` 的 `warnings`。
-- **回覆期限（reply window）**：每個請求的一般回答（不需思考）都要在 LINE 事件時間 + `REPLY_WINDOW_SECONDS`（90 秒）內完成，私訊與群組都一樣，不論由 Colab 或 API 層回答；Colab 是第一個可用層時最多用到期限前 20 秒，留給 API 備援層。需要思考的回答與生圖，不論私訊或群組，都可以用到 `TURN_DEADLINE_SECONDS`（從開始處理起算 240 秒）；開始回答時期限只剩不到 `MIN_TIER_SECONDS` 的一般回答（延遲或重送的事件，或路由太慢用掉了期限）也改用這個 turn 期限。LINE 的 reply token 只保證約 1 分鐘有效，但送出一律先試免費的 reply，不會因為已經過了多久就略過；LINE 確定拒絕（4xx，例如 reply token 無效或過期，或請求根本沒送出）才改用 push，結果不明（送出後逾時、5xx）視為已送出、不再 push，push 不計數也不設上限。期限內每一層模型只拿「自己的上限」與「剩餘時間」中較小的那個，思考層合計最多只用剩餘時間的一半；網路搜尋必須在期限前 20 秒結束。生圖：FLUX.2 klein 被安全過濾擋下時改用 FLUX.1-dev 再試一次，仍被擋下就用繁中告訴使用者是圖片模型的安全過濾擋下、請換個描述，不回一般的失敗訊息。Colab 還沒 READY 時一律略過，不會讓回覆等它。
+- **回覆期限（reply window）**：每個請求的一般回答（不需思考）都要在 LINE 事件時間 + `REPLY_WINDOW_SECONDS`（90 秒）內完成，私訊與群組都一樣，不論由 Colab 或 API 層回答；Colab 是第一個可用層時最多用到期限前 20 秒，留給 API 備援層。需要思考的回答與生圖，不論私訊或群組，都可以用到 `TURN_DEADLINE_SECONDS`（從開始處理起算 240 秒）；開始回答時期限只剩不到 `MIN_TIER_SECONDS` 的一般回答（延遲或重送的事件，或路由太慢用掉了期限）也改用這個 turn 期限。LINE 的 reply token 只保證約 1 分鐘有效，但送出一律先試免費的 reply，不會因為已經過了多久就略過；LINE 確定拒絕（4xx，例如 reply token 無效或過期，或請求根本沒送出）才改用 push，結果不明（送出後逾時、5xx）視為已送出、不再 push，push 不計數也不設上限。期限內每一層模型只拿「自己的上限」與「剩餘時間」中較小的那個，思考層合計最多只用剩餘時間的一半；網路搜尋必須在期限前 20 秒結束。生圖被安全過濾擋下時的處理見 `.env.example` 的 image 角色說明。Colab 還沒 READY 時一律略過，不會讓回覆等它。
 - 語音和圖片生成需要 `GCS_BUCKET_NAME`，沒設定時文字回覆仍正常。
 - 目前只支援**語音輸出**，不支援把使用者傳來的音訊自動轉文字。
 - 主 prompt 記憶是「1 份長期摘要 + 上次壓縮後的近期文字訊息」（累積到 6 則開始壓縮；上次壓縮不到 `COMPACTION_DEBOUNCE_SECONDS`＝120 秒時，等下一則訊息再壓縮，累積到安全上限的一半則立即壓縮）。近期訊息依 LINE 收到的時間排序，壓縮完成時只移除被摘要的那幾則（依訊息 id），壓縮期間進來的訊息不會遺失。預設使用 **in-memory backend**（per-instance），重部署 / cold start 會重置；要長期保存請啟用下方的 **Firestore backend**。
@@ -901,7 +908,9 @@ gcloud run services update-traffic "${SERVICE_NAME}" \
 
 ## Colab 層
 
-Colab A100 上的 Ollama 0.35.0 跑 `qwen3.8:27b-mtp-q4_K_M`（對話、視覺、思考）與 `nimble:9b`（`/v1/systemone` 路由），所有使用者都先走 Colab（Colab 條款禁止提供網路服務與讓第三方使用 runtime，這個風險已由你接受，見 [ADR-0010](docs/adr/0010-colab-ollama-tier.md)）。**任何訊息都不會等 Colab**：READY 前一律由 NVIDIA → OpenRouter 立即回覆。READY 後由 Colab 先回答，期限和其他請求一樣是事件時間 + `REPLY_WINDOW_SECONDS`（90 秒），Colab 層最多用到期限前 20 秒；送出一律先試 reply，reply token 已失效才改用 push。bot 放棄一個 Colab 請求（時間用完）時會關閉連線，VM 上的 auth proxy 隨即中止對應的 Ollama 請求，GPU 不會繼續算沒人要的回答；`auth_proxy.log` 的 `cancelled after N s` 紀錄從**下一次 Colab 開機**起才有（VM 的檔案在開機時上傳），也可以用它確認 Cloudflare 有把斷線傳到 VM（見 [colab/README.md](colab/README.md)）。開機、保活、釋放都由每分鐘的 cron 決定，慢的步驟走 `colab` Cloud Tasks；VM 端的程式與疑難排解見 [colab/README.md](colab/README.md)。
+Colab A100 上的 Ollama 0.35.0 跑 `qwen3.8:27b-mtp-q4_K_M`（對話、視覺、思考）與 `nimble:9b`（`/v1/systemone` 路由），所有使用者都先走 Colab（Colab 條款禁止提供網路服務與讓第三方使用 runtime，這個風險已由你接受，見 [ADR-0010](docs/adr/0010-colab-ollama-tier.md)）。**任何訊息都不會等 Colab**：READY 前一律由 NVIDIA → OpenRouter 立即回覆。READY 後由 Colab 先回答，期限和其他請求一樣是事件時間 + `REPLY_WINDOW_SECONDS`（90 秒），Colab 層最多用到期限前 20 秒；送出一律先試 reply，reply token 已失效才改用 push。開機、保活、釋放都由每分鐘的 cron 決定，慢的步驟走 `colab` Cloud Tasks。
+
+這一節只放操作步驟。VM 端的程式、協定、釘住的 digest、VRAM 與疑難排解（包括 bot 放棄請求時 auth proxy 如何中止 Ollama、`auth_proxy.log` 的 `cancelled after N s`）見 [colab/README.md](colab/README.md)；每個 Colab 設定的說明在 `.env.example` 的 Colab 區塊。
 
 ### 第一次設定
 
@@ -920,10 +929,10 @@ Colab A100 上的 Ollama 0.35.0 跑 `qwen3.8:27b-mtp-q4_K_M`（對話、視覺�
    - `FIRESTORE_ENABLED=true`（session 狀態存在 `{prefix}_colab/state`）
    - `COLAB_SHARED_SECRET`：至少 32 字元的隨機字串，例如 `python3 -c "import secrets; print(secrets.token_urlsafe(48))"`。每次 session 的註冊金鑰與 Ollama bearer 都由它和 session id 導出，其他密鑰不會存在任何地方；換掉它會讓正在跑的 session 失效
    - `LINE_ADMIN_USER_IDS`：可以使用 `!colab` 的 LINE userId（逗號分隔）；私訊 bot `!whoami` 就能看到自己的 userId（可以先部署一次、傳 `!whoami`，再補上）
-   - `COLAB_ADC_PATH` 維持預設 `/secrets/colab/adc.json`（部署把 token 掛載在這裡；不一致時部署會警告）
+   - `COLAB_ADC_PATH` 維持預設 `/secrets/colab/adc.json`（部署把 token 掛載在這裡；不一致時部署會警告）。**不要**把 `GOOGLE_APPLICATION_CREDENTIALS` 指到這個檔案：那會讓 Firestore、GCS、Cloud Tasks 全部改用這個個人帳號
    - `COLAB_ENABLED=true`，加上第一次實跑用的 `COLAB_DRY_RUN=true` 與 `MODEL_PATH_PREFERENCE=api`：這樣只有 `!colab on` 會開機，一般訊息照舊走 API、不會觸發開機
    - Cloud Tasks 必須可用（`INTERNAL_TASKS_SECRET` 有值、`TASKS_MODE` 不是 `inline`）：控制器的 `colab` 任務一律排進 Cloud Tasks、從不在 cron request 內執行；部署會另建專用 queue `CLOUD_TASKS_COLAB_QUEUE`（預設 `linebot-colab`，2 個並行名額），不佔 LINE 事件的 queue
-   - 選用：`COLAB_TUNNEL_MODE=named` 加 `COLAB_TUNNEL_HOST` / `COLAB_TUNNEL_TOKEN`（自己的 Cloudflare 網域；空白時只接受 `https://<名稱>.trycloudflare.com`）、`COLAB_ROUTER_ENABLED`（nimble 路由開關）、`COLAB_ROUTER_CONFIDENCE` / `COLAB_ROUTER_THINK_ON` / `COLAB_ROUTER_THINK_OFF`（路由門檻，預設 0.75 / 0.85 / 0.15 是暫定的嚴格值，要用 `scripts/evals/routing_eval.py` 重新調整）、`COLAB_CHAT_THINK` / `COLAB_DEEP_THINK`、`COLAB_ACCOUNT_DEDICATED=true`（帳號真的只給 bot 用時，帳號上不認得的 runtime 也會被釋放）
+   - 選用（說明見 `.env.example` 的 Colab 區塊）：named tunnel（`COLAB_TUNNEL_MODE=named` 加 `COLAB_TUNNEL_HOST` / `COLAB_TUNNEL_TOKEN`；在 Cloudflare 建立 tunnel，把公開網址指到 VM 上的 `http://127.0.0.1:8081`（auth proxy））、`COLAB_ROUTER_*`（nimble 路由開關與暫定門檻，之後用〈路由評測〉重新調整）、`COLAB_CHAT_THINK` / `COLAB_DEEP_THINK`、`COLAB_ACCOUNT_DEDICATED=true`（帳號真的只給 bot 用時）
 
    缺 Firestore、`COLAB_SHARED_SECRET` 太短、沒有 `INTERNAL_CRON_SECRET`、讀不到 token 或在 Cloud Run 上沒有 Cloud Tasks 時，服務照常啟動但 Colab 層維持停用，原因記在 WARNING log 與 `/health/detail` 的 `colab.reason`。
 4. **部署**：`./scripts/deploy_cloud_run.sh`。輸出應有 `Mounting linebot-colab-adc version N at /secrets/colab/adc.json`；部署後 `/health/detail` 的 `colab.enabled` 是 `true`。
@@ -932,24 +941,24 @@ Colab A100 上的 Ollama 0.35.0 跑 `qwen3.8:27b-mtp-q4_K_M`（對話、視覺�
    2. `.venv312/bin/python scripts/live_gate.py --path colab`：`colab.probe`（經 tunnel 與 auth proxy 跑 bot 的 readiness probe）應為 PASS，其他三項 SKIP（乾跑沒有推論）。gate 以本機 ADC 讀 Firestore 的 session 文件，先執行 `gcloud auth application-default login`，用**能讀這個專案 Firestore 的帳號**（通常是你自己），不是 Colab 專用帳號；bearer 由 `.env` 的 `COLAB_SHARED_SECRET` 推導，不會印出。
    3. `!colab off`：`DRAINING` → `IDLE`，runtime 被釋放。另外建議再跑一次、不下 `!colab off`，確認控制器在 `COLAB_IDLE_TTL_SECONDS`（15 分鐘）後自己釋放。
    4. 確認沒有留下 runtime：`!colab status` 是 `IDLE`；用專用帳號在 Colab 網頁的「管理工作階段」看不到 runtime。
-6. **一次真正的 A100**：兩個模型的 digest 都已釘在 `colab/versions.json`（路由模型在 2026-09-30 換成 `nimble:9b`，見 ADR-0010）。qwen3.8 與釘住的不一致、或沒有完全載入 GPU 時，每次開機都會失敗並自我釋放，連續 3 次後 Colab 層停用；nimble 沒拉到、不一致或沒有完全載入 GPU 時照常 READY（載入 nimble 時若踢掉了 qwen3.8，VM 會卸載 nimble、重新載入 qwen3.8），但這個 session 不用 nimble，路由改由規則與 API 路由決定（見 [colab/README.md](colab/README.md)〈釘住的 digest〉與〈VRAM〉）。`COLAB_DRY_RUN=false`、部署、`!colab on`，約 4–8 分鐘後 READY，再跑 `.venv312/bin/python scripts/live_gate.py --path colab`，四項都要 PASS：readiness probe（兩個模型都完全在 VRAM）、qwen3.8 的繁中回覆（think=`COLAB_CHAT_THINK`）、紅色圓形 PNG 的視覺、nimble 路由決定。記下 assign 到 READY 的時間、`!colab status` 的 CU 每小時用量（約 5.4）、`/health/detail` 的 `colab.gpu`（應是 40 GB 的 A100，不是 80 GB 的 high-mem；`chat_on_gpu`、`router_on_gpu`、`used_mib` 是 warm-up 後的 VRAM，照 colab/README.md〈VRAM〉記錄），再用 `scripts/evals/routing_eval.py` 重新調整 `COLAB_ROUTER_*` 門檻；可以的話在群組同時送兩則訊息確認忙碌閘門會改走 API，最後 `!colab off`。
+6. **一次真正的 A100**：兩個模型的 digest 都已釘在 `colab/versions.json`。qwen3.8 不符或沒有完全在 GPU 上時開機會失敗並自我釋放（連續 3 次後 Colab 層停用）；nimble 有問題時照常 READY，只是這個 session 不用 nimble 路由（細節見 [colab/README.md](colab/README.md)〈釘住的 digest〉與〈VRAM〉）。`COLAB_DRY_RUN=false`、部署、`!colab on`，約 4–8 分鐘後 READY，再跑 `.venv312/bin/python scripts/live_gate.py --path colab`，四項都要 PASS：readiness probe（兩個模型都完全在 VRAM）、qwen3.8 的繁中回覆（think=`COLAB_CHAT_THINK`）、紅色圓形 PNG 的視覺、nimble 路由決定。記下 assign 到 READY 的時間、`!colab status` 的 CU 每小時用量（約 5.4）、`/health/detail` 的 `colab.gpu`（應是 40 GB 的 A100，不是 80 GB 的 high-mem；`chat_on_gpu`、`router_on_gpu`、`used_mib` 是 warm-up 後的 VRAM，照 colab/README.md〈VRAM〉記錄），再用 `scripts/evals/routing_eval.py` 重新調整 `COLAB_ROUTER_*` 門檻；可以的話在群組同時送兩則訊息確認忙碌閘門會改走 API，最後 `!colab off`。
 7. **對所有人開啟**：A100 那次正常後，把 `MODEL_PATH_PREFERENCE` 改回 `colab`（預設，也可以刪掉這一行）並部署。之後通過限流的觸發訊息會讓控制器開機（CU 餘額扣掉一次開機加一次閒置（約 2.7 CU）仍 ≥ `COLAB_MIN_CU_BALANCE`、當日用量加上它仍 ≤ `COLAB_DAILY_CU_CAP` 時），閒置 15 分鐘或滿 11 小時釋放。
 
 關閉：`!colab off` 立即生效（session 會釋放，`!colab on` 恢復）；要完全停用就設 `COLAB_ENABLED=false` 再部署，部署會同時卸下 token 的掛載。
 
 ### 重新產生 token
 
-token 在被撤銷、6 個月沒用或被 100 個上限擠掉時失效。控制器看到 `invalid_grant` 或 `Reauthentication is needed` 會進入 `DISABLED` 並記錄 ERROR（`!colab status` 會寫原因），回覆不受影響（全部走 API 層）。處理方式：
+token 在這些情況會失效：被撤銷、**6 個月沒用**（每日的孤兒對帳會持續用它，正常不會發生）、被 **100 個上限**擠掉（gcloud 的 `application-default login` 與 colab-cli 的 oauth2 登入共用同一個 Cloud SDK OAuth client（`764086051850-…`），這個帳號每登入一次就多一個 token，超過 100 個時最舊的會被默默撤銷，所以專用帳號不要再做其他 gcloud／colab 登入），或 Workspace 管理員的政策（session control、限制 scope）。控制器看到 `invalid_grant`、`invalid_client` 或 `Reauthentication is needed` 會進入 `DISABLED` 並記錄 ERROR（`!colab status` 會寫原因），回覆不受影響（全部走 API 層）；token 端點只是暫時出錯（502、HTML 頁面、沒有 token 的 200）時算暫時性錯誤，下一輪重試，不會 DISABLED。進入 DISABLED 時若還持有 runtime，會先送一次 unassign 釋放它（DISABLED 期間唯一會呼叫 Colab 的動作）；token 已失效而釋放不了時，由 VM 的 watchdog 釋放。處理方式：
 
 1. `./scripts/mint_colab_adc.sh --apply`（同樣用專用帳號；新增一個版本）
-2. `./scripts/deploy_cloud_run.sh`（釘住最新的 enabled 版本；smoke check 通過後，銷毀沒有 revision 釘住、也不在最新 2 個之內的舊版本）
+2. `./scripts/deploy_cloud_run.sh`（釘住最新的 enabled 版本；smoke check 通過後，銷毀沒有 revision 釘住、也不在最新 2 個之內的舊版本：disabled 的版本仍計費，只有銷毀才免費）
 3. `!colab on`
 
-token 外洩時：用專用帳號登入 https://myaccount.google.com/connections 移除「Google Cloud SDK」的存取權。這會撤銷這個帳號透過 gcloud 產生的**所有** token（包括 bot 正在用的，這也是要用專用帳號的原因），接著照上面的步驟產生新的。
+token 外洩時：用專用帳號登入 https://myaccount.google.com/connections 移除「Google Cloud SDK」的存取權。這會撤銷這個帳號透過 gcloud 產生的**所有** token（包括 bot 正在用的，這也是要用專用帳號的原因），接著照上面的步驟產生新的。被新版本取代的舊 token 不需要另外處理：部署會銷毀它的版本，沒人使用 6 個月後也會自然失效。
 
 ### 註冊與檢查
 
-VM 開機後以 HMAC 簽章 POST `/internal/colab/register`；bot 檢查 tunnel 網址（只接受 https + trycloudflare 或 `COLAB_TUNNEL_HOST`，且解析出的 IP 全是公開位址），再經 tunnel 探測 Ollama 版本 0.35.0、qwen3.8 已載入且完全在 VRAM、qwen3.8 的 digest 與釘住的一致、qwen3.8 的 think 等級，全部通過才標成 READY（nimble 沒載入、digest 不一致或沒記錄到、或沒有完全在 VRAM 時仍會 READY，但這個 session 不用 nimble 路由，`/health/detail` 的 `colab.unpinned`／`colab.off_gpu` 會列出；之後的健康檢查發現 nimble 被踢出 VRAM 時也一樣，qwen3.8 對話照常）。探測失敗回 503，VM 可重試；原因寫在 `!colab status` 與 `/health/detail` 的 `colab.last_error`。
+VM 開機後以簽章 POST `/internal/colab/register`，bot 檢查 tunnel 網址並經 tunnel 跑 readiness probe，全部通過才標成 READY（檢查的內容見 [colab/README.md](colab/README.md)〈端到端流程〉第 5 步與〈協定摘要〉）。探測失敗回 503，VM 會重試；原因寫在 `!colab status` 與 `/health/detail` 的 `colab.last_error`。nimble 被這個 session 停用時列在 `/health/detail` 的 `colab.unpinned`／`colab.off_gpu`，qwen3.8 對話照常。
 
 ### 排查
 
@@ -1139,47 +1148,45 @@ gcloud firestore indexes fields list --project="$PROJECT" --database="$DATABASE"
 gcloud builds submit . \
   --project YOUR_PROJECT_ID \
   --config cloudbuild.yaml \
-  --substitutions=_REGION=us-west1,_IMAGE_TAG=manual-$(date -u +%Y%m%d%H%M%S)
+  --substitutions=_REGION=us-west1,_IMAGE_TAG=manual-$(date -u +%Y%m%d%H%M%S) \
+  --service-account=projects/YOUR_PROJECT_ID/serviceAccounts/linebot-builder@YOUR_PROJECT_ID.iam.gserviceaccount.com \
+  --gcs-source-staging-dir=gs://YOUR_PROJECT_ID-cb-src-usw1/source
 ```
 
-送出前請先確認不會上傳密鑰檔：`gcloud meta list-files-for-upload . | python3 scripts/envfile.py check-upload`。已佈建時請加上 `--service-account=projects/YOUR_PROJECT_ID/serviceAccounts/linebot-builder@YOUR_PROJECT_ID.iam.gserviceaccount.com --gcs-source-staging-dir=gs://YOUR_PROJECT_ID-cb-src-usw1/source`，否則原始碼會放到預設的 `gs://YOUR_PROJECT_ID_cloudbuild`。Artifact Registry repository 需已存在（wrapper 或 `provision_gcp.sh --step builder-sa` 會建立）。之後再自行 `gcloud run deploy --image ...`；Cloud Run service 已有的 secret 掛載與環境變數會沿用，否則建議直接用 `./scripts/deploy_cloud_run.sh`。
+送出前請先確認不會上傳密鑰檔：`gcloud meta list-files-for-upload . | python3 scripts/envfile.py check-upload`。最後兩個旗標**一定要加**：少了它們，原始碼會放到預設的 `gs://YOUR_PROJECT_ID_cloudbuild`（US 多區域，不在免費額度內）；`linebot-builder` 與 staging bucket 由 `./scripts/provision_gcp.sh --step staging-bucket --apply`、`--step builder-sa --apply` 建立。Artifact Registry repository 需已存在（wrapper 或 `provision_gcp.sh --step builder-sa` 會建立）。之後再自行 `gcloud run deploy --image ...`；Cloud Run service 已有的 secret 掛載與環境變數會沿用，否則建議直接用 `./scripts/deploy_cloud_run.sh`。
 
 ---
 
 ## 依賴鎖定與本機驗證
 
-Image 與 Cloud Build 都跑 **Python 3.12**（`python:3.12-slim`，以 digest 固定），依賴只從 hash 鎖定檔安裝：
+Image 與 Cloud Build 都跑 **Python 3.12**（`python:3.12-slim`，以 digest 固定），依賴只從 `uv.lock` 安裝，每個檔案都比對 sha256、安裝時不再解析依賴：
 
 | 檔案 | 用途 |
 | --- | --- |
-| `requirements.in` | 執行期直接依賴，**唯一需要手動編輯**的清單 |
-| `requirements.lock` | 由 `requirements.in` 產生，含全部遞移依賴與 sha256；Dockerfile 用 `pip install --no-cache-dir --require-hashes --no-deps -r requirements.lock` 安裝 |
-| `requirements-dev.in` | `-r requirements.in` + pytest / pytest-asyncio / `ruff==0.16.4`；以 `-c requirements.lock` 讓共用套件與 image 版本一致 |
-| `requirements-dev.lock` | 由 `requirements-dev.in` 產生；Cloud Build 測試步驟與本機測試安裝它 |
-| `requirements.txt` / `requirements-dev.txt` | 相容用，只有一行 `-r requirements*.lock`，不要在這裡加套件（沒有 hash 的套件會讓 pip 直接拒絕安裝） |
+| `pyproject.toml` | **唯一需要手動編輯**的清單：`[project] dependencies` 是執行期依賴，`[dependency-groups] dev` 是 Cloud Build 與本機測試才用的 pytest / pytest-asyncio / `ruff==0.16.4`（不進 image）。這個專案是應用程式不是套件（`[tool.uv] package = false`），uv 不會建置或安裝它本身；`exclude-dependencies` 見下 |
+| `uv.lock` | `uv lock` 產生：全部遞移依賴與每個檔案的 sha256，同一份同時適用 Cloud Run 的 linux/amd64 image 和本機 macOS / Linux。不要手改 |
 
-鎖定檔用 `--universal` 產生：同一份檔案同時適用 Cloud Run 的 linux/amd64 image 和本機 macOS / Linux 開發環境（uv 會列出每個版本所有 wheel 的 hash，平台相關的依賴以 environment marker 標註，pip 會自動略過不適用的行）。
+怎麼安裝：
 
-### 重新鎖定依賴
+- **Image**：Dockerfile 第一階段用 digest 固定的 `ghcr.io/astral-sh/uv:0.12.6` 執行 `uv export --frozen --no-dev`，第二階段（image 本身，沒有 uv）以 `pip install --require-hashes --no-deps` 安裝
+- **Cloud Build**：先用同一個 uv image export（含 `dev` group），測試步驟在與 image 相同的 `python:3.12-slim` 上同樣以 `--require-hashes --no-deps` 安裝，再跑 `ruff`、`pytest`、`compileall`
+- **本機**：`uv sync --locked`（見〈本機測試（Python 3.12）〉）
 
-需要 [uv](https://docs.astral.sh/uv/)。**先鎖 runtime，再鎖 dev**（dev 以 `requirements.lock` 當 constraint）。兩行都要帶同一組 `--no-emit-package`（與兩個鎖定檔開頭記錄的指令相同）：
+`--frozen` 與 `--locked` 都不會改 `uv.lock`。`pyproject.toml` 改了卻沒重新鎖定時，`uv sync --locked` 會直接失敗，`tests/test_packaging.py` 也會失敗並提示執行 `uv lock`。uv 至少要 0.12.6（`required-version`，`exclude-dependencies` 需要新版的 uv）。
+
+### 修改或升級依賴
+
+需要 [uv](https://docs.astral.sh/uv/)。先改 `pyproject.toml`，再重新鎖定：
 
 ```bash
-NO_EMIT=(--no-emit-package fastjsonschema --no-emit-package google-auth-oauthlib
-  --no-emit-package jsonschema --no-emit-package jsonschema-specifications
-  --no-emit-package nbformat --no-emit-package oauthlib --no-emit-package prompt-toolkit
-  --no-emit-package pyarrow --no-emit-package referencing --no-emit-package requests-oauthlib
-  --no-emit-package rpds-py --no-emit-package shellingham --no-emit-package typer
-  --no-emit-package wcwidth)
-uv pip compile requirements.in --universal --python-version 3.12 --generate-hashes "${NO_EMIT[@]}" -o requirements.lock
-uv pip compile requirements-dev.in --universal --python-version 3.12 --generate-hashes "${NO_EMIT[@]}" -o requirements-dev.lock
+uv lock                             # 改了依賴之後：重新解析，既有版本盡量保留
+uv lock --upgrade                   # 升級全部套件
+uv lock --upgrade-package <名稱>     # 只升級一個套件
 ```
 
-- `--no-emit-package`：`google-colab-cli`（Colab control plane，ADR-0010）只以函式庫方式使用 `colab_cli.client`、`.runtime`、`.contents`，這三個模組不會 import 它的 CLI 依賴（typer、prompt-toolkit、nbformat、google-auth-oauthlib 及其依賴）與 pyarrow（經 jupyter-mimetypes 帶進來，安裝後約 157 MB）。uv 仍照完整依賴解析版本，只是不寫進鎖定檔；因為 image 以 `--no-deps` 安裝，這些套件不會進 image（Colab 相關套件安裝後共約 16 MB）。`tests/test_packaging.py` 會檢查兩個鎖定檔都沒有它們、三個模組在缺少它們時仍可 import，且 `src/` 從不 import `colab_cli.common`、`.auth`、`.commands`、`.cli`
-- 只改 `.in` 時照跑上面的指令，既有版本會盡量保留
-- 升級全部套件：兩行都加 `--upgrade`；只升級一個套件：加 `--upgrade-package <name>`
-- 鎖完跑一次本機測試；`tests/test_packaging.py` 會檢查 `src/` 與 `main.py` import 的每個套件都在 `requirements.lock` 且有 hash
-- aiohttp 或它的依賴版本變了時，也重新鎖定 Colab VM 上 auth proxy 用的 `colab/proxy-requirements.lock`（`tests/test_colab_vm_scripts.py` 會檢查它的版本與 hash 和 `requirements.lock` 相同）：
+- 鎖完跑一次本機測試；`tests/test_packaging.py` 會檢查 `src/` 與 `main.py` import 的每個套件都是 `uv.lock` 裡有 hash 的執行期依賴、dev 工具不在 image 的依賴裡，以及 `uv.lock` 與 `pyproject.toml` 一致
+- `exclude-dependencies`：`google-colab-cli`（Colab control plane，ADR-0010）只以函式庫方式使用 `colab_cli.client`、`.runtime`、`.contents`，這三個模組不會 import 它的 CLI 與選用路徑的依賴（typer、prompt-toolkit、nbformat、google-auth-oauthlib）與 pyarrow（經 jupyter-mimetypes 帶進來，安裝後約 157 MB）。它們整個排除在解析之外，所以 `uv.lock`、image 與本機環境都沒有它們，也沒有只有它們才需要的套件（jsonschema、oauthlib、shellingham、wcwidth…；Colab 相關套件安裝後共約 16 MB）。`tests/test_packaging.py` 會檢查 lock 裡沒有它們、三個模組在缺少它們時仍可 import，且 `src/` 從不 import `colab_cli.common`、`.auth`、`.commands`、`.cli`
+- aiohttp 或它的依賴版本變了時，也重新鎖定 Colab VM 上 auth proxy 用的 `colab/proxy-requirements.lock`（它要裝在 Colab 的 Python 上，所以另外以 Python 3.11 以上為範圍鎖定；`tests/test_colab_vm_scripts.py` 會檢查它的版本與 `uv.lock` 相同，且 `uv.lock` 列出的檔案 hash 它都有）：
 
   ```bash
   uv pip compile colab/proxy-requirements.in --universal --python-version 3.11 --generate-hashes -o colab/proxy-requirements.lock
@@ -1188,17 +1195,16 @@ uv pip compile requirements-dev.in --universal --python-version 3.12 --generate-
 ### 本機測試（Python 3.12）
 
 ```bash
-uv venv -p python3.12 .venv312
-uv pip sync --python .venv312/bin/python requirements-dev.lock
+UV_PROJECT_ENVIRONMENT=.venv312 uv sync --locked -p 3.12
 .venv312/bin/python -m ruff check .
 .venv312/bin/python -m pytest -q
 ```
 
-`.venv312/` 已列在 `.gitignore`、`.gcloudignore`、`.dockerignore`，不會被 commit、上傳或打包進 image。
+`uv sync` 建立或更新 `.venv312`，裝的正是 `uv.lock` 的版本（含 `dev` group），並移除 lock 以外的套件。`.venv312/` 已列在 `.gitignore`、`.gcloudignore`、`.dockerignore`，不會被 commit、上傳或打包進 image。
 
 ### 更新 base image digest
 
-`Dockerfile` 的 `FROM` 與 `cloudbuild.yaml` 的 test step 用同一個 `python:3.12-slim@sha256:...`（multi-arch index digest），要一起更新（`tests/test_packaging.py` 會檢查兩者一致）：
+`Dockerfile` 的兩個 `FROM`（兩個階段）與 `cloudbuild.yaml` 的 test step 用同一個 `python:3.12-slim@sha256:...`，要一起更新；Dockerfile 第一階段與 `cloudbuild.yaml` 的 `export-dev-lock` step 也共用同一個 `ghcr.io/astral-sh/uv:0.12.6@sha256:...`，同樣要一起更新（`docker buildx imagetools inspect ghcr.io/astral-sh/uv:0.12.6`；`tests/test_packaging.py` 會檢查兩處一致，且版本符合 `required-version`）：
 
 ```bash
 docker buildx imagetools inspect python:3.12-slim   # 取 "Digest:" 那一行
@@ -1208,7 +1214,7 @@ docker buildx imagetools inspect python:3.12-slim   # 取 "Digest:" 那一行
 
 ### 記憶體預算（Cloud Run `--memory 512Mi`）
 
-2026-09-30 以 `.venv312`（Python 3.12.11、macOS arm64、上述 lock，已含 trafilatura）量測的 RSS；憑證全部是 stub、所有對外連線被擋掉：
+2026-09-30 以 `.venv312`（Python 3.12.11、macOS arm64、當時的鎖定版本，已含 trafilatura）量測的 RSS；憑證全部是 stub、所有對外連線被擋掉：
 
 | 階段 | RSS |
 | --- | --- |

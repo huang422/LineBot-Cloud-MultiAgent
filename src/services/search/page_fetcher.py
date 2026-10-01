@@ -229,8 +229,8 @@ class _PinnedTransport(httpx.AsyncHTTPTransport):
 
     httpx has no public hook for the network backend, so the pool built by
     the parent is swapped for one that has it (httpx and httpcore are pinned
-    in requirements.lock; tests/test_page_fetcher.py checks the swap still
-    takes effect).
+    in uv.lock; tests/test_page_fetcher.py checks the swap still takes
+    effect).
     """
 
     def __init__(self, network_backend: httpcore.AsyncNetworkBackend) -> None:

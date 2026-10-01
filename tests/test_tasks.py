@@ -1821,8 +1821,14 @@ class DeployScriptTasksTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("TASKS_MODE must be one of", stderr)
 
-    # Lets the fake gcloud pass the upload leak guard, so the deploy runs on.
-    _UPLOAD_OK = '  "meta list-files-for-upload"*) echo "main.py" ;;\n'
+    # Lets the fake gcloud pass the upload leak guard and find linebot-builder
+    # and its staging bucket (without them nothing is built), so the deploy
+    # runs on.
+    _UPLOAD_OK = (
+        '  "meta list-files-for-upload"*) echo "main.py" ;;\n'
+        '  "iam service-accounts describe linebot-builder@"*) echo "linebot-builder" ;;\n'
+        '  "storage buckets list"*) echo "test-project-cb-src-usw1" ;;\n'
+    )
 
     def test_handler_budget_must_stay_below_the_dispatch_deadline(self) -> None:
         # The default deadline is 300 s; a budget equal to it is refused.

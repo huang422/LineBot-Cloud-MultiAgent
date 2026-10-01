@@ -8,13 +8,16 @@
 #   gcloud builds submit . \
 #     --project YOUR_PROJECT_ID \
 #     --config cloudbuild.yaml \
-#     --substitutions=_REGION=us-west1,_IMAGE_TAG=manual-20260929
+#     --substitutions=_REGION=us-west1,_IMAGE_TAG=manual-20260929 \
+#     --service-account=projects/YOUR_PROJECT_ID/serviceAccounts/linebot-builder@YOUR_PROJECT_ID.iam.gserviceaccount.com \
+#     --gcs-source-staging-dir=gs://YOUR_PROJECT_ID-cb-src-usw1/source
 #
 # The Artifact Registry repository must already exist; the deploy wrapper
-# (and scripts/provision_gcp.sh --step builder-sa) creates it. Once
-# provisioned, the wrapper submits the build as linebot-builder
-# (--service-account) with the source staged in gs://<project>-cb-src-usw1
-# (--gcs-source-staging-dir); see docs/adr/0008-secrets-and-identity.md.
+# (and scripts/provision_gcp.sh --step builder-sa) creates it. Never submit
+# without the last two flags: the default staging bucket
+# gs://<project>_cloudbuild is US multi-region, outside the free tier, and
+# the wrapper stops instead while linebot-builder or gs://<project>-cb-src-usw1
+# is missing; see docs/adr/0008-secrets-and-identity.md.
 
 substitutions:
   _REGION: us-west1
@@ -32,11 +35,26 @@ options:
 timeout: 1200s
 
 steps:
+  # uv.lock -> hash-pinned requirements file (dev group included) on a volume
+  # the test step reads. Same digest-pinned uv as the Dockerfile's first stage
+  # (bump both together). The image's entrypoint is /uv; --frozen exports the
+  # lock as is and needs no Python.
+  - id: export-dev-lock
+    name: 'ghcr.io/astral-sh/uv:0.12.6@sha256:88bc6eb1ccd4b82efd0e1b530caffabddf50dc2bf612e66c14ea25b8ee8a4d3d'
+    entrypoint: /uv
+    args: [export, --frozen, --quiet, --no-emit-project, --format, requirements.txt, -o, /deps/dev.txt]
+    volumes:
+      - name: deps
+        path: /deps
+
   # Same pinned base image as the Dockerfile (bump both together), so tests
   # run on the interpreter the service runs on.
   - id: test
     name: 'python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f'
     entrypoint: bash
+    volumes:
+      - name: deps
+        path: /deps
     args:
       - -ceu
       - |
@@ -46,7 +64,7 @@ steps:
         fi
 
         python -m pip install --disable-pip-version-check --no-cache-dir \
-          --require-hashes --no-deps -r requirements-dev.lock
+          --require-hashes --no-deps -r /deps/dev.txt
         python -m ruff check --no-cache .
         python -m pytest -q -p no:cacheprovider
         python -m compileall -q main.py src scripts tests

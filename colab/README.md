@@ -8,7 +8,7 @@ Bot 的 Colab 層在一台 Colab A100（40 GB）上跑 Ollama 0.35.0：`qwen3.8:
 | `auth_proxy.py` | `127.0.0.1:8081` 的 bearer token 反向代理（tunnel → proxy → Ollama），內含 watchdog |
 | `register.py` | bot 與 VM 必須算得一模一樣的部分：金鑰推導、簽章、事件內容、env 檔格式、readiness probe 檢查。只用標準函式庫 |
 | `versions.json` | 釘住的版本：Ollama 與 cloudflared 的下載網址與 sha256、兩個模型的 digest、GPU 下限 |
-| `proxy-requirements.lock` | auth proxy 的 aiohttp 與它全部的依賴，每個檔案都有 sha256（由 `proxy-requirements.in` 以 uv 產生，版本與 hash 和 bot 映像的 `requirements.lock` 相同，測試會檢查） |
+| `proxy-requirements.lock` | auth proxy 的 aiohttp 與它全部的依賴，每個檔案都有 sha256（由 `proxy-requirements.in` 以 uv 產生，版本與 bot 映像的 `uv.lock` 相同、`uv.lock` 列出的每個檔案 hash 都在其中，測試會檢查；重新鎖定的指令見 [DEPLOY.md](../DEPLOY.md)〈依賴鎖定與本機驗證〉） |
 
 `colab.VM_FILES` 列出 launcher 要上傳到 `/content` 的檔案。上傳後它們以同層模組互相 import（`python /content/bootstrap.py`）；在 repo 裡則是 `colab` 套件，所以 bot 與測試可以直接 import，而且 **不需要 aiohttp**（`auth_proxy` 只在真的開始服務時才載入 aiohttp）。測試：`tests/test_colab_vm_scripts.py`。
 
@@ -52,17 +52,12 @@ Bot 的 Colab 層在一台 Colab A100（40 GB）上跑 Ollama 0.35.0：`qwen3.8:
 - **auth proxy**：`hmac.compare_digest` 比對 bearer（錯誤回 401）；白名單 `GET/HEAD /api/version`、`GET /api/ps`、`GET /api/tags`、`POST /api/show`、`POST /api/chat`、`POST /v1/systemone`，`OPENCODE_ENABLED=1` 時再加 `POST /v1/chat/completions`、`GET /v1/models`，其餘（pull、push、delete、create、copy、blobs…）一律 404；轉送時移除 Authorization、Origin、Cookie 與 hop-by-hop header，`Host` 改成 `127.0.0.1:11434`；串流直接轉送；body 上限 16 MB，上游 150 秒逾時。**放棄的請求會在 VM 上真的停下來**：bot 取消請求（鏈的時間上限、回合期限、關機）時會關掉連線，cloudflared 隨即關掉它到 proxy 的連線；`serve()` 以 aiohttp 的 `handler_cancellation` 執行，handler 因此被取消、關掉通往 Ollama 的連線，Ollama 就停止生成，`auth_proxy.log` 記一行 `POST /api/chat cancelled after N s: the client went away`。VM 的檔案是開機時才上傳，所以 proxy 的改動要到下一次 Colab 開機才生效。**只有** `/api/chat`、`/v1/systemone`、`/v1/chat/completions` 會更新閒置計時，health 與 probe 不算。
 - **watchdog**（proxy 內，每 30 秒）：閒置超過 `IDLE_TTL + 120` 秒、存活超過 `MAX_SESSION + 120` 秒，或 Ollama 重啟一次後仍然掛掉 → `state.json` 寫 `stopping` → 簽章過的 `stopping` 事件 → `POST http://$TBE_RUNTIME_ADDR/unassign`（預期 200）→ 結束。任何一步出錯都不會讓 watchdog 停擺：單次檢查出錯只記 log、下一輪照跑；連續 3 次出錯、釋放流程本身出錯（例如磁碟滿了寫不了 `state.json`），或 watchdog 的 task 整個掛掉，都直接送出上面那個 unassign POST（不寫 `state.json`、不送事件）然後結束。**不呼叫** `google.colab.runtime.unassign()`：它在非 kernel 的 process 裡送出 POST 後會在 `eval_js` 失敗。
 
-## 一次性設定（需要你操作）
+## 設定與操作
 
-1. **專用 Google 帳號**（強烈建議）：用一個只持有 Colab 方案、**沒有任何 GCP 權限**的帳號。gcloud 產生的 refresh token 一定帶 `cloud-platform` scope；若用 terabanana 的 Owner 帳號，存在 Secret Manager 的 token 就等於 Owner 權限。這個帳號也不要拿來做其他 gcloud 登入（見下方 token 注意事項）。
-2. **產生並儲存 refresh token**：先跑 `./scripts/mint_colab_adc.sh`（dry-run，只做唯讀檢查並印出計畫），再跑 `./scripts/mint_colab_adc.sh --apply`。它在暫存的 `CLOUDSDK_CONFIG`（不會蓋掉你本機原本的 ADC 與 gcloud 登入）下執行
-   `gcloud auth application-default login --no-launch-browser --disable-quota-project --scopes=openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory`；
-   用只登入**專用帳號**的無痕視窗打開網址、同意後把授權碼貼回終端機。腳本確認檔案是帶 refresh token 的 `authorized_user` 憑證，經 stdin 存成 Secret Manager `linebot-colab-adc` 的新版本（第一次會建立 secret），執行 `./scripts/provision_gcp.sh --step colab-secret --apply` 讓 `linebot-runtime` 能讀取，最後刪除暫存目錄；token 內容不會印出。
-3. **掛載**：`./scripts/deploy_cloud_run.sh` 在 `COLAB_ENABLED=true` 時把最新的 enabled 版本**釘住版本號**掛載在 `/secrets/colab/adc.json`（`COLAB_ADC_PATH` 的預設值），部署本身不讀它；`COLAB_ENABLED=false` 時不掛載。**絕不**設定 `GOOGLE_APPLICATION_CREDENTIALS`（否則 Firestore、GCS、Cloud Tasks 都會改用這個個人 token）。
-4. **bot 設定**：`COLAB_SHARED_SECRET`（至少 32 個隨機字元，放在 dotenv secret），`COLAB_ENABLED=true`（需要 `FIRESTORE_ENABLED=true`、讀得到的 `COLAB_ADC_PATH` 與 `INTERNAL_CRON_SECRET`（控制器只在每分鐘的 cron 執行），缺少時 Colab 層維持停用、服務照常啟動），`LINE_ADMIN_USER_IDS`（在私訊對 bot 傳 `!whoami` 取得自己的 userId）。第一次實跑時再加 `MODEL_PATH_PREFERENCE=api`，只讓 `!colab on` 開機。完整步驟見 [DEPLOY.md](../DEPLOY.md)〈Colab 層〉。
-5. （選用）**named tunnel**：有 Cloudflare 網域時，建立 tunnel、把公開網址指到 `http://127.0.0.1:8081`，設定 `COLAB_TUNNEL_MODE=named`、`COLAB_TUNNEL_HOST` 與 `COLAB_TUNNEL_TOKEN`；launcher 會以 `TUNNEL_MODE=named`、`TUNNEL_TOKEN`、`TUNNEL_HOST` 傳給 VM。
-6. **先跑 DRYRUN**：設定 `COLAB_DRY_RUN=true`，控制器改申請 CPU runtime（`Variant.DEFAULT`），VM 以 `DRYRUN=1` 走完整個控制流程（assign、上傳、silent env、launcher 標記、register、heartbeat、watchdog 自我釋放、孤兒對帳、`!colab on/off/status`）。DRYRUN 跳過 GPU、Ollama 與模型，改啟動一個假的上游：`/api/version`、`/api/ps`、`/api/tags`、`/api/show` 回傳能通過 readiness probe 的固定內容，推論路徑則回 Ollama 的忙碌 503，所以這段期間真的使用者訊息會立刻改走 API 層，不會收到假回覆。READY 後 `.venv312/bin/python scripts/live_gate.py --path colab` 的 `colab.probe` 應為 PASS（其他三項 SKIP）。
-7. **再跑一次真正的 A100**，READY 後 `scripts/live_gate.py --path colab` 四項都要 PASS；量測 assign 延遲、冷啟動時間、`consumptionRateHourly`、VRAM（照〈VRAM〉的首次實跑檢查記下來）、524、兩則對話同時進來時的忙碌閘門；再用 `scripts/evals/routing_eval.py` 重新調整 `COLAB_ROUTER_*` 門檻；然後再把 `MODEL_PATH_PREFERENCE` 改回 `colab`，對所有人開啟。
+第一次設定（專用帳號、產生 token、`.env`、部署、CPU 乾跑、第一次 A100、對所有人開啟）、重新產生 token 與排查的順序在 [DEPLOY.md](../DEPLOY.md)〈Colab 層〉；設計理由、條款風險與成本保護在 [ADR-0010](../docs/adr/0010-colab-ollama-tier.md)。和 VM 端有關的只有兩件事：
+
+- **DRYRUN**（`COLAB_DRY_RUN=true`）：控制器改申請 CPU runtime，VM 以 `DRYRUN=1` 走完整個控制流程（assign、上傳、silent env、launcher 標記、register、heartbeat、watchdog 自我釋放、孤兒對帳）。它跳過 GPU、Ollama 與模型，改啟動假的上游（`bootstrap.py --stub-upstream`，log 在 `stub_upstream.log`）：`/api/version`、`/api/ps`、`/api/tags`、`/api/show` 回傳能通過 readiness probe 的固定內容，推論路徑一律回 Ollama 的忙碌 503，所以這段期間真的使用者訊息會立刻改走 API 層，不會收到假回覆。
+- **named tunnel**：Cloudflare 上建立的 tunnel 要把公開網址指到 `http://127.0.0.1:8081`（auth proxy）；launcher 以 `TUNNEL_MODE=named`、`TUNNEL_TOKEN`、`TUNNEL_HOST` 傳給 VM（見〈協定摘要〉的 env 檔）。
 
 ## 成本
 
@@ -70,19 +65,6 @@ Bot 的 Colab 層在一台 Colab A100（40 GB）上跑 Ollama 0.35.0：`qwen3.8:
 - **一次啟動 ≈ 2–2.7 CU**：開機 4–8 分鐘加閒置 15 分鐘，約 0.35–0.5 小時。計費從 assign 開始，不是模型載入完成才開始。
 - **絕不用 high-mem**：`--high-mem` 會拿到 80 GB 的 A100，約 6.77 CU/小時。
 - 保護措施：CU 餘額低於 10 不開機、每日上限 30 CU、閒置 15 分鐘或滿 11 小時釋放、watchdog 後援、任何啟動失敗都自我釋放、`!colab off` 與 `COLAB_ENABLED=false` 可一鍵關閉。DRYRUN 的 CPU runtime 也會用掉少量 CU。
-
-## Colab 條款風險（已接受）
-
-Colab FAQ 禁止把 runtime 當成 web service，也禁止讓第三方使用。你在 2026-09-29/30 已接受這個風險並選擇讓**所有使用者**先走 Colab（ADR-0010）。帳號仍可能被警告或封鎖。對策：專用帳號、一鍵關閉、assign 遇到 400／401／403 或 `DENYLISTED` 立即 DISABLED 並記錄 ERROR、CU 上限、從不讓回覆等待 Colab。
-
-## Refresh token 注意事項
-
-- **6 個月沒用會失效**：每日的孤兒對帳會持續使用它。
-- **每個 OAuth client 最多 100 個有效 refresh token**：gcloud 的 `application-default login` 與 colab-cli 的 oauth2 登入共用同一個 Cloud SDK client（`764086051850-…`）。這個帳號每登入一次就多一個 token，超過 100 個時**最舊的會被默默撤銷**，所以專用帳號不要再做其他 gcloud／colab 登入。
-- 你撤銷存取權、Workspace 管理員政策（session control、限制 scope）也會讓它失效。
-- 失效時 bot 會看到 `invalid_grant` 或 `Reauthentication is needed`，Colab 層進入 DISABLED 並記錄 ERROR；回覆不受影響（全部走 API 層）。token 端點只是暫時出錯（502、HTML 頁面、沒有 token 的 200）時算暫時性錯誤，下一輪重試，不會 DISABLED。進入 DISABLED 時若還持有 runtime，會先送一次 unassign 釋放它（DISABLED 期間唯一會呼叫 Colab 的動作）；token 已失效而釋放不了時，由 VM 的 watchdog 釋放。
-- **重新產生**：`./scripts/mint_colab_adc.sh --apply`（新增一個 `linebot-colab-adc` 版本）→ `./scripts/deploy_cloud_run.sh`（釘住最新的 enabled 版本；smoke check 通過後 destroy 沒有 revision 釘住、也不在最新 2 個之內的舊版本，disabled 版本仍計費，只有 destroyed 才免費）→ `!colab on`。
-- **撤銷**：token 外洩時，用專用帳號登入 https://myaccount.google.com/connections 移除「Google Cloud SDK」；這會撤銷這個帳號透過 gcloud 產生的**所有** token（包括 bot 正在用的），之後照上面重新產生。被新版本取代的舊 token 不需要另外處理：部署會 destroy 它的版本，沒人使用 6 個月後也會自然失效。
 
 ## 疑難排解
 
@@ -94,7 +76,7 @@ Colab FAQ 禁止把 runtime 當成 web service，也禁止讓第三方使用。�
 | assign 回 **503** | 暫時沒有 A100 | 自動冷卻後再試；常見於尖峰時段 |
 | assign 回 **400** | 方案沒有 A100 權限或額度 | DISABLED。確認 Colab 方案與 CU 餘額 |
 | assign 回 **401／403**、訊息含 **DENYLISTED** 或 abusive activity | token 權限錯誤，或帳號因疑似濫用被封鎖 | DISABLED。DENYLISTED 時先停用 Colab 層（`COLAB_ENABLED=false`），不要換帳號硬闖 |
-| `invalid_grant`、`invalid_client`、`Reauthentication is needed` | refresh token 失效（`invalid_client`：憑證檔裡的 client 不對） | 依上面的步驟重新產生 |
+| `invalid_grant`、`invalid_client`、`Reauthentication is needed` | refresh token 失效（`invalid_client`：憑證檔裡的 client 不對） | 照 [DEPLOY.md](../DEPLOY.md)〈Colab 層〉的〈重新產生 token〉重新產生 |
 | `state.json` 停在 `gpu` | 拿到的不是 40 GB A100，或驅動 < 550 | VM 已自我釋放；若一直發生，回報並檢查 Colab 的 GPU 配置 |
 | `pull`：qwen3.8 的 digest 不是釘住的值 | qwen3.8 的 tag 在 registry 上被重新發佈 | 每次開機都會在這一步失敗並自我釋放（連續 3 次後 DISABLED），回覆全部走 API 層。照〈釘住的 digest〉確認新版本後重新釘版 |
 | bot log 有 ERROR `nimble:9b off for this Colab session: nimble:9b has digest …`，`/health/detail` 的 `colab.unpinned` 或 `!colab status` 列出 `nimble:9b` | nimble 的 tag 被重新發佈（Bespoke 更新得很頻繁） | 不影響開機與 qwen3.8：這個 session 的路由改由規則與 API 路由決定（每個 session 只記一筆 ERROR，含釘住與實際的 digest）。要再用 nimble，照〈釘住的 digest〉確認新版本後重新釘版、重調門檻並部署 |

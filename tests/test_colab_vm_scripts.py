@@ -27,6 +27,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import tomllib
 import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -395,22 +396,31 @@ class VersionsPinTests(unittest.TestCase):
 
     def test_the_proxy_lock_is_the_bot_image_lock_for_its_packages(self) -> None:
         # The proxy runs on the aiohttp stack these tests run on: same
-        # versions, same file hashes (re-lock both when one changes).
-        def pins(path: Path) -> dict[str, tuple[str, frozenset[str]]]:
-            found: dict[str, tuple[str, frozenset[str]]] = {}
-            for block in re.split(r"\n(?=[a-z0-9])", path.read_text(encoding="utf-8")):
-                match = re.match(r"([a-z0-9._-]+)==(\S+)", block)
-                if match:
-                    found[match.group(1)] = (match.group(2), frozenset(re.findall(r"sha256:([0-9a-f]{64})", block)))
-            return found
+        # versions, same files (re-lock both when one changes).
+        proxy: dict[str, tuple[str, frozenset[str]]] = {}
+        for block in re.split(r"\n(?=[a-z0-9])", _PROXY_LOCK.read_text(encoding="utf-8")):
+            match = re.match(r"([a-z0-9._-]+)==(\S+)", block)
+            if match:
+                proxy[match.group(1)] = (match.group(2), frozenset(re.findall(r"sha256:([0-9a-f]{64})", block)))
+        image: dict[str, tuple[str, frozenset[str]]] = {}
+        for package in tomllib.loads((_REPO / "uv.lock").read_text(encoding="utf-8"))["package"]:
+            files = [*package.get("wheels", []), *([package["sdist"]] if "sdist" in package else [])]
+            image[package["name"]] = (
+                package["version"],
+                frozenset(file["hash"].removeprefix("sha256:") for file in files),
+            )
 
-        proxy, image = pins(_PROXY_LOCK), pins(_REPO / "requirements.lock")
         self.assertIn("aiohttp", proxy)
         self.assertLessEqual({"multidict", "yarl", "propcache", "frozenlist", "aiosignal", "attrs"}, set(proxy))
         for name, (version, hashes) in proxy.items():
             with self.subTest(name):
                 self.assertTrue(hashes)
-                self.assertEqual((version, hashes), image[name])
+                self.assertEqual(version, image[name][0])
+                # uv.lock (Python >= 3.12) leaves out the cp311 wheels the
+                # proxy lock (Python >= 3.11, for Colab) keeps; every file it
+                # does list must be one the proxy lock has.
+                self.assertTrue(image[name][1])
+                self.assertLessEqual(image[name][1], hashes)
 
     def test_locked_pins_leave_marker_pins_to_pip(self) -> None:
         text = (

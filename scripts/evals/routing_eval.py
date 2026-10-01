@@ -2,7 +2,7 @@
 
 A human runs this to compare the routers and to tune the Colab router's
 gates (plan: Verification 2, routing). From the repo root, with the
-.venv312 built from requirements-dev.lock (DEPLOY.md, 路由評測):
+.venv312 built from uv.lock (DEPLOY.md, 路由評測):
 
     .venv312/bin/python scripts/evals/routing_eval.py --dry-run     # the plan; sends nothing
     .venv312/bin/python scripts/evals/routing_eval.py               # the rules only (offline)

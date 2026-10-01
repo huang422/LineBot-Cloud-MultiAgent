@@ -6,7 +6,7 @@ live gate (8b), the VM package under `colab/` (8c). In service since
 2026-10-01: on-demand sessions reach READY on a 40 GB A100
 (`NVIDIA A100-SXM4-40GB`) and answer first; the checks still open after the
 first runs are listed under Consequences ("Unverified until the Colab
-runs") and in DEPLOY.md, Colab 層. Amended 2026-09-30: the router model is
+runs") and in colab/README.md (首次實跑時確認). Amended 2026-09-30: the router model is
 `nimble:9b`, with per-model gates and a VRAM check ("The router model",
 "VRAM").
 
@@ -212,7 +212,9 @@ Risks, and what bounds them:
 ### The wire protocol (`src/services/colab/protocol.py`, `colab/register.py`)
 
 Nothing secret is stored. Per session (`nbh`, the UUID the controller picks
-before assigning):
+before assigning), both keys are derived from `COLAB_SHARED_SECRET`, so the
+bot can recompute them at any time and a leaked session key is worth one
+session:
 
 ```
 reg_key     = hex(HMAC_SHA256(COLAB_SHARED_SECRET, "reg:" + nbh))
@@ -220,34 +222,26 @@ proxy_token = base64url(HMAC_SHA256(COLAB_SHARED_SECRET, "proxy:" + nbh)) withou
 X-Colab-Signature: t=<unix seconds>,v1=hex(HMAC_SHA256(reg_key as ASCII, "<t>." + raw body))
 ```
 
-The VM gets both values in `/content/.bootstrap.env` (see the launcher
-below). Its auth proxy on 127.0.0.1:8081 checks the bearer (constant time),
-forwards only `GET|HEAD /api/version`, `GET /api/ps`, `GET /api/tags`,
-`POST /api/show`, `POST /api/chat` and `POST /v1/systemone` (plus
-`/v1/chat/completions` and `GET /v1/models` with `OPENCODE_ENABLED=1`) to
-Ollama with Host `127.0.0.1:11434`, strips Authorization/Origin/Cookie/
-hop-by-hop headers, caps bodies at 16 MB and upstream calls at 150 s, and
-counts only inference calls as activity.
+The VM's auth proxy (127.0.0.1:8081) checks the bearer in constant time
+and forwards only the probe and inference paths, never pull, push, create
+or delete, so a leaked tunnel URL cannot change what the VM serves; the
+allowlist, header rules and limits are in colab/README.md (協定摘要).
 
 `POST /internal/colab/register` is public; the signature authenticates it.
-The body (≤ 8 KB) is `{event: ready|failed|stopping, nbh, tunnel_url?,
-versions?, digests?, gpu?, step?, error?}`. Refused: a timestamp more than
-300 s off, an `nbh` other than the current session's, a bad or reused
-signature (403); a `ready` after `!colab off` (409, and the session
-drains); a `tunnel_url` that is not `https://` + host alone (no user info,
-port, path, query or fragment), whose host is not
-`<name>.trycloudflare.com` or exactly `COLAB_TUNNEL_HOST`, or that resolves
-to any non-public address (422; the page fetcher's checks, ADR-0009). All
-Colab traffic uses the page fetcher's pinned, public-only transport on
-port 443. After `ready`, a readiness probe (≤ 10 s, with the bearer) needs
-Ollama 0.35.0, qwen3.8 in `/api/ps` and `/api/tags`, wholly in VRAM
-(`size_vram == size`) and at its pinned digest (see below), and think
-values `[false, low, medium, xhigh]` from `/api/show`; nimble need not be
-there at all. A failure answers 503 so the VM can retry. The session
-keeps the digests and the `/api/ps` sizes the probe saw; the VM's own `gpu` report (VRAM per model,
-nvidia-smi's memory.used) is shown, never trusted. `failed` and
-`stopping` move the session to DRAINING; a `failed` counts as a boot
-failure only while ASSIGNING or BOOTING.
+Refused: a timestamp more than 300 s off, an `nbh` other than the current
+session's, a bad or reused signature (403); a `ready` after `!colab off`
+(409, and the session drains); a `tunnel_url` that is not `https://` + host
+alone, whose host is not `<name>.trycloudflare.com` or exactly
+`COLAB_TUNNEL_HOST`, or that resolves to any non-public address (422; the
+page fetcher's checks, ADR-0009). All Colab traffic uses the page
+fetcher's pinned, public-only transport on port 443. After `ready`, a
+readiness probe (≤ 10 s, with the bearer) needs Ollama 0.35.0, qwen3.8
+loaded, wholly in VRAM and at its pinned digest (below), and its think
+levels; nimble need not be there at all. A failure answers 503 so the VM
+can retry. The session keeps the digests and sizes the probe saw; the VM's
+own `gpu` report is shown, never trusted. `failed` and `stopping` move the
+session to DRAINING; a `failed` counts as a boot failure only while
+ASSIGNING or BOOTING.
 
 ### Pinned digests: exact for chat, optional for the router
 
@@ -278,45 +272,33 @@ models are treated differently:
 ### VRAM: whole for chat, optional for the router
 
 `OLLAMA_MAX_LOADED_MODELS=2` keeps both models resident (keep-alive -1),
-and no request sends `num_ctx`. Ollama loads a model beside the loaded
-ones only when its predicted size is under 80% of the free VRAM, else it
-evicts one, so the bootstrap loads qwen3.8 first (predicted about 22.4
-GiB at 32K, planned at 24–25 GiB) and nimble second (about 9.87 GiB,
-needing about 12.3 GiB free, 13.3 GiB with Ollama's automatic batch
-1024); the other order would need about 28 GiB free for qwen3.8. After
-the warm-up the VM records each model's `/api/ps` `size_vram`/`size` and
-nvidia-smi's memory.used in `state.json` and the `ready` event's `gpu`.
+and no request sends `num_ctx` (a change would reload the model). Ollama
+0.35.0 loads a model beside the loaded ones only when its predicted size
+fits the free VRAM, and otherwise evicts an idle model rather than load the
+new one partly on the CPU. So the bootstrap loads qwen3.8 first and nimble
+second (the other order would need about 28 GiB free for qwen3.8), and the
+two models are again treated differently:
 
 - **qwen3.8** not wholly in VRAM, or not loaded, fails the probe, like a
-  digest mismatch. The one way the warm-up itself unloads it is guarded:
-  Ollama 0.35.0 (`sched.go`, the preflight in `load`) evicts an idle model
-  rather than load the next one partly on the CPU, so if loading nimble
-  evicts qwen3.8, the bootstrap unloads nimble (`/api/generate` with
-  `keep_alive: 0`), loads qwen3.8 again alone and boots on without the
-  router, with an ERROR. Chat stays up whatever nimble does, and three
-  boots in a row can no longer fail on nimble's account.
-- **nimble** not wholly in VRAM, not loaded (it did not load, or was
-  unloaded as above) or not pulled is treated like its digest mismatch:
-  the VM logs an ERROR and boots on, the session goes READY, and the
-  router sits the session out with one ERROR (`router not fully on GPU`
-  or `router not loaded`) and `colab.off_gpu` in `/health/detail`. A READY
-  session with no sizes recorded for the router counts the same.
+  digest mismatch. If loading nimble evicts qwen3.8, the bootstrap unloads
+  nimble, loads qwen3.8 again alone and boots on without the router, with
+  an ERROR: chat stays up whatever nimble does, and three boots in a row
+  can never fail on nimble's account.
+- **nimble** not wholly in VRAM, not loaded or not pulled is treated like
+  its digest mismatch: the session goes READY and the router sits it out
+  with one ERROR and `colab.off_gpu` in `/health/detail`.
 - **Mid-session**, the per-minute health check needs only qwen3.8 loaded.
-  Reloading qwen3.8 with nimble resident (after a runner crash) needs
-  about 28 GiB free, so Ollama evicts idle nimble; the health check then
-  finds nimble gone and the router sits the rest of the session out (a
-  WARNING, and `colab.off_gpu`), without marking the endpoint unhealthy.
-  Nothing calls nimble again that session: loading it could evict qwen3.8
-  in turn. The watchdog's restart counts as failed only when qwen3.8 does
-  not come back.
+  A qwen3.8 reload with nimble resident (after a runner crash) evicts idle
+  nimble, and the router sits the rest of the session out without marking
+  the endpoint unhealthy; nothing calls nimble again, since loading it could
+  evict qwen3.8 in turn.
 - `COLAB_ROUTER_ENABLED=false` does not reach the VM: nimble is still
-  pulled (about 9.5 GB) and loaded. Given the guards above that costs boot
-  time and VRAM, never chat; to take nimble off the VM, re-pin the
-  router (`nimble:9b-q4_K_M`) or drop it from `versions.json` and the
-  model profiles together.
-- Measured on the first A100 run (colab/README.md, VRAM): the per-model
-  sizes, memory.used and Ollama's scheduler lines. If the margin is thin,
-  `nimble:9b-q4_K_M` (5.6 GB) is the fallback, after the eval.
+  pulled and loaded. Given the guards above that costs boot time and VRAM,
+  never chat; to take nimble off the VM, re-pin or drop the router in
+  `versions.json` and the model profiles together.
+
+The predicted sizes, the margin (nobody has measured the A100 yet) and the
+smaller `nimble:9b-q4_K_M` fallback are in colab/README.md (VRAM).
 
 ### The control plane: the colab_cli library behind a facade
 
@@ -431,45 +413,37 @@ being assigned, booting or ready drains at once), `!colab status`.
 
 ### Launch and the VM (`src/services/colab/launcher.py`, `colab/`)
 
-The `launch` task uploads `colab.VM_FILES` (bootstrap, auth proxy,
-register, `versions.json`, `proxy-requirements.lock`) to `/content`
-through the Contents API, writes
-`/content/.bootstrap.env` (mode 0600 before any byte) with a **silent**,
-history-free kernel execute (never `colab exec --env`, which logs values),
-starts `bootstrap.py` detached (`start_new_session`) and counts the launch
-only when `BOOTSTRAP_LAUNCHED <pid>` comes back (a failing cell still
-"succeeds"). The bootstrap reads and deletes the env file, installs the
-auth proxy's aiohttp stack from `proxy-requirements.lock` when the runtime
-lacks it (`--require-hashes --no-deps --only-binary=:all:`: the proxy
-holds the session's keys, so like every binary on the VM it runs only
-checked files; the lock's versions and hashes are the bot image's),
-checks the GPU (VRAM ≥ 38000 MiB, driver ≥ 550), installs the
-sha256-pinned Ollama and cloudflared, pulls both models and checks their
-digests (above), warms them up (qwen3.8 first; a nimble that does not
-load, or whose loading evicts qwen3.8, is left out) and records their VRAM,
-starts the auth proxy and a quick tunnel (named with `COLAB_TUNNEL_MODE=
-named`) and registers `ready`. Any failure registers `failed` and releases
-the runtime (`POST $TBE_RUNTIME_ADDR/unassign`). The proxy's watchdog is
-the second line of the cost guards: idle or age past the limits plus 120 s,
-or Ollama down after one restart, and it registers `stopping` and releases
-itself. No failure ends that guard: a check that raises is logged and the
-next one runs; three in a row, a release that raises (a full disk under
-`state.json`, say) or the watchdog task dying send the bare self-unassign
-POST, with no state file or event, and exit.
+The `launch` task uploads `colab.VM_FILES` to `/content` and starts
+`bootstrap.py` detached; the steps and their order are in colab/README.md
+(端到端流程). What the design depends on:
+
+- **Secrets never touch argv, history or a log.** They reach the VM only
+  in `/content/.bootstrap.env`, written with a silent, history-free kernel
+  execute (mode 0600 before any byte) and deleted by the bootstrap as it
+  reads it; never `colab exec --env`, which logs values.
+- **A launch counts only when `BOOTSTRAP_LAUNCHED <pid>` comes back**: a
+  failing cell still "succeeds".
+- **Only checked files run on the VM.** Ollama and cloudflared are
+  sha256-pinned, and the auth proxy's aiohttp stack installs from
+  `proxy-requirements.lock` with `--require-hashes --no-deps
+  --only-binary=:all:` (the proxy holds the session's keys; its versions
+  are the bot image's).
+- **The VM releases itself.** Any bootstrap failure registers `failed` and
+  releases the runtime (`POST $TBE_RUNTIME_ADDR/unassign`). The proxy's
+  watchdog is the second line of the cost guards: idle or age past the
+  limits plus 120 s, or Ollama down after one restart, and it registers
+  `stopping` and releases the runtime; no error ends that guard (three
+  failed checks in a row, or a release that fails, send the bare
+  self-unassign and exit).
 
 ### Credential model
 
 The control plane runs as the owner's Colab account: a Google
 `authorized_user` refresh token that only a person can mint (browser
-consent). `scripts/mint_colab_adc.sh` (dry run by default) runs
-`gcloud auth application-default login --no-launch-browser
---disable-quota-project` with the openid, cloud-platform, userinfo.email
-and colaboratory scopes under a scratch `CLOUDSDK_CONFIG` (so the
-machine's own ADC is untouched), checks the file is an `authorized_user`
-credential with a refresh token, stores it through stdin as a new version
-of the Secret Manager secret `linebot-colab-adc`, grants `linebot-runtime`
-`roles/secretmanager.secretAccessor` (`scripts/provision_gcp.sh --step
-colab-secret`) and deletes the scratch directory.
+consent). `scripts/mint_colab_adc.sh` (dry run by default) mints it under a
+scratch `CLOUDSDK_CONFIG`, so the machine's own ADC is untouched, stores it
+as a new version of the Secret Manager secret `linebot-colab-adc` and lets
+`linebot-runtime` read it; the steps are in DEPLOY.md (Colab 層).
 
 - **A dedicated account.** gcloud always adds the cloud-platform scope, so
   the token of an account with roles in the project could manage the
@@ -481,10 +455,11 @@ colab-secret`) and deletes the scratch directory.
   newest enabled version, pinned per revision like the dotenv secret, at
   `/secrets/colab/adc.json` (`COLAB_ADC_PATH`) only while
   `COLAB_ENABLED=true`, and never reads it. A missing secret leaves the
-  tier off with a warning; a runtime account without read access stops
-  the deploy before the build (Cloud Run would reject the revision).
+  tier off with a warning, and so does a runtime account the secret's
+  policy grants no `secretAccessor` (a project-level or group grant does
+  not show there; Cloud Run rejects a revision that cannot read it).
   After a passing smoke check the deploy destroys the versions no kept
-  revision pins. `GOOGLE_APPLICATION_CREDENTIALS` is never set: it would
+  revision mounts. `GOOGLE_APPLICATION_CREDENTIALS` is never set: it would
   turn every Google client (Firestore, Cloud Storage, Cloud Tasks) into
   the owner's personal account. The control plane reads the file once
   into an `AuthorizedSession`.
@@ -494,24 +469,22 @@ colab-secret`) and deletes the scratch directory.
   with an ERROR log; replies go on through the API tiers. Any move to
   DISABLED first queues the unassign of the runtime the session holds (the
   one Colab call DISABLED still makes); when that fails too (a dead token),
-  the VM's watchdog releases it. A person re-mints and deploys, then sends
-  `!colab on`.
+  the VM's watchdog releases it. Re-minting is a person's job (DEPLOY.md,
+  Colab 層, 重新產生 token).
 
 ### The dry run and the live gate
 
-`COLAB_DRY_RUN=true` assigns a CPU runtime (`Variant.DEFAULT`) and starts
-the VM with `DRYRUN=1`: no GPU, Ollama or model steps; a stub upstream
-answers the readiness probe (so the whole control path, registration and
-READY included, runs for a fraction of a compute unit) and answers
-inference with Ollama's busy 503, so users still get API answers.
-`scripts/live_gate.py --path colab` reads the session document with the
-operator's local ADC, derives the bearer from `COLAB_SHARED_SECRET`,
-re-checks the tunnel rule and runs the bot's own readiness probe, a qwen3.8
-chat reply at `COLAB_CHAT_THINK`, the red-circle vision check and a nimble
-routing decision; each check SKIPs, with the reason, without a READY
-session, and a dry-run session gets only the probe.
+`COLAB_DRY_RUN=true` assigns a CPU runtime and starts the VM with
+`DRYRUN=1`, whose stub upstream passes the readiness probe and answers
+inference with Ollama's busy 503: the whole control path, registration and
+READY included, runs for a fraction of a compute unit while users still get
+API answers. `scripts/live_gate.py --path colab` checks a READY session
+from the operator's machine with the bot's own probe and clients (a dry-run
+session gets only the probe). How to run both: DEPLOY.md (Colab 層).
 
 ### What cannot be automated
+
+These stay with a person (the steps are in DEPLOY.md, Colab 層):
 
 - Buying the Colab plan, accepting Colab's terms and holding the
   dedicated account.
@@ -520,15 +493,12 @@ session, and a dry-run session gets only the probe.
 - A named tunnel's Cloudflare setup (optional; quick tunnels need none).
 - The first live runs: the CPU dry run, then one A100 run that measures
   the assign latency, the cold start, the burn rate and VRAM, and the
-  routing eval (`scripts/evals/routing_eval.py`) that re-tunes
-  `COLAB_ROUTER_CONFIDENCE`, `COLAB_ROUTER_THINK_ON` and
-  `COLAB_ROUTER_THINK_OFF`.
-- Approving a new model digest when a pinned tag is republished: fetch
-  the manifest by tag, check its sha256 and what changed, then update
-  `colab/versions.json` and the model profiles together (colab/README.md).
-  Until then a republished qwen3.8 fails every boot at `pull`, and a
-  republished nimble leaves routing to the rules and the API router. A
-  new nimble checkpoint also needs the routing eval before its pin.
+  routing eval that re-tunes the `COLAB_ROUTER_*` gates.
+- Approving a new model digest when a pinned tag is republished
+  (colab/README.md, 釘住的 digest). Until then a republished qwen3.8 fails
+  every boot at `pull`, and a republished nimble leaves routing to the
+  rules and the API router; a new nimble checkpoint also needs the routing
+  eval before its pin.
 - Turning the tier on for everyone (`MODEL_PATH_PREFERENCE=colab`), and
   acting on DENYLISTED or a policy warning.
 

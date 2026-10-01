@@ -66,7 +66,7 @@ the seams that make a later move mechanical.
 4. **Cost and footprint.** Cloud Run runs with `--memory 512Mi`,
    `--max-instances=1` and scale to zero; the measured peak RSS is about
    124 MB (DEPLOY.md, 記憶體預算). Resolving `langgraph` on 2026-09-30 pulls 38
-   packages, about 20 of them not in `requirements.lock` (langchain-core,
+   packages, about 20 of them not in `uv.lock` (langchain-core,
    langsmith, langgraph-checkpoint, langgraph-prebuilt, langgraph-sdk,
    orjson, ormsgpack, tenacity, xxhash, zstandard, ...): more to hash-pin,
    audit and import on a cold start, and LangSmith tracing to keep switched

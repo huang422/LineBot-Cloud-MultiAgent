@@ -24,8 +24,8 @@ venv/
 .vscode/
 .DS_Store
 
-# Not needed at runtime. Keep requirements.lock: the image installs it with
-# --require-hashes.
+# Not needed at runtime. Never list pyproject.toml or uv.lock: the
+# Dockerfile's first stage exports uv.lock for pip --require-hashes.
 README.md
 DEPLOY.md
 docs/
@@ -33,6 +33,4 @@ CONTEXT.md
 tests/
 scripts/
 infra/
-requirements-dev.in
-requirements-dev.txt
 LICENSE

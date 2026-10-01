@@ -98,7 +98,7 @@ that could reach inside:
 
 httpx has no public hook for the network backend, so the fetcher's
 transport swaps its connection pool for one that has it. httpx and httpcore
-are pinned in `requirements.lock`, and `tests/test_page_fetcher.py` fails
+are pinned in `uv.lock`, and `tests/test_page_fetcher.py` fails
 if the swap stops taking effect.
 
 Text comes out of **trafilatura 2.2.0** (fast, precision-first, no comments,

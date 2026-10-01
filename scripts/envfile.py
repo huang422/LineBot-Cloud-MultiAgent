@@ -331,6 +331,13 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return parse_env_text(path.read_text(encoding="utf-8"))
 
 
+def upper_keys(values: Mapping[str, str]) -> dict[str, str]:
+    """*values* keyed in upper case, as the app's settings read them
+    (pydantic-settings, ``case_sensitive=False``): of two keys that differ
+    only in case, the later one wins."""
+    return {key.upper(): value for key, value in values.items()}
+
+
 def remove_env_keys(text: str, keys: Iterable[str]) -> str:
     """Drop every assignment of ``keys`` (case-insensitive), keeping all other lines
     (and a leading byte order mark) as-is."""
@@ -712,8 +719,8 @@ def git_ignores(root: Path, relative: str) -> bool | None:
 
 
 def cmd_get(args: argparse.Namespace) -> int:
-    values = parse_env_file(Path(args.file))
-    value = values.get(args.key)
+    values = upper_keys(parse_env_file(Path(args.file)))
+    value = values.get(args.key.upper())
     if value is None:
         return 1
     print(value)
@@ -721,7 +728,7 @@ def cmd_get(args: argparse.Namespace) -> int:
 
 
 def cmd_dump(args: argparse.Namespace) -> int:
-    values = parse_env_file(Path(args.file))
+    values = upper_keys(parse_env_file(Path(args.file)))
     fields: list[str] = []
     for key, value in values.items():
         fields += [key, value, "1" if is_placeholder_value(value) else "0"]
@@ -879,7 +886,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Utilities for reading .env-style files.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    get_parser = subparsers.add_parser("get", help="Read a single key from an env file.")
+    get_parser = subparsers.add_parser(
+        "get", help="Read a single key from an env file (case-insensitive, like the app)."
+    )
     get_parser.add_argument("--file", required=True, help="Path to env file.")
     get_parser.add_argument("key", help="Key to read.")
     get_parser.set_defaults(func=cmd_get)
@@ -887,7 +896,8 @@ def build_parser() -> argparse.ArgumentParser:
     dump_parser = subparsers.add_parser(
         "dump",
         help=(
-            "Print every key python-dotenv reads, each followed by its value and 1 "
+            "Print every key python-dotenv reads, in upper case (the app reads keys "
+            "case-insensitively), each followed by its value and 1 "
             "when that value is an example placeholder (else 0), all NUL-terminated: "
             "one python3 start for a script that reads many keys."
         ),

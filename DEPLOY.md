@@ -156,11 +156,11 @@ cp .env.example .env
 
 | 角色 | 用途 | 各層（依序） |
 | --- | --- | --- |
-| `router` | LLM 路由（一律關閉思考） | Colab `nimble:9b` → NVIDIA `nvidia/nemotron-3-super-120b-a12b`（json_schema，temperature 0.1）→ NVIDIA `nvidia/nemotron-3-ultra-550b-a55b`（沒有結構化輸出，只靠 prompt 要求 JSON；temperature 0.1）→ OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`（json_object，effort none） |
-| `chat` | 對話、網搜回答 | Colab `qwen3.8:27b-mtp-q4_K_M`（`COLAB_CHAT_THINK`，70 秒；後面有 API 層時最多用到期限前 20 秒）→ NVIDIA `nvidia/nemotron-3-ultra-550b-a55b`（關閉思考）→ `qwen/qwen3.8-27b:free`（effort none）→ `nvidia/nemotron-3-ultra-550b-a55b:free`（effort none） |
-| `thinking` | router 判定需要思考時先走這裡，之後接 chat 各層（關閉思考） | Colab qwen3.8（`COLAB_DEEP_THINK`）→ NVIDIA Ultra（開啟思考，`medium_effort`；Ultra 收到 `reasoning_budget` 會回 400，所以不送，`NVIDIA_THINKING_BUDGET` 只放寬 `max_tokens`）→ `qwen/qwen3.8-27b:free`（effort medium）→ `nvidia/nemotron-3-ultra-550b-a55b:free`（effort medium） |
-| `vision` | 有圖片的請求（不論哪個 agent 回答） | Colab qwen3.8（70 秒）→ NVIDIA `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`（關閉思考，temperature 0.2，max_tokens 1024，15 秒）→ NVIDIA `meta/muse-glimmer-30b`（關閉思考，35 秒）→ `qwen/qwen3.8-27b:free`（effort none，15 秒）。API 層一律不思考，需要思考時只有 Colab 思考；引用的圖片若是 URL（訊息快取 / GCS），Colab 依設計略過（摘要記 `skip(by design: url image)`），直接由 API 層回答；有圖片的 prompt 只帶 3000 字的上下文（`IMAGE_CONTEXT_CHARS`：profile、最近對話由新到舊整輪保留、剩下的給長期摘要），整體約 4k tokens（2026-10-01 實測 muse-glimmer 在 6.2k tokens 要約 40 秒，4k 約 8.5–19 秒）。Nano Omni 忙碌時回 503（不到 1 秒），直接換下一層。Nemotron Ultra 只收文字，所以不在這個角色 |
-| `utility` | 記憶摘要、搜尋查詢規劃、生圖提示改寫與說明文字 | NVIDIA `nvidia/nemotron-3-super-120b-a12b`（關閉思考，temperature 0.2）→ NVIDIA `nvidia/nemotron-3-ultra-550b-a55b`（關閉思考）→ `nvidia/nemotron-3-ultra-550b-a55b:free`（effort none） |
+| `router` | LLM 路由（一律關閉思考） | Colab `clef-flash:9b` → NVIDIA `nvidia/nemotron-3-super-120b-a12b`（json_schema，temperature 0.1）→ NVIDIA `nvidia/nemotron-3-ultra-550b-a55b`（沒有結構化輸出，只靠 prompt 要求 JSON；temperature 0.1）→ OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`（json_object，effort none） |
+| `chat` | 對話、網搜回答 | Colab `qwen3.8:27b-mtp-q4_K_M`（`COLAB_CHAT_THINK`，70 秒；後面有 API 層時最多用到期限前 20 秒）→ NVIDIA `nvidia/nemotron-3-super-120b-a12b`（關閉思考，用模型卡取樣，45 秒）→ NVIDIA `nvidia/nemotron-3-ultra-550b-a55b`（關閉思考，25 秒）→ `dots-studio/dots-3-note-preview:free`（effort none，40 秒）→ `nvidia/nemotron-3-ultra-550b-a55b:free`（effort none，40 秒） |
+| `thinking` | router 判定需要思考時先走這裡，之後接 chat 各層（關閉思考） | Colab qwen3.8（`COLAB_DEEP_THINK`，110 秒）→ NVIDIA Super（開啟思考，`NVIDIA_THINKING_BUDGET` 當作 `reasoning_budget`，60 秒）→ NVIDIA Ultra（開啟思考，`medium_effort`；Ultra 收到 `reasoning_budget` 會回 400，所以不送，`NVIDIA_THINKING_BUDGET` 只放寬 `max_tokens`；30 秒）→ `dots-studio/dots-3-note-preview:free`（effort medium，120 秒）→ `nvidia/nemotron-3-ultra-550b-a55b:free`（effort medium，30 秒）。思考層合計最多用剩餘時間的一半（240 秒 turn 期限下不到 120 秒）；dots-3 的 120 秒讓這一半、而不是它自己的上限結束它：NIM 很快失敗時它可以想完整個一半，兩個 NVIDIA 層都卡住時拿這一半剩下的時間（不到它 chat 層的 40 秒，所以那一層照樣會跑）。之後接的 chat 各層（關閉思考）會跳過已經逾時、給的時間又沒多多少的模型（見下面 2026-10-16 部署後那一條） |
+| `vision` | 有圖片的請求（不論哪個 agent 回答） | Colab qwen3.8（70 秒）→ NVIDIA `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`（關閉思考，temperature 0.2，max_tokens 1024，15 秒）→ NVIDIA `meta/muse-glimmer-30b`（關閉思考，35 秒）→ `dots-studio/dots-3-note-preview:free`（effort none，20 秒）。API 層一律不思考，需要思考時只有 Colab 思考；引用的圖片若是 URL（訊息快取 / GCS），Colab 依設計略過（摘要記 `skip(by design: url image)`），直接由 API 層回答；有圖片的 prompt 只帶 3000 字的上下文（`IMAGE_CONTEXT_CHARS`：profile、最近對話由新到舊整輪保留、剩下的給長期摘要），整體約 4k tokens（2026-10-01 實測 muse-glimmer 在 6.2k tokens 要約 40 秒，4k 約 8.5–19 秒）。Nano Omni 忙碌時回 503（不到 1 秒），直接換下一層。Nemotron Ultra 與 Super 只收文字，所以不在這個角色 |
+| `utility` | 記憶摘要、搜尋查詢規劃、生圖提示改寫與說明文字 | NVIDIA `nvidia/nemotron-3-super-120b-a12b`（關閉思考，temperature 0.2，30 秒）→ NVIDIA `nvidia/nemotron-3-ultra-550b-a55b`（關閉思考，30 秒）→ `dots-studio/dots-3-note-preview:free`（effort none，30 秒）→ `nvidia/nemotron-3-ultra-550b-a55b:free`（effort none，30 秒）。四層合計 120 秒，在記憶摘要的 180 秒期限（`MEMORY_SUMMARY_TIMEOUT_SECONDS`）內；摘要超過 400 字時，更新前、後各最多一次的排序呼叫也走這幾層，共用同一個 180 秒期限（同一輪裡逾時過的模型不再呼叫） |
 | `embed` | episodic recall | NVIDIA `nvidia/nemotron-3-embed-1b`（取前 1024 維） |
 | `image` | 生圖 | NVIDIA `black-forest-labs/flux.2-klein-4b` → `black-forest-labs/flux.1-dev`（50 steps） |
 
@@ -170,13 +170,16 @@ cp .env.example .env
 - Colab 層要設定 `COLAB_ENABLED=true` 才會啟用（見下方〈Colab 層〉），否則一律停用（`/health/detail` 會列出原因）。`MODEL_PATH_PREFERENCE=colab`（預設）讓各角色先走 Colab、通過限流的觸發訊息自動開機；`api` 讓 Colab 層排到最後、只在已 READY 時使用，只有 `!colab on` 會開機。READY 前 Colab 層一律立刻略過，回覆不會等它；READY 後 Colab 層最多用到回答期限（`REPLY_WINDOW_SECONDS`）前 20 秒（期限短時最多一半），留給 API 層
 - 取樣：層自己的 `temperature` 優先，其次是模型卡建議值（NVIDIA Nemotron Ultra / Super：temperature 1.0、top_p 0.95；muse-glimmer：0.6），最後才是 `CHAT_TEMPERATURE` 等 agent 設定（只影響 OpenRouter 這些沒有模型卡取樣的層）。Colab 的 qwen3.8 固定用 Qwen 建議的取樣（不思考 0.7 / top_p 0.8 / top_k 20 / presence penalty 1.5，思考 1.0 / 0.95 / 20），除非該層自己設 `temperature`。router 的 Super 與 Ultra 層、utility 的 Super 層刻意維持低溫（0.1 / 0.1 / 0.2），讓路由 JSON、搜尋查詢與記憶摘要穩定
 - OpenRouter 的 `nvidia/nemotron-3-*:free` 由 NVIDIA 託管，可能與 NIM 同時失效，所以排在各角色最後
-- 2026-10-01 起預設不再使用 Gemma（NIM 的 Gemma 4 31B 實測每次都卡住，OpenRouter 的 Gemma `:free` 每次都回 429）：router、chat、utility 改由 Nemotron 3 Ultra 備援；Ultra 只收文字、沒有結構化輸出，所以 vision 的備援改為 OpenRouter qwen3.8，router 的 Ultra 層只靠 prompt 要求 JSON，由 orchestrator 的容錯解析器（加一次修復提示）讀取。`MODEL_ROLES` 若還寫著 Gemma 的 id，`check-v3` 會提醒（不擋部署），請自行改掉
+- 2026-10-01 起預設不再使用 Gemma（NIM 的 Gemma 4 31B 實測每次都卡住，OpenRouter 的 Gemma `:free` 每次都回 429）：router、chat、utility 改由 Nemotron 3 Ultra 備援；Ultra 只收文字、沒有結構化輸出，所以 vision 的備援改為 OpenRouter qwen3.8（2026-10-16 再換成 dots-3，見下一條），router 的 Ultra 層只靠 prompt 要求 JSON，由 orchestrator 的容錯解析器（加一次修復提示）讀取。`MODEL_ROLES` 若還寫著 Gemma 的 id，`check-v3` 會提醒（不擋部署），請自行改掉
+- 2026-10-16：OpenRouter 自 2026-10-13 起撤下 `qwen/qwen3.8-27b:free`（沒有 endpoint，呼叫回 HTTP 404「This model is unavailable for free」），chat、thinking、vision 改用 `dots-studio/dots-3-note-preview:free`（上游 AtlasCloud，不是 NVIDIA；實測工具呼叫 2.0 秒，紅圈圖片在 effort none 下 1.7 秒、0 個推理 token、以繁體中文回答；不送 `reasoning` 物件時預設會推理，所以關閉思考一定要送 effort none）。它是預覽版，OpenRouter 的 `GET /api/v1/models` 列出 `expiration_date` 2026-12-31，每日下架檢查會提早標成 `expiring`（只記 INFO，不告警；它是備援）。OpenRouter 的 Gemma `:free` 同日仍回 429（上游共用額度），所以沒有選它。同一天 NIM Ultra 回 503 時 Super 一句話要 19–51 秒，chat 因此加上 NVIDIA Super（順序見下一條）；OpenRouter 以 HTTP 200 回傳、body 裡帶 `error` 物件的上游錯誤，改依 `code` 對應成同一種錯誤（例如 503 算暫時性失敗，連續兩次冷卻 2 分鐘），不再當成空回覆
+- 2026-10-16 部署後：NIM Ultra 每次呼叫都卡住（正式環境 5/5 逾時：chat 40 秒、thinking 100 秒、utility 30 秒；A/B 測試關閉思考 0/4、開啟思考 0/2），NIM Super 都有回答（A/B 關閉思考 4/4、12–52 秒，開啟思考 3/3、22–50 秒；正式環境短回答 1–3 秒）。所以 chat 與 thinking 的 NVIDIA 層改成 Super 在前、Ultra 在後（chat：Super 45 秒、Ultra 25 秒；thinking：Super 60 秒、Ultra 30 秒、dots-3 120 秒），utility 加上 dots-3（Super、Ultra 都失敗時記憶摘要原本沒有 NVIDIA 以外的層）。chat 的兩個 NVIDIA 層都用滿時，dots-3 在 90 秒回覆期限內只剩約 20 秒再扣掉路由（與搜尋）的時間，路由本身卡在 NIM 時就沒有時間；超過約 1000 tokens 的 Super 回答（A/B 中 1121 tokens 要 52 秒）會超過 45 秒、算一次逾時。另外，同一輪（一次 fallback walk；chat 的整個工具迴圈與之後不帶工具的重試共用同一份紀錄）裡逾時、而且至少跑了 `MIN_TIER_SECONDS` 的模型，後面同 provider、同 id 的層，若它當時用滿了自己的上限，或這一層給的時間沒有比它已經用掉的多出 `MIN_TIER_SECONDS` 以上，就直接跳過（摘要記 `skip(timed out earlier)`）：例如 thinking 層的 Ultra 逾時後，接在後面、關閉思考的 chat 層 Ultra（25 秒）不再等一次；思考層的一半只給 dots-3 15 秒時，它關閉思考的 chat 層（40 秒）照樣會跑（a05be403 就是這樣回答的）。下一個請求照常會再呼叫它。代價：思考請求不再讓卡住的模型冷卻（思考層的逾時本來就不算，關閉思考的那一層又被跳過），只有呼叫到它的一般請求與 utility 會；NIM 很快失敗而 dots-3 想滿整個一半還沒回答時，它關閉思考的層也會被跳過
+- 2026-10-16 晚上：router 的 NIM Ultra 層從 12 秒縮短為 6 秒（健康時約 2 秒就能路由，當天每次都卡住；一則短續問曾在 Super、Ultra 各等 12 秒，最後 OpenRouter Super 1.2 秒回答），Super 維持 12 秒、順序不變。OpenRouter 回 502 / 503（HTTP 狀態，或 200 body 裡 `error` 的 `code`）且說明上游無法使用或過載（`metadata.error_type` 為 `provider_unavailable` / `provider_overloaded`，或訊息含 overloaded、temporarily unavailable）時，等 1 秒用同一個請求重送一次：dots-3 只有 AtlasCloud 一個上游，當天記憶摘要與 live gate 各遇到一次，幾秒後重試就成功。只重送一次、只在模型沒有冷卻且免費額度還有剩時（重送也算一次請求），而且仍受該層時間上限約束（到時間會被取消）；重送前那次失敗不計入冷卻：一次請求加上重送最多算一次失敗，要兩個請求都失敗（共 4 次回應）才冷卻；4xx、429、逾時與被擋下的付費 id 一律不重送。「再搜尋一次」「重新查」「確認一下」「在查詢確認一下」（在是再的常見錯字，只認這種整句短訊息）這類要求重新搜尋或確認的短訊息也算續問：沿用上一輪的 agent，不再交給 LLM router，搜尋前也會依上一輪對話改寫查詢。記憶摘要改成只請模型回「移除：編號」加上「- 新項目」，由程式套用（Super 原本會逐字照抄舊摘要再往後加，摘要越壓越長，794 字時每輪都被 768 token 截斷）；長期摘要上限 400 字，超過時請 utility 層排序、依序保留放得下的項目，本輪新增的項目不會在同一輪被裁掉；模型寫的「予以保留」「不納入長期記憶」這類說明句會被刪掉；沒照格式、會弄丟舊項目的回答改由下一層重試（ADR-0003）。部署後每個摘要超過 400 字的聊天室，第一次壓縮會被裁到 400 字以內（那個 794 字的群組約剩 2 項舊項目加新項目），log 會出現 INFO「Memory summary trimmed from … to … characters」；WARNING「Memory summary trim failed」表示這輪沒有層給出可用的排序，摘要先整份保留、下一輪再裁；WARNING「Memory summary rejected: … did not follow the update format」表示該層沒照格式，已改用下一層
 - 要換某個角色的模型，用 `MODEL_ROLES`（JSON，只取代列出的角色；格式見 `.env.example`）。JSON 錯誤、未知角色 / provider、付費或已下架的 id、模型做不到該角色時，啟動會直接失敗，不會默默略過
 - `FORCE_TIER`（例如 `nvidia`、`openrouter`）**只供測試**：停用其他所有層；若讓 router / chat / vision / utility 沒有可用的層，啟動會失敗。正式環境請留空
 - 已下架、會回 HTTP 410 的 `qwen/qwen3.5-397b-a17b`、`qwen/qwen3.5-122b-a10b`、`nvidia/nv-embedqa-e5-v5`（包括寫在 `MODEL_ROLES` 裡），以及已停用的 `ORCHESTRATOR_MODEL` / `ORCHESTRATOR_FALLBACK_MODEL`、`REQUIRE_REASONING_MODELS=true`，部署腳本會直接拒絕（`python3 scripts/envfile.py check-v3 --file .env`）；修正指令：`python3 scripts/envfile.py migrate-v3 --file .env`（`MODEL_ROLES` 需自行修改）
 - 舊版的逐模型 key（`NVIDIA_MODEL`、`ROUTER_MODEL`、`*_FALLBACK_MODEL`、`IMAGE_GEN_*`、`NVIDIA_EMBEDDING_MODEL`、各種 reasoning 開關等）已不再讀取；啟動時會列出仍存在的 key 名稱，`migrate-v3` 會把它們刪掉
 - thinking 參數（`chat_template_kwargs.enable_thinking` 與 Ultra 的 `medium_effort`、Super 的 `reasoning_budget`、muse-glimmer 的 `reasoning_effort`、OpenRouter `reasoning`）由應用程式依模型與角色層自動套用，不需要改 deploy 指令
-- 每天第一次 `/internal/cron` 會排入一個 `eol` 任務，用公開的模型目錄檢查每個設定中的模型是否下架、即將停用或沒有 endpoint（不帶 API key）；狀態改變時記 ERROR log，結果在 `/health/detail`
+- 每天第一次 `/internal/cron` 會排入一個 `eol` 任務，用公開的模型目錄檢查每個設定中的模型是否下架、即將停用或沒有 endpoint（不帶 API key；OpenRouter 的到期日只列在 `GET /api/v1/models`，每次檢查讀一次）；狀態改變時記 log：變成下架、停用、不在目錄或沒有 endpoint（模型真的不能用）記 ERROR；變成 `expiring`（只有到期日、模型還能用，例如 dots-3 的 2026-12-31）或回到 ok 只記 INFO，不告警，等它真的沒有 endpoint 才記 ERROR。結果只存在記憶體，所以每個新 instance（部署、Cloud Run 換掉 instance）第一次檢查都會再記一次所有不正常的模型，同一個 instance 之後每天的檢查沒有變化就不記；結果在 `/health/detail`
 
 如果你有開：
 
@@ -292,6 +295,8 @@ Cloud Run 用 request-based 計費（`--cpu-throttling`）：只有在處理 req
 ```
 
 這就是這個專案現在整理好的「一鍵重部署」方式。
+
+`COLAB_ENABLED=true` 而且有 Colab session 在跑時，先 `!colab off` 等它回到 `IDLE` 再部署（原因見〈Colab 層〉）：VM 的檔案只在開機時上傳，舊 session 不會跟著新版本更新。
 
 預設行為：
 
@@ -542,7 +547,7 @@ app 的每一行只出現一次（`… | INFO | linebot | …`；修正前的舊
 gcloud beta run services logs tail "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
   | grep --line-buffered ' | linebot | '
 
-# 每則訊息一行摘要：走 Colab 還是 API、路由由誰決定、nimble 機率、最後由哪個模型回答
+# 每則訊息一行摘要：走 Colab 還是 API、路由由誰決定、Colab 路由（clef-flash）的機率、最後由哪個模型回答
 gcloud beta run services logs tail "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
   | grep --line-buffered '] summary pref='
 
@@ -550,9 +555,9 @@ gcloud beta run services logs tail "$SERVICE_NAME" --project "$PROJECT_ID" --reg
 gcloud beta run services logs tail "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
   | grep --line-buffered -E ' \| (WARNING|ERROR) +\| linebot \| '
 
-# 只看 Colab 開機、狀態變化與 nimble 路由
+# 只看 Colab 開機（含挑到的 Ollama 版本）、狀態變化與 clef-flash 路由
 gcloud beta run services logs tail "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
-  | grep --line-buffered -E ' \| linebot \| .*(Colab|colab|nimble)'
+  | grep --line-buffered -E ' \| linebot \| .*(Colab|colab|clef-flash)'
 
 # 追單一則訊息的完整過程：把 9e4000b2 換成 summary／Input 那行開頭 [ ] 裡的編號
 gcloud beta run services logs tail "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
@@ -631,14 +636,14 @@ gcloud logging read \
 每則有回覆（或回了錯誤訊息）的訊息，在回覆送出後記一行 INFO `summary`（`!new`、`!colab` 與被擋下的訊息不記）。原本逐次呼叫的 log 照舊；這一行把它們收成一句：
 
 ```text
-[a615fdd7] summary pref=colab path=colab route=colab:nimble:9b agent=chat out=text think=off answer=colab:qwen3.8:27b-mtp-q4_K_M 2.8s answer_think=low delivery=reply total=3.4s router_p=[agent={chat:0.93,web_search:0.04,vision:0.02,image_gen:0.01} conf=0.84 gate=0.75 ok | format={text:0.97,voice:0.02,image:0.01} conf=0.90 ok | think p=0.05 (on>=0.85 off<=0.15) -> off] tiers=[colab:qwen3.8:27b-mtp-q4_K_M ok 2.8s]
+[a615fdd7] summary pref=colab path=colab route=colab:clef-flash:9b agent=chat out=text think=off answer=colab:qwen3.8:27b-mtp-q4_K_M 2.8s answer_think=low delivery=reply total=3.4s router_p=[agent={chat:0.95,web_search:0.03,vision:0.01,image_gen:0.01} conf=0.93 gate=0.00 ok | format={text:0.97,voice:0.02,image:0.01} conf=0.96 ok | think p=0.05 (on>=0.85 off<=0.15) -> off] tiers=[colab:qwen3.8:27b-mtp-q4_K_M ok 2.8s]
 ```
 
 | 欄位 | 意思 |
 |---|---|
 | `pref` | `MODEL_PATH_PREFERENCE`：`colab` 或 `api`；`COLAB_ENABLED=false` 時是 `api-only` |
 | `path` | 實際寫出回答的是哪一種 tier：`colab`、`api`，沒有回答是 `none` |
-| `route` | 誰決定 agent：`rules`（快速規則）、`colab:nimble:9b`（Colab 路由）、回答的 API 路由 tier（例如 `nvidia:nvidia/nemotron-3-super-120b-a12b`），或 `fallback`（路由都失敗，預設 chat） |
+| `route` | 誰決定 agent：`rules`（快速規則）、`colab:clef-flash:9b`（Colab 路由）、回答的 API 路由 tier（例如 `nvidia:nvidia/nemotron-3-super-120b-a12b`），或 `fallback`（路由都失敗，預設 chat） |
 | `agent` / `out` / `think` | 路由結果：agent、輸出形式（`text`／`voice`／`image`）、是否需要思考 |
 | `answer` | 回答的 tier 與該次呼叫秒數；工具迴圈呼叫多次時看最後一次呼叫（真正送出的那個回答），最後一次失敗就是沒有回答，即使前面幾輪成功。沒有回答時 `answer=none`，出錯時加 `error=<例外類別>(<最後的 provider 錯誤> <狀態碼>)` |
 | `answer_think` | 回答的 tier 實際怎麼思考：`off`、`on`，或 Colab／OpenRouter 的等級。Colab chat 預設以 `COLAB_CHAT_THINK=low` 思考，所以 `think=off` 時仍可能是 `answer_think=low` |
@@ -647,8 +652,8 @@ gcloud logging read \
 | `delivery` | 怎麼送出的：`reply`（免費）或 `push`（reply 確定失敗後改用；同一則訊息只要有一次是 push 就記 `push`）；什麼都沒送出時不出現 |
 | `sent=no` | 回覆沒送達（reply 確定失敗，push 也失敗） |
 | `total` | 從開始處理到這一行的秒數 |
-| `router_p` | nimble 每個問題的機率（只列定義的選項，高到低、取兩位）、信心值對門檻（`gate`，`COLAB_ROUTER_CONFIDENCE`）的 `ok`／`fail`，以及 `needs_thinking` 的機率與 `COLAB_ROUTER_THINK_ON`／`_OFF` 得出的結果（`rules->on` 表示落在中間，由規則決定）。沒被採用時結尾是 `gate fail -> API router`。沒問 nimble（快速規則、API 路由先答）是 `n/a`；問了但沒用上時寫原因，例如 `n/a(nimble not READY)`、`n/a(nimble busy)` |
-| `tiers` | 回答這一段走過的每個 tier 與結果：`ok`、`tools`（只要求呼叫工具、沒寫回答：工具迴圈中間的一輪）、`skip(<原因>)`、`timeout`、`rate_limited`、`empty`、`error(<類別> <狀態碼>)`，後面是秒數。常見的 `skip`：`skip(Colab session not READY)`、`skip(by design: url image)`（引用的圖片是 URL，Colab 只收內嵌圖片，依設計交給 API 視覺層，不算失敗）；生圖被 FLUX 安全過濾擋下是 `error(ContentFilteredError 200)`，會改用 FLUX.1-dev 再試一次。依 tier 分組：tier 按第一次用到的順序，各自的結果按發生順序，同一結果連續出現寫成 `x<次數>`（秒數相加），所以思考與不思考兩輪走過同一批 tier 時，看不出中間跑了哪一個。呼叫不只一次時加 `calls=<次數>` |
+| `router_p` | Colab 路由（clef-flash）每個問題的機率（只列定義的選項，高到低、取兩位）、信心值（(最高機率 − 1/N) / (1 − 1/N)）對門檻（`gate`，`COLAB_ROUTER_CONFIDENCE`）的 `ok`／`fail`，以及 `needs_thinking` 的機率與 `COLAB_ROUTER_THINK_ON`／`_OFF` 得出的結果（`rules->on` 表示落在中間，由規則決定）。沒被採用時結尾是 `gate fail -> API router`（只在 `COLAB_ROUTER_CONFIDENCE` 大於 0 時出現；預設 0.0 一律採用機率最高的選項，`gate=0.00` 永遠是 `ok`）；agent 選 `image_gen` 但 output 不是 image 時結尾是 `image_gen without image output -> API router`（預設 0.0 下唯一不採用的情況）。沒問 Colab 路由（快速規則、API 路由先答）是 `n/a`；問了但沒用上時寫原因，例如 `n/a(router not READY)`、`n/a(router busy)`、`n/a(router off for this session)` |
+| `tiers` | 回答這一段走過的每個 tier 與結果：`ok`、`tools`（只要求呼叫工具、沒寫回答：工具迴圈中間的一輪）、`skip(<原因>)`、`timeout`、`rate_limited`、`empty`、`error(<類別> <狀態碼>)`，後面是秒數。常見的 `skip`：`skip(Colab session not READY)`、`skip(by design: url image)`（引用的圖片是 URL，Colab 只收內嵌圖片，依設計交給 API 視覺層，不算失敗）、`skip(timed out earlier)`（同一輪前面的層已經讓這個模型逾時，這一層給的時間又沒多多少，例如思考層的 Ultra 逾時後，關閉思考的 Ultra 不再呼叫）、`skip(thinking half used)`（思考層合計的一半時間已用完）；生圖被 FLUX 安全過濾擋下是 `error(ContentFilteredError 200)`，會改用 FLUX.1-dev 再試一次。依 tier 分組：tier 按第一次用到的順序，各自的結果按發生順序，同一結果連續出現寫成 `x<次數>`（秒數相加），所以思考與不思考兩輪走過同一批 tier 時，看不出中間跑了哪一個。呼叫不只一次時加 `calls=<次數>` |
 
 這一行只有 tier 名稱、固定的結果字樣與數字：不含使用者文字、prompt、URL 或錯誤訊息內容（使用者文字另外記在 `Input:` 那一行，已截斷）。啟動時另有一行 `Model roles (MODEL_PATH_PREFERENCE=...)` 列出每個角色的 tier 順序。
 
@@ -660,7 +665,7 @@ gcloud logging read \
   --format='value(timestamp,textPayload)'
 ```
 
-只看 Colab 回答的（`path=api` 看 API）、或 nimble 沒被採用的：
+只看 Colab 回答的（`path=api` 看 API）、或 Colab 路由沒被採用的：
 
 ```bash
 gcloud logging read \
@@ -720,7 +725,7 @@ v2 使用的 `qwen/qwen3.5-397b-a17b`（2026-07-27 起）與 `nvidia/nv-embedqa-
    ```
 
    它會刪掉指定已下架模型的 key、`ORCHESTRATOR_MODEL` / `ORCHESTRATOR_FALLBACK_MODEL`、`REQUIRE_REASONING_MODELS`，以及所有已不再讀取的舊 key（逐模型設定、reasoning 開關等，完整清單見 `src/config.py` 的 `REMOVED_ENV_KEYS`），讓模型角色表的預設生效；`MODEL_ROLES` 不會被改動，裡面若有已下架的 id 請自行修改。確認沒問題後可刪除備份檔（`.env.bak.*` 符合 `.env.*`，不會被上傳到 Cloud Build 或打包進 image）。
-2. **（建議）跑 live gate**，用你的 key 驗證 bot 實際送出的每條路徑（全部約 NVIDIA 33 次、OpenRouter 15-18 次請求，其中 `--path tiers` 依預設角色表約 NVIDIA 11 次、OpenRouter 7 次）：
+2. **（建議）跑 live gate**，用你的 key 驗證 bot 實際送出的每條路徑（全部約 NVIDIA 37 次、OpenRouter 16-19 次請求，其中 `--path tiers` 依預設角色表約 NVIDIA 13 次、OpenRouter 8 次）：
 
    ```bash
    .venv312/bin/python scripts/live_gate.py                 # 全部（含 tiers）
@@ -730,13 +735,13 @@ v2 使用的 `qwen/qwen3.5-397b-a17b`（2026-07-27 起）與 `nvidia/nv-embedqa-
    .venv312/bin/python scripts/live_gate.py --only tier.router   # 只測 router 角色的每一層
    ```
 
-   模型檢查的 tier 選項來自實際的角色表（含 `MODEL_ROLES`、`FORCE_TIER`）；角色表裡沒有或被 `FORCE_TIER` 停用的模型會顯示 SKIP；`--path colab` 需要一個 READY 的 Colab session（見〈Colab 層〉），沒有時顯示 SKIP 與原因。Ultra 思考檢查確認送出 `medium_effort` 且沒有 `reasoning_budget`；router 的 Ultra 檢查（`nvidia.ultra.router`）確認沒有送 `response_format`（Ultra 沒有結構化輸出，只靠 prompt 要求 JSON），回覆由 orchestrator 的容錯解析器讀取；視覺檢查（`nvidia.omni.vision` 15 秒、`nvidia.muse.vision` 35 秒）用紅色圓形 PNG，而且只給該層的時間上限，和 bot 的 fallback chain 一致；Nano Omni 忙碌時回 503 會 FAIL（bot 會立刻改用 muse-glimmer），用 `--only nvidia.omni.vision` 重跑即可；路由與工具檢查走 bot 的 fallback chain，超過該層 `timeout_s` 的模型一樣 FAIL；`nvidia.ultra.plain` 會標出回覆是否帶 Markdown / LaTeX（送 LINE 前會被清掉）。
+   模型檢查的 tier 選項來自實際的角色表（含 `MODEL_ROLES`、`FORCE_TIER`）；角色表裡沒有或被 `FORCE_TIER` 停用的模型會顯示 SKIP；`--path colab` 需要一個 READY 的 Colab session（見〈Colab 層〉），沒有時顯示 SKIP 與原因。Ultra 思考檢查確認送出 `medium_effort` 且沒有 `reasoning_budget`；router 的 Ultra 檢查（`nvidia.ultra.router`）確認沒有送 `response_format`（Ultra 沒有結構化輸出，只靠 prompt 要求 JSON），回覆由 orchestrator 的容錯解析器讀取；視覺檢查（`nvidia.omni.vision` 15 秒、`nvidia.muse.vision` 35 秒）用紅色圓形 PNG，而且只給該層的時間上限，和 bot 的 fallback chain 一致；Nano Omni 忙碌時回 503 會 FAIL（bot 會立刻改用 muse-glimmer），用 `--only nvidia.omni.vision` 重跑即可；路由與工具檢查走 bot 的 fallback chain，超過該層 `timeout_s` 的模型一樣 FAIL（工具迴圈檢查有 chat 的第一個 API 層 Super 與 Ultra 兩個：`nvidia.super.tools`、`nvidia.ultra.tools`）；`nvidia.ultra.plain` 會標出回覆是否帶 Markdown / LaTeX（送 LINE 前會被清掉）。
 
    `--path tiers`（`all` 也包含）用 `.env` 的設定建出和 bot 完全相同的角色表（含 `MODEL_ROLES`、`MODEL_PATH_PREFERENCE`、`FORCE_TIER`），依呼叫順序對**每個角色的每一層**透過 bot 自己的 provider 與 payload 各送一次最小請求，檢查 id 為 `tier.<角色>.<第幾層>.<provider>:<model>`：
 
-   - `router`：要回出 orchestrator 解析器讀得懂的繁中訊息路由決定；Colab 的 nimble 走 `SystemOneRouter`
+   - `router`：要回出 orchestrator 解析器讀得懂的繁中訊息路由決定；Colab 的 clef-flash 走 `SystemOneRouter`
    - `chat`：繁中短回答（思考依該層設定）；`thinking`：一題繁中推理題，開啟思考（budget 依該層），必須有推理內容
-   - `vision`：紅色圓形 PNG 要被描述成紅色、圓形；`utility`：一段繁中記憶摘要（被 `max_tokens` 截斷算 FAIL）
+   - `vision`：紅色圓形 PNG 要被描述成紅色、圓形；`utility`：對一份兩項的合成舊摘要回「移除：…」加「- 新項目」格式的繁中摘要更新，套用後舊項目都要還在、至少新增一項（被 `max_tokens` 截斷、沒照格式而會弄丟舊項目都算 FAIL）
    - `embed`：向量維度要等於 `EMBEDDING_DIMENSIONS`；`image`：要拿到圖片 bytes
 
    每項最多等該層的 `timeout_s` 再加 2 秒；請求會自動間隔，維持在 NVIDIA 每分鐘 40 次、OpenRouter 每分鐘 20 次以內；OpenRouter 一旦回 `free-models-per-day`（帳號每日上限），本次執行後面的 OpenRouter 檢查都不再送出，顯示 SKIP「daily cap」。Colab 層沿用 `--path colab` 的 session 探查，沒有 READY 的 session 時 SKIP；被 `FORCE_TIER` 或 `COLAB_ROUTER_ENABLED=false` 關掉的層 SKIP，缺 key 而停用的層 FAIL。最後另外印一張表：角色、第幾層、provider:model、PASS/FAIL/SKIP、延遲、備註（最多約 80 字，失敗時含 HTTP 狀態碼，不含 key 或完整回覆）。
@@ -883,10 +888,10 @@ gcloud run services update-traffic "${SERVICE_NAME}" \
 ## 運行注意事項
 
 - `/health` 可能回 `200` 但 `ready_for_webhook=false`，要看 payload 不能只看 HTTP status。ready 的條件是 LINE 憑證齊全，且 chat 角色至少有一個不依賴 Colab 的可用層（`NVIDIA_API_KEY` 或 `OPENROUTER_API_KEY` 其一即可）；原因列在 `/health/detail` 的 `warnings`。
-- **回覆期限（reply window）**：每個請求的一般回答（不需思考）都要在 LINE 事件時間 + `REPLY_WINDOW_SECONDS`（90 秒）內完成，私訊與群組都一樣，不論由 Colab 或 API 層回答；Colab 是第一個可用層時最多用到期限前 20 秒，留給 API 備援層。需要思考的回答與生圖，不論私訊或群組，都可以用到 `TURN_DEADLINE_SECONDS`（從開始處理起算 240 秒）；開始回答時期限只剩不到 `MIN_TIER_SECONDS` 的一般回答（延遲或重送的事件，或路由太慢用掉了期限）也改用這個 turn 期限。LINE 的 reply token 只保證約 1 分鐘有效，但送出一律先試免費的 reply，不會因為已經過了多久就略過；LINE 確定拒絕（4xx，例如 reply token 無效或過期，或請求根本沒送出）才改用 push，結果不明（送出後逾時、5xx）視為已送出、不再 push，push 不計數也不設上限。期限內每一層模型只拿「自己的上限」與「剩餘時間」中較小的那個，思考層合計最多只用剩餘時間的一半；網路搜尋必須在期限前 20 秒結束。生圖被安全過濾擋下時的處理見 `.env.example` 的 image 角色說明。Colab 還沒 READY 時一律略過，不會讓回覆等它。
+- **回覆期限（reply window）**：每個請求的一般回答（不需思考）都要在 LINE 事件時間 + `REPLY_WINDOW_SECONDS`（90 秒）內完成，私訊與群組都一樣，不論由 Colab 或 API 層回答；Colab 是第一個可用層時最多用到期限前 20 秒，留給 API 備援層。需要思考的回答與生圖，不論私訊或群組，都可以用到 `TURN_DEADLINE_SECONDS`（從開始處理起算 240 秒）；開始回答時期限只剩不到 `MIN_TIER_SECONDS` 的一般回答（延遲或重送的事件，或路由太慢用掉了期限）也改用這個 turn 期限。LINE 的 reply token 只保證約 1 分鐘有效，但送出一律先試免費的 reply，不會因為已經過了多久就略過；LINE 確定拒絕（4xx，例如 reply token 無效或過期，或請求根本沒送出）才改用 push，結果不明（送出後逾時、5xx）視為已送出、不再 push，push 不計數也不設上限。期限內每一層模型只拿「自己的上限」與「剩餘時間」中較小的那個，思考層合計最多只用剩餘時間的一半；同一輪裡已經逾時的模型，若當時已用滿自己的上限，或後面的層給的時間沒有多出 `MIN_TIER_SECONDS` 以上，就不再呼叫；網路搜尋必須在期限前 20 秒結束。生圖被安全過濾擋下時的處理見 `.env.example` 的 image 角色說明。Colab 還沒 READY 時一律略過，不會讓回覆等它。
 - 語音和圖片生成需要 `GCS_BUCKET_NAME`，沒設定時文字回覆仍正常。
 - 目前只支援**語音輸出**，不支援把使用者傳來的音訊自動轉文字。
-- 主 prompt 記憶是「1 份長期摘要 + 上次壓縮後的近期文字訊息」（累積到 6 則開始壓縮；上次壓縮不到 `COMPACTION_DEBOUNCE_SECONDS`＝120 秒時，等下一則訊息再壓縮，累積到安全上限的一半則立即壓縮）。近期訊息依 LINE 收到的時間排序，壓縮完成時只移除被摘要的那幾則（依訊息 id），壓縮期間進來的訊息不會遺失。預設使用 **in-memory backend**（per-instance），重部署 / cold start 會重置；要長期保存請啟用下方的 **Firestore backend**。
+- 主 prompt 記憶是「1 份長期摘要（最多 400 字，超過時保留 utility 層排序最重要、放得下的項目）+ 上次壓縮後的近期文字訊息」（累積到 6 則開始壓縮；上次壓縮不到 `COMPACTION_DEBOUNCE_SECONDS`＝120 秒時，等下一則訊息再壓縮，累積到安全上限的一半則立即壓縮）。近期訊息依 LINE 收到的時間排序，壓縮完成時只移除被摘要的那幾則（依訊息 id），壓縮期間進來的訊息不會遺失。預設使用 **in-memory backend**（per-instance），重部署 / cold start 會重置；要長期保存請啟用下方的 **Firestore backend**。
 - 發訊息者的 user profile facts（最新 10 筆、500 字內）會以 `[使用者 profile，僅供參考]` 區塊提供給 chat / vision / web_search（路由與生圖提示改寫不會看到）；profile 在程序內快取 10 分鐘。顯示名稱與 last seen 在回覆送出後才更新，且只在名稱改變或距上次寫入滿 24 小時才寫入。
 - `!new` 會清空當前 user / group / room 的近期記憶、長期摘要與 episodic recall 記錄（`!new` 之後才送出的訊息會保留），並回覆 `Let's start a new chat!`；跨聊天室的 `linebot_user_profile/{user_id}` 不會被 `!new` 刪除，需要時請在 Firestore 手動刪除。
 - 長期摘要內容會直接寫進 log（loaded / updated / cleared），請自行評估 Cloud Logging 的敏感資訊風險。
@@ -896,10 +901,10 @@ gcloud run services update-traffic "${SERVICE_NAME}" \
 - 問題裡的「今天 / 最近 / 這個月 / 今年」這類時間詞會換成對應的時間範圍（day / week / month / year）；指過去一段日曆期間的詞依台北時間換成涵蓋整段期間的最短範圍（昨天 → week、上週 → month、上個月 → year、去年不設範圍），昨天、上個月、去年還會在查詢後補上明確日期（2026 年問「去年」會加上「2025年」）。Tavily 的 `country` 只在一般主題時送出。查無結果時拿掉主題、時間與國家篩選重搜一次（最多一次）；Tavily 失敗（連不上、拒絕、限流，而不是查無結果）時不重搜，免得再等一次逾時。
 - 搜尋到結果後，會讀取前 `SEARCH_FETCH_TOP_N`（3）筆的網頁全文，所有網頁共用 `SEARCH_FETCH_BUDGET_SECONDS`（6 秒），時間到就用已讀到的；使用者傳來的網址也先在本機讀取，讀不到的才交給 Tavily extract；還是讀不到時，回覆開頭註明連結無法開啟，模型不會猜測該網頁內容。整個搜尋階段必須在回覆期限前 20 秒結束，留給模型回答；讀網頁會在搜尋階段結束前 0.5 秒停下，所以已讀到的網頁一定會用上，沒讀完的會取消。可以用整個 turn 期限的回答（思考模式的回答，不論私訊或群組，或開始時回覆期限只剩不到 `MIN_TIER_SECONDS` 的回答；reply token 失效後改用 push 送出）在回覆期限不夠搜尋時，改以它自己的期限計算，不會因此跳過搜尋。
 - 本機讀網頁會擋掉所有內部位址：只允許 http / https 的 80 / 443 埠；`localhost`、`metadata.google.internal`、`*.internal`、`*.local` 直接拒絕；解析出的每個 IP 都必須是公開位址（私有網段、loopback、169.254.169.254 等 link-local、CGNAT 100.64.0.0/10、multicast、IPv4-mapped / 6to4 包著的內部位址都拒絕），連線直接連到檢查過的 IP；redirect 最多 5 次、每次重新檢查；只讀 HTML / 純文字，每頁最多 `SEARCH_FETCH_MAX_BYTES`（2 MB）。
-- 續問（例如問完台北天氣再問「那高雄呢」）會先由 utility 模型依最近對話與調度摘要改寫成完整搜尋字串；只有短而獨立的查詢（中文少於 8 字、英文少於 4 個詞）直接照原文搜尋。
+- 續問（例如問完台北天氣再問「那高雄呢」，或問完股價再說「再搜尋確認一次」）會先由 utility 模型依最近對話與調度摘要改寫成完整搜尋字串；只有短而獨立的查詢（中文少於 8 字、英文少於 4 個詞）直接照原文搜尋。
 - 排程訊息需要同時設定 `SCHEDULED_MESSAGES_ENABLED=true`、`SCHEDULED_GROUP_ID`、`INTERNAL_CRON_SECRET`，以及至少一個排程 job。觸發機制：Cloud Run 不再用 in-process timer，改由 Cloud Scheduler 每分鐘 POST `/internal/cron`，因此 Cloud Run 可以維持 `min-instances=0`、走免費額度。
 - 群組訊息緩衝、引用訊息快取、事件去重與「摘要是否已排入」都是 **in-memory / per-instance**，依賴 `max-instances=1`；緩衝會在達到門檻（或逾時後有新訊息）、機器人回答該群組之前、cron 逾時掃描或 instance 關閉時寫入；寫入失敗的訊息會留在緩衝等下次再寫。
-- Colab 的忙碌閘門（每個 Colab 模型一個 `asyncio.Semaphore(1)`：模型正在回答時直接跳過，不排隊）與斷路器（qwen3.8 連續 3 次失敗跳過 120 秒；nimble 的失敗只讓 nimble 冷卻，不會跳過 Colab 對話）都在程序內，前提是 `max-instances=1`；session 狀態本身存在 Firestore `{prefix}_colab/state`，冷啟動後讀一次。
+- Colab 的忙碌閘門（每個 Colab 模型一個 `asyncio.Semaphore(1)`：模型正在回答時直接跳過，不排隊）與斷路器（qwen3.8 連續 3 次失敗跳過 120 秒；clef-flash 的失敗只讓 clef-flash 冷卻，不會跳過 Colab 對話）都在程序內，前提是 `max-instances=1`；session 狀態本身存在 Firestore `{prefix}_colab/state`，冷啟動後讀一次。
 - `!colab on` / `off` / `status` 只限 `LINE_ADMIN_USER_IDS`（其他人回「此指令僅限管理員」），在群組不需 @ 也會觸發；`!whoami` 只在私訊回覆自己的 userId，在群組只提醒改用私訊。
 - Prompts 從 `prompts/*.md` 載入，調整路由或語氣不需要改 Python 程式碼。
 - LINE 不會渲染 Markdown：每則送出的文字（回覆、圖片說明、朗讀的文字）都會先去掉 `**粗體**`、`##` 以下的標題、程式碼圍欄那兩行、行內程式碼、LaTeX（`\( … \)`、`\[ … \]`、`$$…$$`）、`[文字](http…)` 連結語法與表格分隔列（網址、emoji 與程式碼內容保留，圍欄內的程式碼原樣保留，`src/utils/line_text.py`），再做 OpenCC 簡轉繁。
@@ -908,9 +913,9 @@ gcloud run services update-traffic "${SERVICE_NAME}" \
 
 ## Colab 層
 
-Colab A100 上的 Ollama 0.35.0 跑 `qwen3.8:27b-mtp-q4_K_M`（對話、視覺、思考）與 `nimble:9b`（`/v1/systemone` 路由），所有使用者都先走 Colab（Colab 條款禁止提供網路服務與讓第三方使用 runtime，這個風險已由你接受，見 [ADR-0010](docs/adr/0010-colab-ollama-tier.md)）。**任何訊息都不會等 Colab**：READY 前一律由 NVIDIA → OpenRouter 立即回覆。READY 後由 Colab 先回答，期限和其他請求一樣是事件時間 + `REPLY_WINDOW_SECONDS`（90 秒），Colab 層最多用到期限前 20 秒；送出一律先試 reply，reply token 已失效才改用 push。開機、保活、釋放都由每分鐘的 cron 決定，慢的步驟走 `colab` Cloud Tasks。
+Colab A100 上的 Ollama（每次開機時由 bot 挑 GitHub 最新正式版，至少 0.40.4；查不到或不能用時用 `colab/versions.json` 釘住的備援 0.40.5）跑 `qwen3.8:27b-mtp-q4_K_M`（對話、視覺、思考）與 `clef-flash:9b`（`/v1/systemone` 路由；2026-10-16 起取代 `nimble:9b`），兩個模型都跟著 tag 走，所有使用者都先走 Colab（Colab 條款禁止提供網路服務與讓第三方使用 runtime，這個風險已由你接受，見 [ADR-0010](docs/adr/0010-colab-ollama-tier.md)）。**任何訊息都不會等 Colab**：READY 前一律由 NVIDIA → OpenRouter 立即回覆。READY 後由 Colab 先回答，期限和其他請求一樣是事件時間 + `REPLY_WINDOW_SECONDS`（90 秒），Colab 層最多用到期限前 20 秒；送出一律先試 reply，reply token 已失效才改用 push。開機、保活、釋放都由每分鐘的 cron 決定，慢的步驟走 `colab` Cloud Tasks。
 
-這一節只放操作步驟。VM 端的程式、協定、釘住的 digest、VRAM 與疑難排解（包括 bot 放棄請求時 auth proxy 如何中止 Ollama、`auth_proxy.log` 的 `cancelled after N s`）見 [colab/README.md](colab/README.md)；每個 Colab 設定的說明在 `.env.example` 的 Colab 區塊。
+這一節只放操作步驟。VM 端的程式、協定、Ollama 版本與模型 tag、VRAM 與疑難排解（包括 bot 放棄請求時 auth proxy 如何中止 Ollama、`auth_proxy.log` 的 `cancelled after N s`）見 [colab/README.md](colab/README.md)；每個 Colab 設定的說明在 `.env.example` 的 Colab 區塊。
 
 ### 第一次設定
 
@@ -932,7 +937,7 @@ Colab A100 上的 Ollama 0.35.0 跑 `qwen3.8:27b-mtp-q4_K_M`（對話、視覺�
    - `COLAB_ADC_PATH` 維持預設 `/secrets/colab/adc.json`（部署把 token 掛載在這裡；不一致時部署會警告）。**不要**把 `GOOGLE_APPLICATION_CREDENTIALS` 指到這個檔案：那會讓 Firestore、GCS、Cloud Tasks 全部改用這個個人帳號
    - `COLAB_ENABLED=true`，加上第一次實跑用的 `COLAB_DRY_RUN=true` 與 `MODEL_PATH_PREFERENCE=api`：這樣只有 `!colab on` 會開機，一般訊息照舊走 API、不會觸發開機
    - Cloud Tasks 必須可用（`INTERNAL_TASKS_SECRET` 有值、`TASKS_MODE` 不是 `inline`）：控制器的 `colab` 任務一律排進 Cloud Tasks、從不在 cron request 內執行；部署會另建專用 queue `CLOUD_TASKS_COLAB_QUEUE`（預設 `linebot-colab`，2 個並行名額），不佔 LINE 事件的 queue
-   - 選用（說明見 `.env.example` 的 Colab 區塊）：named tunnel（`COLAB_TUNNEL_MODE=named` 加 `COLAB_TUNNEL_HOST` / `COLAB_TUNNEL_TOKEN`；在 Cloudflare 建立 tunnel，把公開網址指到 VM 上的 `http://127.0.0.1:8081`（auth proxy））、`COLAB_ROUTER_*`（nimble 路由開關與暫定門檻，之後用〈路由評測〉重新調整）、`COLAB_CHAT_THINK` / `COLAB_DEEP_THINK`、`COLAB_ACCOUNT_DEDICATED=true`（帳號真的只給 bot 用時）
+   - 選用（說明見 `.env.example` 的 Colab 區塊）：named tunnel（`COLAB_TUNNEL_MODE=named` 加 `COLAB_TUNNEL_HOST` / `COLAB_TUNNEL_TOKEN`；在 Cloudflare 建立 tunnel，把公開網址指到 VM 上的 `http://127.0.0.1:8081`（auth proxy））、`COLAB_ROUTER_*`（clef-flash 路由開關與暫定門檻，之後用〈路由評測〉重新調整；`COLAB_ROUTER_CONFIDENCE` 預設 0.0，一律採用機率最高的選項）、`COLAB_CHAT_THINK` / `COLAB_DEEP_THINK`、`COLAB_ACCOUNT_DEDICATED=true`（帳號真的只給 bot 用時）
 
    缺 Firestore、`COLAB_SHARED_SECRET` 太短、沒有 `INTERNAL_CRON_SECRET`、讀不到 token 或在 Cloud Run 上沒有 Cloud Tasks 時，服務照常啟動但 Colab 層維持停用，原因記在 WARNING log 與 `/health/detail` 的 `colab.reason`。
 4. **部署**：`./scripts/deploy_cloud_run.sh`。輸出應有 `Mounting linebot-colab-adc version N at /secrets/colab/adc.json`；部署後 `/health/detail` 的 `colab.enabled` 是 `true`。
@@ -941,10 +946,14 @@ Colab A100 上的 Ollama 0.35.0 跑 `qwen3.8:27b-mtp-q4_K_M`（對話、視覺�
    2. `.venv312/bin/python scripts/live_gate.py --path colab`：`colab.probe`（經 tunnel 與 auth proxy 跑 bot 的 readiness probe）應為 PASS，其他三項 SKIP（乾跑沒有推論）。gate 以本機 ADC 讀 Firestore 的 session 文件，先執行 `gcloud auth application-default login`，用**能讀這個專案 Firestore 的帳號**（通常是你自己），不是 Colab 專用帳號；bearer 由 `.env` 的 `COLAB_SHARED_SECRET` 推導，不會印出。
    3. `!colab off`：`DRAINING` → `IDLE`，runtime 被釋放。另外建議再跑一次、不下 `!colab off`，確認控制器在 `COLAB_IDLE_TTL_SECONDS`（15 分鐘）後自己釋放。
    4. 確認沒有留下 runtime：`!colab status` 是 `IDLE`；用專用帳號在 Colab 網頁的「管理工作階段」看不到 runtime。
-6. **一次真正的 A100**：兩個模型的 digest 都已釘在 `colab/versions.json`。qwen3.8 不符或沒有完全在 GPU 上時開機會失敗並自我釋放（連續 3 次後 Colab 層停用）；nimble 有問題時照常 READY，只是這個 session 不用 nimble 路由（細節見 [colab/README.md](colab/README.md)〈釘住的 digest〉與〈VRAM〉）。`COLAB_DRY_RUN=false`、部署、`!colab on`，約 4–8 分鐘後 READY，再跑 `.venv312/bin/python scripts/live_gate.py --path colab`，四項都要 PASS：readiness probe（兩個模型都完全在 VRAM）、qwen3.8 的繁中回覆（think=`COLAB_CHAT_THINK`）、紅色圓形 PNG 的視覺、nimble 路由決定。記下 assign 到 READY 的時間、`!colab status` 的 CU 每小時用量（約 5.4）、`/health/detail` 的 `colab.gpu`（應是 40 GB 的 A100，不是 80 GB 的 high-mem；`chat_on_gpu`、`router_on_gpu`、`used_mib` 是 warm-up 後的 VRAM，照 colab/README.md〈VRAM〉記錄），再用 `scripts/evals/routing_eval.py` 重新調整 `COLAB_ROUTER_*` 門檻；可以的話在群組同時送兩則訊息確認忙碌閘門會改走 API，最後 `!colab off`。
+6. **一次真正的 A100**：Ollama 由 bot 在開機時挑（log 有 `Colab launch: Ollama <版本>, the latest release` 或 `the pinned fallback`），兩個模型跟著 tag 走，digest 只記錄（READY 時每個模型一行 INFO，tag 動過會寫 `tag moved since it was verified`）。qwen3.8 沒拉到、沒載入或沒有完全在 GPU 上時開機會失敗並自我釋放（連續 3 次後 Colab 層停用）；clef-flash 有問題時照常 READY，只是這個 session 不用它路由，READY 時會有一筆 ERROR `Colab session READY without its router: …` 寫明原因（細節見 [colab/README.md](colab/README.md)〈模型 tag 與 digest〉與〈VRAM〉）。`COLAB_DRY_RUN=false`、部署、`!colab on`，約 4–8 分鐘後 READY，再跑 `.venv312/bin/python scripts/live_gate.py --path colab`，四項都要 PASS：readiness probe（兩個模型都完全在 VRAM）、qwen3.8 的繁中回覆（think=`COLAB_CHAT_THINK`）、紅色圓形 PNG 的視覺、clef-flash 路由決定（`colab.router`）。記下 assign 到 READY 的時間、`!colab status` 的 CU 每小時用量（約 5.4）、`/health/detail` 的 `colab.gpu`（應是 40 GB 的 A100，不是 80 GB 的 high-mem；`chat_on_gpu`、`router_on_gpu`、`used_mib` 是 warm-up 後的 VRAM，照 colab/README.md〈VRAM〉記錄；clef-flash 的 VRAM 從沒實測過，這次一定要記），再用 `scripts/evals/routing_eval.py` 重新調整 `COLAB_ROUTER_*` 門檻；可以的話在群組同時送兩則訊息確認忙碌閘門會改走 API，最後 `!colab off`。
 7. **對所有人開啟**：A100 那次正常後，把 `MODEL_PATH_PREFERENCE` 改回 `colab`（預設，也可以刪掉這一行）並部署。之後通過限流的觸發訊息會讓控制器開機（CU 餘額扣掉一次開機加一次閒置（約 2.7 CU）仍 ≥ `COLAB_MIN_CU_BALANCE`、當日用量加上它仍 ≤ `COLAB_DAILY_CU_CAP` 時），閒置 15 分鐘或滿 11 小時釋放。
 
 關閉：`!colab off` 立即生效（session 會釋放，`!colab on` 恢復）；要完全停用就設 `COLAB_ENABLED=false` 再部署，部署會同時卸下 token 的掛載。
+
+**有 session 在跑時，部署前先 `!colab off`**：VM 的檔案（`bootstrap.py`、`versions.json`…）只在開機時上傳，正在跑的 session 會繼續用它開機時的 Ollama 與模型。新版 bot 若改了 Colab 的要求（例如 2026-10-16 起 Ollama 至少 0.40.4，舊 session 是 0.35.0），健康檢查會判它不健康，連續 3 次（約 3 分鐘）後才排空釋放，這段時間 Colab 層都被跳過。所以先 `!colab off`、確認 `!colab status` 是 `IDLE`、部署，再 `!colab on`（或等下一則觸發訊息自動開機）。
+
+**部署 2026-10-16（clef-flash）這一版之前先改 `.env`**：`COLAB_ROUTER_CONFIDENCE` 的預設改成 `0.0`（一律採用 clef-flash 機率最高的選項，argmax）。從舊的 `.env.example` 複製來的 `.env`（包括正在用的那份）明寫 `0.75` 或 `0.90`，要改成 `0.0`（或刪掉這一行），否則 clef-flash 的判斷幾乎都會交給 API router：實際訊息的信心值只有 0.39–0.43。
 
 ### 重新產生 token
 
@@ -958,20 +967,21 @@ token 外洩時：用專用帳號登入 https://myaccount.google.com/connections
 
 ### 註冊與檢查
 
-VM 開機後以簽章 POST `/internal/colab/register`，bot 檢查 tunnel 網址並經 tunnel 跑 readiness probe，全部通過才標成 READY（檢查的內容見 [colab/README.md](colab/README.md)〈端到端流程〉第 5 步與〈協定摘要〉）。探測失敗回 503，VM 會重試；原因寫在 `!colab status` 與 `/health/detail` 的 `colab.last_error`。nimble 被這個 session 停用時列在 `/health/detail` 的 `colab.unpinned`／`colab.off_gpu`，qwen3.8 對話照常。
+VM 開機後以簽章 POST `/internal/colab/register`，bot 檢查 tunnel 網址並經 tunnel 跑 readiness probe，全部通過才標成 READY（檢查的內容見 [colab/README.md](colab/README.md)〈端到端流程〉第 5 步與〈協定摘要〉）。探測失敗回 503，VM 會重試；原因寫在 `!colab status` 與 `/health/detail` 的 `colab.last_error`。clef-flash 被這個 session 停用（沒拉到、沒載入或沒有完全在 VRAM）時，READY 當下記一筆 ERROR 寫明原因（含 VM 回報的拉取或載入錯誤），並列在 `/health/detail` 的 `colab.off_gpu`，qwen3.8 對話照常；健康檢查與路由層不會再為它記 WARNING 或 ERROR（路由層只記一行 INFO）；之後健康檢查才發現它被踢出 VRAM 時記一筆 WARNING，第一則要路由的訊息再記一筆 ERROR `clef-flash:9b off for this Colab session: …`。`colab.digests` 是 probe 看到的 digest，`colab.tags_moved` 列出和驗證過的不同的模型（只是資訊）。
 
 ### 排查
 
-先看 `!colab status`（狀態、開機步驟、最後錯誤、冷卻時間、CU 餘額與用量）。常見狀況（assign 412／503／400、DENYLISTED、`invalid_grant`、digest 不符、tunnel 連不上、524）的原因與處理見 [colab/README.md](colab/README.md)〈疑難排解〉。
+先看 `!colab status`（狀態、開機步驟、最後錯誤、冷卻時間、CU 餘額與用量）。常見狀況（assign 412／503／400、DENYLISTED、`invalid_grant`、模型拉不到、tunnel 連不上、524）的原因與處理見 [colab/README.md](colab/README.md)〈疑難排解〉。
 
 ```bash
 # session 狀態（不含網址與金鑰）
 curl -fsS -H "X-Cron-Token: $CRON_SECRET" "$SERVICE_URL/health/detail" \
   | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)["colab"], indent=2, ensure_ascii=False))'
 
-# Colab 相關 log（READY、註冊被拒、斷路器、nimble 不確定或停用、控制器的狀態轉換）
+# Colab 相關 log（挑到的 Ollama 版本、READY 與各模型 digest、沒有路由模型的原因、註冊被拒、斷路器、
+#   clef-flash 不確定或停用、控制器的狀態轉換）
 gcloud logging read \
-  "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE_NAME}\" AND textPayload=~\"Colab|nimble\"" \
+  "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE_NAME}\" AND textPayload=~\"Colab|clef-flash\"" \
   --project "$PROJECT_ID" \
   --limit 50 \
   --format='table(timestamp,severity,textPayload)'
@@ -979,7 +989,7 @@ gcloud logging read \
 
 ### 路由評測（routing eval）
 
-`scripts/evals/routing_eval.py` 拿 `scripts/evals/routing_zh_tw.jsonl`（約 270 則人工標註的繁中 LINE 訊息：四個 agent、三種輸出、要不要思考，含 `tests/test_routing_rules.py` 與 `prompts/orchestrator.md` 的所有已知誤判、續問、引用、英文與中英混合、prompt injection）比較規則（離線）、Colab 的 nimble、NVIDIA 與 OpenRouter 的路由層，並用 nimble 的原始機率掃描門檻，建議 `COLAB_ROUTER_CONFIDENCE` / `COLAB_ROUTER_THINK_ON` / `COLAB_ROUTER_THINK_OFF`：在設定允許的範圍內，gated precision 達到 `--target-precision`（預設 0.95）時覆蓋率最高的值。
+`scripts/evals/routing_eval.py` 拿 `scripts/evals/routing_zh_tw.jsonl`（約 325 則人工標註的繁中 LINE 訊息：四個 agent、三種輸出、要不要思考，含 `tests/test_routing_rules.py` 與 `prompts/orchestrator.md` 的所有已知誤判、續問、引用、英文與中英混合、prompt injection）比較規則（離線）、Colab 的 clef-flash、NVIDIA 與 OpenRouter 的路由層，並用 clef-flash 回報的信心值與機率掃描門檻，建議 `COLAB_ROUTER_CONFIDENCE` / `COLAB_ROUTER_THINK_ON` / `COLAB_ROUTER_THINK_OFF`：在設定允許的範圍內，gated precision 達到 `--target-precision`（預設 0.95）時覆蓋率最高的值。
 
 ```bash
 .venv312/bin/python scripts/evals/routing_eval.py --dry-run     # 只印計畫，不送任何請求
@@ -990,10 +1000,10 @@ gcloud logging read \
 
 - `colab`、`nvidia`、`openrouter` 會用真的 key 送請求，**要你同意才跑**，而且一定要明確給 `--env-file`（不會自動讀 `.env`），沒給就 SKIP。
 - `colab` 需要一個 READY、能推論的 session（不是 `COLAB_DRY_RUN`）：先 `!colab on`，`live_gate.py --path colab` 通過後再跑。它和 live gate 一樣用本機 ADC 讀 Firestore 的 session 文件、由 `COLAB_SHARED_SECRET` 推導 bearer，一次送一則；READY 只維持到上次健康檢查後 120 秒，所以跑得比這久時它會自己再做健康檢查，檢查失敗就停下。
-- 任何候選停下而留下沒跑的訊息（`not_run`）時，它標為 `partial`，整個評測以 exit code 1 結束，也不給 nimble 門檻建議；確定要用這些部分結果時加 `--allow-partial`。
+- 任何候選停下而留下沒跑的訊息（`not_run`）時，它標為 `partial`，整個評測以 exit code 1 結束，也不給 Colab 路由的門檻建議；確定要用這些部分結果時加 `--allow-partial`。
 - NVIDIA 每分鐘最多 40 次、OpenRouter 20 次，和線上的 bot 共用額度，bot 忙碌時請在離峰執行或加上 `--max-rpm`。OpenRouter 免費模型每天只有 `OPENROUTER_FREE_DAILY_LIMIT` 次（50；買過 credits 是 1,000），完整一輪要 270–540 次，不夠時用 `--limit` 取平均分布的樣本。
-- 報告（Markdown 與 JSON）寫在 `tmp/routing-eval/`：各路由的覆蓋率與準確率（全部訊息，以及規則放行給模型路由的訊息）、agent 混淆表、各標籤準確率、誤判清單，和 nimble 的門檻曲線與建議值（每個點附 95% Wilson 下界，另有 output_format 混淆表；思考門檻只在通過建議信心門檻的訊息上掃描）；不含 key、bearer 或 tunnel 網址。把建議值寫進 `.env` 再部署；nimble 換 checkpoint 或量化版本時要重跑。
-- 資料集只有約 270 則、模型路由實際會看到的約 167 則，而且八成是 chat：建議值只能當**暫定**，報告裡的 95% 下界常常遠低於目標 precision。每個門檻至少要有 20 則通過才會被建議（20 則全對的下界約 0.84）；累積更多實際訊息的標註後再重跑、再收緊。
+- 報告（Markdown 與 JSON）寫在 `tmp/routing-eval/`：各路由的覆蓋率與準確率（全部訊息，以及規則放行給模型路由的訊息）、agent 混淆表、各標籤準確率、誤判清單，和 Colab 路由的門檻曲線與建議值（每個點附 95% Wilson 下界，另有 output_format 混淆表；思考門檻只在通過建議信心門檻的訊息上掃描）；不含 key、bearer 或 tunnel 網址。把建議值寫進 `.env` 再部署；路由模型換掉、它的 tag 動過（READY 的 log 寫 `tag moved since it was verified`）或 Ollama 換了大版本時要重跑。
+- 資料集只有約 325 則、模型路由實際會看到的約 194 則，而且八成是 chat：建議值只能當**暫定**，報告裡的 95% 下界常常遠低於目標 precision。每個門檻至少要有 20 則通過才會被建議（20 則全對的下界約 0.84）；累積更多實際訊息的標註後再重跑、再收緊。
 
 ---
 

@@ -755,6 +755,9 @@ class ToolLoopTests(unittest.TestCase):
         self.assertEqual(answer.kwargs["tool_choice"], "none")
         self.assertEqual(answer.kwargs["deadline"], deadline)
         self.assertNotIn("hold_deadline_timeouts", answer.kwargs)
+        # One record of the models that timed out, for every request.
+        self.assertIs(second_round.kwargs["timed_out"], first_round.kwargs["timed_out"])
+        self.assertIs(answer.kwargs["timed_out"], first_round.kwargs["timed_out"])
 
     def test_the_first_round_running_out_of_the_deadline_is_the_end(self) -> None:
         from src.providers.fallback_chain import DeadlineExceededError
@@ -909,6 +912,58 @@ class ToolLoopTests(unittest.TestCase):
         self.assertGreater(deadline - calls[2][1], reserve - 0.1)
         health.record_failure.assert_not_called()
 
+    def test_a_later_round_does_not_wait_again_on_a_model_that_timed_out(self) -> None:
+        # Round 1: Ultra hangs its whole limit, dots-3 asks for a search.
+        # Round 2 and the answer skip Ultra: every request of the loop shares
+        # one record of the models that timed out.
+        search_call = self._search_call
+
+        class Hung:
+            name = "nvidia"
+            calls = 0
+
+            async def generate(self, model, messages, **kwargs):
+                Hung.calls += 1
+                await asyncio.sleep(5)
+
+        class Dots:
+            name = "openrouter"
+            choices: list[str] = []
+
+            async def generate(self, model, messages, **kwargs):
+                Dots.choices.append(kwargs.get("tool_choice"))
+                if len(Dots.choices) == 1:
+                    return search_call(model)
+                return ProviderResponse(text="answer", model=model)
+
+        from src.providers.fallback_chain import Tier
+
+        async def search(args, ctx):
+            return {"status": "ok", "context": "x"}
+
+        reg = build_default_registry()
+        reg.replace_executor("web_search", search)
+        chain = FallbackChain(ModelHealth(), min_tier_seconds=0.01)
+        tiers = [Tier(Hung(), "ultra", timeout_s=0.05), Tier(Dots(), "dots:free", timeout_s=5.0)]
+
+        async def go():
+            return await run_tool_loop(
+                fallback_chain=chain,
+                targets=tiers,
+                messages=[{"role": "user", "content": "hi"}],
+                registry=reg,
+                context=ToolContext(),
+                max_iterations=1,
+                deadline=time.monotonic() + 60,
+            )
+
+        result = asyncio.run(go())
+
+        self.assertEqual(result.response.text, "answer")
+        self.assertEqual(result.tool_calls_executed, ["web_search"])
+        self.assertEqual(Dots.choices, ["auto", "none"])
+        self.assertEqual(Hung.calls, 1)
+
     def test_tool_results_lose_the_fence_labels(self) -> None:
         from src.agents.base_agent import CURRENT_MESSAGE_LABEL, QUOTE_FOOTER
 
@@ -1030,9 +1085,11 @@ class ChatAgentToolLoopTests(unittest.IsolatedAsyncioTestCase):
                 plain_call = chain.generate.await_args_list[-1]
                 self.assertNotIn("tools", plain_call.kwargs)
                 self.assertEqual([m["role"] for m in plain_call.kwargs["messages"]], ["user"])
-                # Within the same deadline, which the first round had whole.
+                # Within the same deadline, which the first round had whole,
+                # and without the models that already timed out in the loop.
                 first_round = chain.generate.await_args_list[0]
                 self.assertEqual(plain_call.kwargs["deadline"], first_round.kwargs["deadline"])
+                self.assertIs(plain_call.kwargs["timed_out"], first_round.kwargs["timed_out"])
 
     async def test_no_retry_without_time_left_or_with_every_tier_rate_limited(self) -> None:
         from src.models.agent_request import AgentRequest

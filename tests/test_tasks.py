@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import ExitStack, contextmanager
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -684,6 +685,31 @@ class TaskHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(process.await_count, 2)
 
+    async def test_a_copy_that_arrives_while_the_turn_runs_is_dropped_at_once(self) -> None:
+        # The event is marked before its turn starts, so a second delivery
+        # during a slow answer (a thinking Colab turn) never starts another.
+        started, release = asyncio.Event(), asyncio.Event()
+        runs: list[dict] = []
+
+        async def slow(event, pipeline):
+            runs.append(event)
+            started.set()
+            await release.wait()
+
+        line = SimpleNamespace(send_text=AsyncMock())
+        deps = TaskDeps(pipeline=_pipeline(line=line), process_event=slow)
+        first = asyncio.create_task(handle_task("event", {"event": _group_event("01S")}, deps))
+        await asyncio.wait_for(started.wait(), 1)
+
+        copy = _group_event("01S", deliveryContext={"isRedelivery": True})
+        self.assertTrue(await handle_task("event", {"event": copy}, deps))
+        self.assertFalse(first.done())
+        release.set()
+        self.assertTrue(await first)
+
+        self.assertEqual(len(runs), 1)
+        line.send_text.assert_not_called()
+
     def test_event_dedupe_key_prefers_webhook_event_id(self) -> None:
         self.assertEqual(event_dedupe_key(_group_event("01EVT")), "01EVT")
         no_id = _group_event("")
@@ -1025,6 +1051,28 @@ class WebhookTaskTests(_AppTestCase):
             sorted(kind for kind, _ in queue.calls), ["cache_image", "event", "passive_flush"]
         )
         dispatch.assert_awaited_once_with("event", {"event": triggered})
+
+    def test_an_event_run_inline_is_not_answered_again_by_its_queued_copy(self) -> None:
+        # Cloud Tasks gave no clear answer, so the turn ran inside the
+        # webhook; the task it may have created arrives afterwards, and LINE
+        # redelivers the slow webhook. One turn in all.
+        process = AsyncMock()
+        event = _group_event("01DUP")
+        queue = _RecordingQueue(error=TaskMaybeQueuedError("ReadTimeout"))
+        with self._client(queue=queue) as client, patch.object(
+            main_module, "TaskDeps", partial(TaskDeps, process_event=process)
+        ), patch.object(task_queue_module.logger, "error"):
+            self._post_webhook(client, [event])
+            copy = client.post(
+                "/internal/tasks/event",
+                content=json.dumps({"event": event}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Tasks-Token": _TASKS_SECRET},
+            )
+            self._post_webhook(client, [dict(event, deliveryContext={"isRedelivery": True})])
+
+        self.assertEqual(copy.json()["ok"], True)
+        process.assert_awaited_once()
+        self.assertEqual(queue.calls, [("event", {"event": event})])
 
     def test_events_are_enqueued_concurrently(self) -> None:
         class _OverlapQueue(_RecordingQueue):

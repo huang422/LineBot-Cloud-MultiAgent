@@ -2,13 +2,14 @@
 
 Runs on the vision role's tiers (src/runtime/model_roles.py): Colab qwen3.8
 once it is READY, then Nemotron 3 Nano Omni (15 s) and muse-glimmer 30B
-(35 s) on NVIDIA and the OpenRouter free qwen3.8 (15 s), each taking image
-input (Nemotron Ultra, the text tiers' model, cannot). The API tiers never
-think; a request that needs thinking lets Colab think (COLAB_DEEP_THINK),
-then runs every tier with thinking off (``BaseAgent.targets_for``). A
-quoted image that reaches the agent as a URL (the message cache or GCS)
-goes straight to the API tiers: Colab takes inline images only and skips
-it by design (``skip(by design: url image)`` in the summary line).
+(35 s) on NVIDIA and the OpenRouter free dots-3 (20 s), each taking image
+input (Nemotron Ultra and Super, the text tiers' NIM models, cannot). The
+API tiers never think; a request that needs thinking lets Colab think
+(COLAB_DEEP_THINK), then runs every tier with thinking off
+(``BaseAgent.targets_for``). A quoted image that reaches the agent as a
+URL (the message cache or GCS) goes straight to the API tiers: Colab takes
+inline images only and skips it by design (``skip(by design: url image)``
+in the summary line).
 
 The prompt is kept near 4k tokens, as for every image request
 (``BaseAgent._build_messages``, ``IMAGE_CONTEXT_CHARS``).

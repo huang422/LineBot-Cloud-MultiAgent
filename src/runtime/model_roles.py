@@ -5,8 +5,8 @@ at images, background utility work, embedding, drawing). Each role is an
 ordered list of tiers (:class:`TierSpec`): the code defaults below, with any
 role replaced wholesale by the ``MODEL_ROLES`` JSON object::
 
-    MODEL_ROLES='{"chat": [{"provider": "nvidia", "model": "nvidia/nemotron-3-ultra-550b-a55b",
-                            "thinking": false, "timeout_s": 40}]}'
+    MODEL_ROLES='{"chat": [{"provider": "nvidia", "model": "nvidia/nemotron-3-super-120b-a12b",
+                            "thinking": false, "timeout_s": 45}]}'
 
 :meth:`RoleTable.from_settings` checks everything at startup and never drops
 a tier silently. A bad table (invalid JSON, unknown role or provider, a paid
@@ -15,9 +15,9 @@ OpenRouter id, a model that cannot do the role) raises
 provider is not configured (no key; Colab until it registers) stays in the
 table, disabled with its reason, for ``/health/detail``. An id without a
 model profile gets the provider's generic protocol and a config warning,
-except on Colab: the VM pulls only the pinned (profiled) models, and any
-other id would answer 404, which marks the whole Colab endpoint unhealthy,
-so an unprofiled Colab id is a RoleConfigError.
+except on Colab: the VM pulls only the models versions.json lists (all
+profiled), and any other id would answer 404, which marks the whole Colab
+endpoint unhealthy, so an unprofiled Colab id is a RoleConfigError.
 
 ``MODEL_PATH_PREFERENCE`` orders every role: ``colab`` (the default) puts
 its Colab tiers first, ``api`` puts them last; the order within each group
@@ -49,7 +49,7 @@ Colab tier with a usable API tier after it stops
 ``COLAB_API_RESERVE_SECONDS`` before the deadline, or halfway to it when
 that is later (``Tier.shares_time``, whatever its thinking setting), so a
 slow session cannot use up the window before the API tiers get a turn. The
-router's Colab tier (nimble, protocol systemone) is not a chain tier: the
+router's Colab tier (clef-flash, protocol systemone) is not a chain tier: the
 orchestrator asks it directly (src/providers/systemone.py), and
 COLAB_ROUTER_ENABLED=false disables it here.
 """
@@ -118,9 +118,13 @@ _OPTION_FIELDS = frozenset(
 )
 
 # The v3 line-up (decision table rows 6, 7, 16, 17; since 2026-10-01
-# Nemotron 3 Ultra backs up router, chat and utility, see ADR-0007).
+# Nemotron 3 Ultra backs up router, chat and utility; since 2026-10-16 Super
+# comes before Ultra in chat and thinking, and dots-3 :free replaces the
+# withdrawn qwen3.8 :free; see ADR-0007).
 COLAB_QWEN = "qwen3.8:27b-mtp-q4_K_M"
-COLAB_NIMBLE = "nimble:9b"
+# The Colab router since 2026-10-16 (Cloudflare clef-flash; it replaced
+# nimble:9b, see ADR-0010). The VM pulls the tag, whatever it points at.
+COLAB_ROUTER = "clef-flash:9b"
 NIM_ULTRA = "nvidia/nemotron-3-ultra-550b-a55b"
 NIM_SUPER = "nvidia/nemotron-3-super-120b-a12b"
 NIM_MUSE = "meta/muse-glimmer-30b"
@@ -128,7 +132,9 @@ NIM_OMNI = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
 NIM_EMBED_1B = "nvidia/nemotron-3-embed-1b"
 FLUX_KLEIN = "black-forest-labs/flux.2-klein-4b"
 FLUX_DEV = "black-forest-labs/flux.1-dev"
-OR_QWEN = "qwen/qwen3.8-27b:free"
+# Not served by NVIDIA, so it answers through an NIM outage; a preview that
+# OpenRouter's catalog says expires 2026-12-31 (see its model profile).
+OR_DOTS = "dots-studio/dots-3-note-preview:free"
 # Served by NVIDIA behind OpenRouter: last, since they fail together with NIM.
 OR_ULTRA = "nvidia/nemotron-3-ultra-550b-a55b:free"
 OR_SUPER = "nvidia/nemotron-3-super-120b-a12b:free"
@@ -208,9 +214,12 @@ def default_role_specs(settings: Any) -> dict[str, list[TierSpec]]:
     return {
         # The NIM tiers' low temperature is deliberate (see the module
         # docstring). Ultra has no structured output, so it is asked for
-        # JSON in the prompt alone (json_mode "prompt").
+        # JSON in the prompt alone (json_mode "prompt"). Ultra gets 6 s: it
+        # routes in about 2 s when healthy, and on 2026-10-16 it hung on
+        # every call, so a follow-up whose Super tier timed out (7,887-token
+        # prompt) waited 24 s on NIM before OpenRouter Super answered in 1.2 s.
         "router": [
-            tier("colab", COLAB_NIMBLE, timeout_s=6),
+            tier("colab", COLAB_ROUTER, timeout_s=6),
             tier(
                 "nvidia",
                 NIM_SUPER,
@@ -227,43 +236,68 @@ def default_role_specs(settings: Any) -> dict[str, list[TierSpec]]:
                 json_mode="prompt",
                 max_tokens=256,
                 temperature=0.1,
-                timeout_s=12,
+                timeout_s=6,
             ),
             tier("openrouter", OR_SUPER, effort="none", json_mode="json_object", timeout_s=12),
         ],
         # A Colab answer tier runs to about 70 s: the reply window
         # (REPLY_WINDOW_SECONDS, 90 s) minus the API tiers' reserve
-        # (fallback_chain.COLAB_API_RESERVE_SECONDS).
+        # (fallback_chain.COLAB_API_RESERVE_SECONDS). After Colab come two
+        # NVIDIA models, never just one, then OpenRouter. Super first: on
+        # 2026-10-16 Ultra hung on every call (5/5 production timeouts, 0/4
+        # in an A/B at 60 s) while Super answered 4/4 in 12-52 s (450-1121
+        # tokens) and short answers in 1-3 s; an answer of over about 1000
+        # tokens runs past 45 s and counts as a timeout. Ultra gets a short
+        # 25 s: when both NVIDIA tiers run out, dots-3 has about 20 s of the
+        # window less the routing (and search) time, none when routing
+        # itself stalls on NIM. Super sets no temperature: an answer uses
+        # the model card's sampling (the low ones are for router and
+        # utility work).
         "chat": [
             tier("colab", COLAB_QWEN, think=chat_think, timeout_s=70),
-            tier("nvidia", NIM_ULTRA, thinking=False, timeout_s=40),
-            tier("openrouter", OR_QWEN, effort="none", timeout_s=40),
+            tier("nvidia", NIM_SUPER, thinking=False, timeout_s=45),
+            tier("nvidia", NIM_ULTRA, thinking=False, timeout_s=25),
+            tier("openrouter", OR_DOTS, effort="none", timeout_s=40),
             tier("openrouter", OR_ULTRA, effort="none", timeout_s=40),
         ],
-        # Callers append the chat tiers (thinking off) after these. Ultra
-        # on NIM takes no reasoning_budget (HTTP 400): it thinks at
-        # medium_effort and NVIDIA_THINKING_BUDGET only adds max_tokens.
+        # Callers append the chat tiers (thinking off) after these; the
+        # chain skips a model that already timed out in the request after a
+        # fair try. They share at most half of the time left, under 120 s
+        # of the turn deadline's 240 s once routing is done: Super (thinking
+        # on 3/3 in 22-50 s in the A/B; it takes a reasoning_budget) and
+        # Ultra (thinking at medium_effort, no reasoning_budget: HTTP 400)
+        # use 90 s of it. dots-3, the one tier NVIDIA does not serve, has
+        # 120 s, so the half rather than its own limit ends it: when NIM
+        # fails fast it may think for the rest of the half, and when the NIM
+        # tiers hang it gets what is left (under its chat tier's 40 s, which
+        # then still runs). Ultra :free gets 30 s like NIM Ultra.
         "thinking": [
             tier("colab", COLAB_QWEN, think=settings.colab_deep_think, timeout_s=110),
-            tier("nvidia", NIM_ULTRA, thinking=True, timeout_s=100),
-            tier("openrouter", OR_QWEN, effort="medium", timeout_s=100),
-            tier("openrouter", OR_ULTRA, effort="medium", timeout_s=100),
+            tier("nvidia", NIM_SUPER, thinking=True, timeout_s=60),
+            tier("nvidia", NIM_ULTRA, thinking=True, timeout_s=30),
+            tier("openrouter", OR_DOTS, effort="medium", timeout_s=120),
+            tier("openrouter", OR_ULTRA, effort="medium", timeout_s=30),
         ],
         # The 2026-10-01 vision probe: Nano Omni answers in 2-6 s but is
         # often busy (HTTP 503 in under a second); muse-glimmer takes 8-19 s
-        # at the ~4k-token prompt VisionAgent keeps to. The API tiers never
-        # think, not even for a request that needs it (only Colab does).
-        # Ultra cannot see images, so it has no vision tier.
+        # at the ~4k-token prompt VisionAgent keeps to. dots-3 described the
+        # red circle in 1.7 s (probe 2026-10-16). The API tiers never think,
+        # not even for a request that needs it (only Colab does). Ultra and
+        # Super cannot see images, so they have no vision tier.
         "vision": [
             tier("colab", COLAB_QWEN, think=chat_think, timeout_s=70),
             tier("nvidia", NIM_OMNI, thinking=False, temperature=0.2, max_tokens=1024, timeout_s=15),
             tier("nvidia", NIM_MUSE, thinking=False, timeout_s=35),
-            tier("openrouter", OR_QWEN, effort="none", timeout_s=15),
+            tier("openrouter", OR_DOTS, effort="none", timeout_s=20),
         ],
-        # No Colab: its single slot belongs to replies.
+        # No Colab: its single slot belongs to replies. dots-3 (since
+        # 2026-10-16) is the tier NVIDIA does not serve. The four 30 s
+        # tiers fit the memory summary's one 180 s deadline
+        # (MEMORY_SUMMARY_TIMEOUT_SECONDS).
         "utility": [
             tier("nvidia", NIM_SUPER, thinking=False, temperature=0.2, timeout_s=30),
             tier("nvidia", NIM_ULTRA, thinking=False, timeout_s=30),
+            tier("openrouter", OR_DOTS, effort="none", timeout_s=30),
             tier("openrouter", OR_ULTRA, effort="none", timeout_s=30),
         ],
         "embed": [tier("nvidia", NIM_EMBED_1B, dim=settings.embedding_dimensions, timeout_s=10)],
@@ -486,8 +520,8 @@ def _profile(role: str, spec: TierSpec, errors: list[str], warnings: list[str]) 
     if profile is None:
         if spec.provider == COLAB:
             errors.append(
-                f"{role}: {spec.label} has no model profile; Colab serves only the pinned models "
-                "(model profiles and colab/versions.json)"
+                f"{role}: {spec.label} has no model profile; Colab serves only the models "
+                "colab/versions.json lists (and the model profiles)"
             )
         else:
             errors.append(f"{role}: {spec.provider} cannot serve the {role} role ({spec.model})")

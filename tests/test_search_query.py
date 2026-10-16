@@ -6,7 +6,7 @@ import asyncio
 import unittest
 from datetime import date
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from src.agents.web_search_agent import WebSearchAgent
 from src.config import Settings
@@ -14,6 +14,7 @@ from src.models.agent_request import AgentRequest
 from src.providers.base import ProviderResponse
 from src.providers.fallback_chain import AllProvidersFailedError, FallbackChain, Tier
 from src.services.model_health import ModelHealth
+from src.services.search import query as query_module
 from src.services.search.query import (
     SearchContext,
     SearchQueryPlanner,
@@ -22,6 +23,7 @@ from src.services.search.query import (
     detect_time_range,
     detect_topic,
     is_short_query,
+    lost_identifiers,
     needs_rewrite,
     parse_query_reply,
 )
@@ -153,6 +155,45 @@ class PlannerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(plan.query, "那高雄呢")
                 self.assertFalse(plan.rewritten)
 
+    async def test_a_rewrite_that_changes_a_model_name_searches_the_text_as_typed(self) -> None:
+        # 2026-10-16: the planner turned qwen3.8 into Qwen3-8B, another model.
+        text = "幫我搜尋開源 LLM 有哪些，包含 qwen3.8 和 gemma4 的評測"
+        for reply in ("開源 LLM Qwen3-8B Gemma-4 評測", "開源 LLM Qwen 3.8B gemma4 評測"):
+            with self.subTest(reply=reply):
+                chain = _chain(reply)
+                with patch.object(query_module.logger, "info") as log_info:
+                    plan = await SearchQueryPlanner(chain, _UTILITY).plan(text)
+
+                self.assertEqual(plan.query, text)
+                self.assertFalse(plan.rewritten)
+                [message] = [call.args[0] for call in log_info.call_args_list]
+                self.assertIn("lost qwen3.8;", message)
+                system = chain.generate.await_args.kwargs["messages"][0]["content"]
+                self.assertIn("qwen3.8 就寫 qwen3.8，不能寫成 Qwen3-8B", system)
+
+    async def test_a_rewrite_that_keeps_the_names_is_used(self) -> None:
+        # Case, a space or a hyphen inside a name is still the same name.
+        text = "幫我搜尋開源 LLM 有哪些，包含 qwen3.8 和 gemma4 的評測"
+        for reply in ("開源 LLM qwen3.8 gemma4 評測", "開源 LLM Qwen3.8 Gemma 4 評測", "Qwen3.8 Gemma-4 開源 LLM"):
+            with self.subTest(reply=reply):
+                plan = await SearchQueryPlanner(_chain(reply), _UTILITY).plan(text)
+
+                self.assertEqual(plan.query, reply)
+                self.assertTrue(plan.rewritten)
+
+    async def test_a_follow_up_without_names_of_its_own_is_rewritten(self) -> None:
+        # Only the message's own names must survive; the context's may be
+        # added in any spelling.
+        context = SearchContext(
+            last_user_text="幫我搜尋 qwen3.8 和 gemma4 的評測", last_assistant_text="找到幾篇評測。", follow_up=True
+        )
+        chain = _chain("Qwen3.8 Gemma4 評測 最新")
+
+        plan = await SearchQueryPlanner(chain, _UTILITY).plan("在查詢確認一下", context)
+
+        self.assertEqual(plan.query, "Qwen3.8 Gemma4 評測 最新")
+        self.assertTrue(plan.rewritten)
+
     async def test_the_context_loses_the_request_labels(self) -> None:
         # A group member's turn, a quote or the router's summary of them
         # must not close its block or pose as the message (review 4 E5).
@@ -210,6 +251,28 @@ class ReplyParsingTests(unittest.TestCase):
         ):
             with self.subTest(reply=reply):
                 self.assertEqual(parse_query_reply(reply), expected)
+
+
+class IdentifierTests(unittest.TestCase):
+    def test_names_and_versions_must_be_spelled_out(self) -> None:
+        # (message, rewrite, names the rewrite lost)
+        for text, query, lost in (
+            ("qwen3.8 和 gemma4 的評測", "Qwen3-8B Gemma-4 評測", ["qwen3.8"]),
+            ("qwen3.8 和 gemma4 的評測", "Qwen3.8B gemma4", ["qwen3.8"]),
+            ("qwen3.8 和 gemma4 的評測", "QWEN3.8 gemma 4 評測", []),
+            ("qwen3.8 和 gemma4 的評測", "qwen3.8評測 gemma4.", []),  # CJK or a full stop ends a name
+            ("nemotron-3-super 120b 跟 deepseek v4.1 哪個快", "Nemotron 3 Super 120B DeepSeek-V4.1 速度", []),
+            ("nemotron-3-super 120b 跟 deepseek v4.1 哪個快", "Nemotron Super DeepSeek V4 速度", ["nemotron-3-super", "120b", "v4.1"]),
+            ("gpt-5 跟 v4 比", "GPT5 V4.1", ["v4"]),
+            ("rtx5090 和 iPhone17 價格", "RTX 5090 iPhone 17 價格", []),
+            ("iPhone 16 Pro 跟 Samsung S24 哪個比較好", "iPhone 16 Pro Samsung S24 比較", []),
+            # Bare numbers are not names: a stock code, a year or a 3.8 may go.
+            ("台積電2330股價", "台積電 股價", []),
+            ("2026 年 3.8 版", "最新版", []),
+            ("在查詢確認一下", "台積電 目前 股價", []),
+        ):
+            with self.subTest(text=text, query=query):
+                self.assertEqual(lost_identifiers(text, query), lost)
 
 
 class HintTests(unittest.TestCase):

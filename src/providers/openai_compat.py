@@ -8,11 +8,23 @@ anything else. NVIDIA Cloud Functions may answer 202 with an ``NVCF-REQID``
 header for a slow job; the result is then polled from the status URL until
 *timeout*. A 404 from that status URL means it does not know the job, which
 says nothing about the model, so it is transient, never a ``ModelGoneError``.
+
+A 200 is not always an answer: once OpenRouter has routed a request it can
+report an upstream failure only in the body, as a top-level ``error``
+object whose ``code`` is the HTTP status it stands for, alone or beside
+partial output with ``finish_reason`` "error" (OpenRouter's errors doc), or
+as the same object on the choice itself.
+On 2026-10-16 Ultra ``:free`` answered so (code 503, "Upstream error from
+Nvidia: Service temporarily overloaded"); read as an empty completion it
+earned no strike and no cooldown, so every reply tried it again. Such a
+body raises the error its code maps to, as that status itself would
+(:func:`error_for_body`); ``"error": null`` is no error.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from typing import Any
@@ -55,6 +67,7 @@ async def post_chat_completion(
 
     *timeout* bounds the whole exchange, 202 polling included; a 202 is
     polled every *poll_interval* seconds (default ``NVCF_POLL_INTERVAL_SECONDS``).
+    A 200 whose body holds an ``error`` object raises like a non-200.
 
     Raises:
         RateLimitError, PayloadError, AuthError, CreditsError,
@@ -89,6 +102,19 @@ async def post_chat_completion(
         raise TransientError(model, 200, "invalid JSON body", provider) from exc
     if not isinstance(data, dict):
         raise TransientError(model, 200, "JSON body is not an object", provider)
+    if isinstance(data.get("error"), dict):
+        # Even beside choices: partial output cut by an error is no answer.
+        raise error_for_body(data["error"], response, provider=provider, model=model)
+    choices = data.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    if isinstance(choice, dict):
+        # OpenRouter's schema also lets the choice itself carry the error
+        # (NonStreamingChoice.error) beside its partial text; the first
+        # choice is the one read as the answer.
+        if isinstance(choice.get("error"), dict):
+            raise error_for_body(choice["error"], response, provider=provider, model=model)
+        if choice.get("finish_reason") == "error":
+            raise TransientError(model, 200, 'finish_reason "error" without an error object', provider)
     return data
 
 
@@ -121,12 +147,73 @@ async def _poll_nvcf(
 
 def error_for_status(response: Any, *, provider: str, model: str) -> ProviderError:
     """The provider error a non-200 HTTP answer stands for."""
-    status = response.status_code
-    detail = (response.text or "")[:_DETAIL_LIMIT]
+    return _error_for(
+        response.status_code,
+        (response.text or "")[:_DETAIL_LIMIT],
+        response.headers.get("retry-after"),
+        provider=provider,
+        model=model,
+    )
+
+
+def error_for_body(error: dict, response: Any, *, provider: str, model: str) -> ProviderError:
+    """The provider error a 200 whose body is an ``error`` object stands for.
+
+    ``error["code"]`` is mapped as that HTTP status would be; a code that
+    is missing, not a number or not an error status (400-599) is transient
+    with status 200. The detail is the object as JSON, its ``message``,
+    ``code``, ``metadata.error_type`` and ``metadata.raw`` first: ModelHealth
+    tells OpenRouter's account cap (``free-models-per-day``) from one
+    upstream's 429 (``rate-limited upstream``) by those words, and
+    OpenRouterProvider retries an unavailable upstream by them, so they
+    must survive the cut to 500 characters whatever else the object carries.
+    """
+    detail = json.dumps({"error": _lead_with_reason(error)}, ensure_ascii=False)[:_DETAIL_LIMIT]
+    status = _error_status(error.get("code"))
+    if status is None:
+        return TransientError(model, 200, detail, provider)
+    return _error_for(
+        status, detail, response.headers.get("retry-after"), provider=provider, model=model
+    )
+
+
+def _error_status(code: Any) -> int | None:
+    """*code* as an HTTP error status, or None."""
+    if isinstance(code, bool):
+        return None
+    if isinstance(code, str):
+        # isdigit() would pass "²", which int() rejects; a ValueError here
+        # would escape the ProviderError contract and earn no strike.
+        if not code.strip().isdecimal():
+            return None
+        try:
+            code = int(code)
+        except ValueError:  # past int()'s digit limit
+            return None
+    if isinstance(code, int) and 400 <= code <= 599:
+        return code
+    return None
+
+
+def _lead_with_reason(error: dict) -> dict:
+    """*error* with ``message``, ``code``, ``metadata.error_type`` and
+    ``metadata.raw`` in front."""
+    lead = {key: error[key] for key in ("message", "code") if key in error}
+    metadata = error.get("metadata")
+    if isinstance(metadata, dict):
+        first = {key: metadata[key] for key in ("error_type", "raw") if key in metadata}
+        lead["metadata"] = {**first, **metadata}
+    return {**lead, **{key: value for key, value in error.items() if key not in lead}}
+
+
+def _error_for(
+    status: int, detail: str, retry_after: str | None, *, provider: str, model: str
+) -> ProviderError:
+    """The provider error *status* stands for, with *detail* (already cut)."""
     if status == 429:
         return RateLimitError(
             model,
-            parse_retry_after(response.headers.get("retry-after")),
+            parse_retry_after(retry_after),
             provider=provider,
             detail=detail or "rate limited",
         )

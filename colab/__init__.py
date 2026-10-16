@@ -8,6 +8,12 @@ import them. They use the standard library only (``auth_proxy`` imports
 aiohttp lazily, when it serves), so importing them costs the bot nothing.
 """
 
+from pathlib import Path
+
+# The pins and the Ollama fallback; the launcher uploads a copy whose
+# "ollama" entry is the release it picked for the session.
+VERSIONS_FILE = Path(__file__).resolve().with_name("versions.json")
+
 VM_FILES: tuple[str, ...] = (
     "bootstrap.py",
     "auth_proxy.py",

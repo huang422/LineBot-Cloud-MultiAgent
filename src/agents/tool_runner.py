@@ -21,7 +21,10 @@ against its model) goes straight to that last request, which asks for the
 answer with what the model has, in the time left. A tool with a per-turn
 cap (``ToolDefinition.max_calls_per_turn``; web_search: 2) runs at most that
 many times in the whole loop, every round counted: a call past the cap is
-answered ``limit`` without being run. Tool results lose the
+answered ``limit`` without being run. Every request of the loop shares
+one record of the models that timed out (``FallbackChain.generate``'s
+``timed_out``), so a round never waits again on a model that hung in an
+earlier one. Tool results lose the
 prompt's fence labels (:data:`~src.agents.base_agent.FENCE_LABELS`): they
 carry stored text other people wrote.
 
@@ -48,7 +51,7 @@ from src.agents.tools import (
     parse_tool_arguments,
 )
 from src.providers.base import ProviderResponse
-from src.providers.fallback_chain import DeadlineExceededError, FallbackChain, Tier
+from src.providers.fallback_chain import DeadlineExceededError, FallbackChain, Tier, TimedOutModels
 from src.utils.logger import logger
 
 # Seconds of the deadline kept for the answer once the model has asked for
@@ -85,6 +88,7 @@ async def run_tool_loop(
     tool_choice: str | dict = "auto",
     allowed_tools: list[str] | None = None,
     max_iterations: int = 4,
+    timed_out: TimedOutModels | None = None,
     **generate_kwargs,
 ) -> ToolLoopResult:
     """Run the agentic tool-calling loop.
@@ -101,12 +105,19 @@ async def run_tool_loop(
         context: Per-request context handed to every executor.
         tool_choice: ``"auto"`` (let the LLM decide), ``"none"`` (force
             text reply), ``"required"`` (force a tool call), or a
-            specific function spec.
+            specific function spec. The bot passes only ``"auto"`` (and
+            ``"none"`` for the last request): OpenRouter's dots-3
+            ``:free`` endpoint, a chat tier, takes no other value (live
+            probe 2026-10-16).
         allowed_tools: Subset of registered tool names to expose. None
             exposes every registered tool.
         max_iterations: Hard upper bound on tool-call rounds. After that
             many rounds one more request, with ``tool_choice="none"``,
             asks for the answer.
+        timed_out: The models that timed out in this request so far
+            (``FallbackChain.generate``), shared by every request of the
+            loop and filled by them; a caller that retries after the loop
+            (ChatAgent) passes its own to keep them. None: a new one.
         **generate_kwargs: Forwarded to ``FallbackChain.generate`` on
             every request (deadline, temperature, max_tokens,
             disable_thinking, …). One ``deadline`` bounds the whole loop.
@@ -142,6 +153,7 @@ async def run_tool_loop(
 
     conversation = list(messages)
     executed: list[str] = []
+    generate_kwargs["timed_out"] = {} if timed_out is None else timed_out
     deadline = generate_kwargs.get("deadline")
     # Where tool calls, and the tool-offering rounds after the first, must end.
     tools_until = None if deadline is None else deadline - ANSWER_RESERVE_SECONDS

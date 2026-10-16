@@ -41,7 +41,7 @@ _COLAB = _REPO / "colab"
 _VERSIONS = register.load_versions(_COLAB / "versions.json")
 _PROXY_LOCK = _COLAB / bootstrap.PROXY_REQUIREMENTS
 _CHAT = "qwen3.8:27b-mtp-q4_K_M"
-_ROUTER = "nimble:9b"
+_ROUTER = "clef-flash:9b"
 _SECRET = "test-shared-secret-do-not-print"
 _NBH = "3f2a8c1e-5b7d-4e2f-9a1c-0d4b6e8f1a2b"
 _REG_KEY = register.derive_reg_key(_SECRET, _NBH)
@@ -132,7 +132,7 @@ class FakeVM(bootstrap.Ops):
         self.upstream_version = _VERSIONS["ollama"]["version"]
         self.pull_failures: dict[str, int] = {}
         self.pulled: list[str] = []
-        self.tag_digests = {model: pin["digest"] for model, pin in _VERSIONS["models"].items()}
+        self.tag_digests = {model: pin["verified_digest"] for model, pin in _VERSIONS["models"].items()}
         self.chat_load: dict = {"done_reason": "load"}
         self.systemone_status = 200
         # Models /api/ps leaves out (evicted or unloaded). With
@@ -219,8 +219,8 @@ class FakeVM(bootstrap.Ops):
         for proc in self._running("upstream"):
             proc.returncode = -15
 
-    def download(self, url, dest, sha256) -> None:
-        self.calls.append(("download", url, Path(dest), sha256))
+    def download(self, url, dest, sha256, size) -> None:
+        self.calls.append(("download", url, Path(dest), sha256, size))
         if self.download_error is not None:
             raise self.download_error
         Path(dest).parent.mkdir(parents=True, exist_ok=True)
@@ -371,11 +371,15 @@ class VersionsPinTests(unittest.TestCase):
     def test_versions_json_pins_what_the_protocol_names(self) -> None:
         register.validate_versions(_VERSIONS)
         ollama, cloudflared = _VERSIONS["ollama"], _VERSIONS["cloudflared"]
-        self.assertEqual(ollama["version"], "0.35.0")
+        # The fallback when the launcher cannot use the latest release, and
+        # the minimum it accepts (clef-flash's config: "requires": "0.40.4").
+        self.assertEqual(ollama["version"], "0.40.5")
         self.assertEqual(
-            ollama["url"], "https://github.com/ollama/ollama/releases/download/v0.35.0/ollama-linux-amd64.tar.zst"
+            ollama["url"], "https://github.com/ollama/ollama/releases/download/v0.40.5/ollama-linux-amd64.tar.zst"
         )
-        self.assertEqual(ollama["sha256"], "1c114a6b220c5efca2ef2b1e5f01d1e535e26f6cd6d1678c8489325d2835e525")
+        self.assertEqual(ollama["sha256"], "dc5eabc292f9949546c90a97c820f924b035e05243b0de13c7f366182562169c")
+        self.assertEqual(ollama["size"], 1438684604)
+        self.assertEqual(ollama["min_version"], "0.40.4")
         self.assertEqual(cloudflared["version"], "2026.9.3")
         self.assertEqual(
             cloudflared["url"],
@@ -383,16 +387,30 @@ class VersionsPinTests(unittest.TestCase):
         )
         self.assertEqual(cloudflared["sha256"], "77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2")
         self.assertEqual(
-            {model: pin["digest"] for model, pin in _VERSIONS["models"].items()},
+            {model: pin["verified_digest"] for model, pin in _VERSIONS["models"].items()},
             {
                 _CHAT: "22130167c4c20e20c7b71454612966ca8e8171e9b3cc8ab6ce8aa6cbfec79643",
-                _ROUTER: "24e550a16a7081881be2f1f0d91e8cc13a597472735c04119f035a0a85c67e0c",
+                _ROUTER: "73e026ff389b28464bb26f8978f3164851a76832f0d339032747e2c56f98ea29",
             },
         )
         self.assertEqual(_VERSIONS["models"][_CHAT]["thinking"], [False, "low", "medium", "xhigh"])
         # The router's own num_ctx param (the stub reports it; the bot never sends one).
-        self.assertEqual(_VERSIONS["models"][_ROUTER]["num_ctx"], 8194)
+        self.assertEqual(_VERSIONS["models"][_ROUTER]["num_ctx"], 16384)
         self.assertEqual(_VERSIONS["gpu"], {"min_vram_mib": 38000, "min_driver_major": 550})
+
+    def test_versions_compare_as_plain_releases(self) -> None:
+        self.assertEqual(register.parse_version("0.40.5"), (0, 40, 5))
+        self.assertEqual(register.parse_version("v0.41.10"), (0, 41, 10))
+        for text in ("", "0.40", "0.40.5-rc1", " 0.40.5", "0.40.5\n", "v", None, 405, "0.4O.5"):
+            with self.subTest(text=text):
+                self.assertIsNone(register.parse_version(text))
+        self.assertTrue(register.version_at_least("0.40.4", "0.40.4"))
+        self.assertTrue(register.version_at_least("0.40.10", "0.40.4"))
+        self.assertTrue(register.version_at_least("1.0.0", "0.40.4"))
+        self.assertFalse(register.version_at_least("0.40.3", "0.40.4"))
+        self.assertFalse(register.version_at_least("0.35.0", "0.40.4"))
+        self.assertFalse(register.version_at_least("0.41.0-rc1", "0.40.4"))
+        self.assertFalse(register.version_at_least("0.40.5", "latest"))
 
     def test_the_proxy_lock_is_the_bot_image_lock_for_its_packages(self) -> None:
         # The proxy runs on the aiohttp stack these tests run on: same
@@ -461,14 +479,27 @@ class VersionsPinTests(unittest.TestCase):
             ({**_VERSIONS, "ollama": {**_VERSIONS["ollama"], "url": "http://x"}}, "ollama.url"),
             ({**_VERSIONS, "cloudflared": {**_VERSIONS["cloudflared"], "sha256": "abc"}}, "cloudflared.sha256"),
             ({**_VERSIONS, "cloudflared": {**_VERSIONS["cloudflared"], "version": ""}}, "cloudflared.version"),
+            ({**_VERSIONS, "ollama": {k: v for k, v in _VERSIONS["ollama"].items() if k != "size"}}, "ollama.size"),
+            ({**_VERSIONS, "ollama": {**_VERSIONS["ollama"], "size": 0}}, "ollama.size"),
+            ({**_VERSIONS, "ollama": {**_VERSIONS["ollama"], "size": "1438684604"}}, "ollama.size"),
+            ({**_VERSIONS, "cloudflared": {**_VERSIONS["cloudflared"], "size": True}}, "cloudflared.size"),
             ({k: v for k, v in _VERSIONS.items() if k != "ollama"}, "ollama is missing"),
             ({**_VERSIONS, "models": {}}, "models is missing"),
-            ({**_VERSIONS, "models": {_CHAT: {**_VERSIONS["models"][_CHAT], "digest": "sha256:x"}}}, "digest"),
+            ({**_VERSIONS, "models": {_CHAT: {**_VERSIONS["models"][_CHAT], "verified_digest": "sha256:x"}}}, "verified_digest"),
+            # The field before 2026-10-16: a digest it would gate on.
+            (
+                {**_VERSIONS, "models": {_CHAT: {"role": "chat", "digest": _VERSIONS["models"][_CHAT]["verified_digest"]}}},
+                "verified_digest",
+            ),
+            ({**_VERSIONS, "ollama": {k: v for k, v in _VERSIONS["ollama"].items() if k != "min_version"}}, "min_version"),
+            ({**_VERSIONS, "ollama": {**_VERSIONS["ollama"], "min_version": "0.40"}}, "min_version"),
+            ({**_VERSIONS, "ollama": {**_VERSIONS["ollama"], "min_version": "0.41.0"}}, "older than ollama.min_version"),
+            ({**_VERSIONS, "ollama": {**_VERSIONS["ollama"], "version": "0.40.5-rc1"}}, "older than ollama.min_version"),
             ({**_VERSIONS, "models": {_CHAT: {**_VERSIONS["models"][_CHAT], "role": "vision"}}}, "role"),
             ({**_VERSIONS, "models": {_CHAT: {**_VERSIONS["models"][_CHAT], "thinking": "low"}}}, "thinking"),
             ({**_VERSIONS, "models": {_CHAT: _VERSIONS["models"][_CHAT]}}, "one chat and one router"),
             (
-                {**_VERSIONS, "models": {**_VERSIONS["models"], "nimble:9b-q4_K_M": _VERSIONS["models"][_ROUTER]}},
+                {**_VERSIONS, "models": {**_VERSIONS["models"], "nimble:9b": _VERSIONS["models"][_ROUTER]}},
                 "exactly one chat and one router",
             ),
         ]
@@ -776,7 +807,7 @@ class SignatureTests(unittest.TestCase):
                 "ready",
                 _NBH,
                 tunnel_url=f"https://{_QUICK_HOST}",
-                versions={"ollama": "0.35.0", "cloudflared": "2026.9.3"},
+                versions={"ollama": "0.40.5", "cloudflared": "2026.9.3"},
                 digests={_CHAT: "a" * 64},
                 gpu={"name": "A100", "vram_mib": 40960, "driver": "550.54.15"},
             )
@@ -892,9 +923,10 @@ class ProbeTests(unittest.TestCase):
     def test_each_failure_is_named(self) -> None:
         stub = self.responses
         prefixed = {"models": [{**m, "digest": "sha256:" + m["digest"]} for m in stub["tags"]["models"]]}
-        wrong_digest = {"models": [{**m, "digest": "0" * 64} if m["name"] == _CHAT else m for m in stub["tags"]["models"]]}
         cases = [
-            ({"version": {"version": "0.34.4"}}, "Ollama version is '0.34.4', not 0.35.0"),
+            ({"version": {"version": "0.34.4"}}, "Ollama version is '0.34.4', not 0.40.5"),
+            # Exactly the release this session installed, a newer one too.
+            ({"version": {"version": "0.40.6"}}, "Ollama version is '0.40.6', not 0.40.5"),
             ({"version": None}, "Ollama version is None"),
             ({"ps": {"models": "x"}}, f"{_CHAT} is not loaded"),
             (
@@ -906,7 +938,6 @@ class ProbeTests(unittest.TestCase):
                 f"{_CHAT} is not fully on the GPU (/api/ps: 0 of 0 MiB in VRAM)",
             ),
             ({"tags": {"models": []}}, f"{_CHAT} is not pulled"),
-            ({"tags": wrong_digest}, f"{_CHAT} digest is 000000000000, not the pinned 22130167c4c2"),
             ({"shows": {}}, f"{_CHAT} think values are None"),
             ({"shows": {_CHAT: {"thinking": {"values": [0, "low", "medium", "xhigh"]}}}}, "think values are [0,"),
             ({"shows": {_CHAT: {"thinking": {"values": [False, "low", "medium"]}}}}, "think values"),
@@ -917,15 +948,15 @@ class ProbeTests(unittest.TestCase):
                 self.assertTrue(any(fragment in p for p in problems), problems)
         self.assertEqual(self.problems(tags=prefixed), [])
 
-    def test_a_republished_router_passes(self) -> None:
-        # The bot routes that session without it; only the chat model must be its pin.
+    def test_moved_tags_pass(self) -> None:
+        # The models follow their tags: no digest is compared, the chat
+        # model's no more than the router's.
         tags = {
-            "models": [{**m, "digest": "d18e9174" + "0" * 56} if m["name"] == _ROUTER else m
-                       for m in self.responses["tags"]["models"]]
+            "models": [{**m, "digest": "d18e9174" + "0" * 56} for m in self.responses["tags"]["models"]]
         }
         self.assertEqual(self.problems(tags=tags), [])
-        self.assertFalse(register.must_be_exact(_VERSIONS["models"][_ROUTER]))
-        self.assertTrue(register.must_be_exact(_VERSIONS["models"][_CHAT]))
+        self.assertFalse(register.required(_VERSIONS["models"][_ROUTER]))
+        self.assertTrue(register.required(_VERSIONS["models"][_CHAT]))
 
     def test_a_router_not_loaded_or_not_pulled_passes(self) -> None:
         # The bot routes that session without it; only the chat model must be there.
@@ -991,7 +1022,7 @@ class StubServerTests(unittest.TestCase):
         )
         # The stricter checks a probe may add: fully on the GPU, the served context.
         contexts = {m["name"]: m["context_length"] for m in ps["models"]}
-        self.assertEqual(contexts, {_CHAT: 32768, _ROUTER: 8194})
+        self.assertEqual(contexts, {_CHAT: 32768, _ROUTER: 16384})
         for model in ps["models"]:
             self.assertEqual(model["size_vram"], model["size"])
         self.assertEqual(show["thinking"], {"values": [False, "low", "medium", "xhigh"], "default": "medium"})
@@ -1417,7 +1448,7 @@ class _RecordingUpstream:
             if body == b'{"peek": true}' and self.activity is not None:
                 self.in_flight_seen.append(self.activity.in_flight)
             return web.json_response(
-                {"method": request.method, "path": request.path, "version": "0.35.0"},
+                {"method": request.method, "path": request.path, "version": "0.40.5"},
                 headers={"X-Upstream": "ollama", "Connection": "keep-alive"},
             )
 
@@ -1742,18 +1773,19 @@ class DownloadTests(_TempDirTestCase):
         self.source = self.tmp / "source.bin"
         self.source.write_bytes(b"ollama tarball")
         self.sha = bootstrap.file_sha256(self.source)
+        self.size = len(b"ollama tarball")
         self.dest = self.tmp / "out" / "ollama.tar.zst"
         self.dest.parent.mkdir()
 
     def test_verified_download(self) -> None:
-        bootstrap.download_verified(self.source.as_uri(), self.dest, self.sha)
+        bootstrap.download_verified(self.source.as_uri(), self.dest, self.sha, self.size)
         self.assertEqual(self.dest.read_bytes(), b"ollama tarball")
         self.assertEqual(list(self.dest.parent.iterdir()), [self.dest])
 
     def test_wrong_hash_is_refused_and_left_nowhere(self) -> None:
         sleeps = []
         with self.assertRaisesRegex(bootstrap.DownloadError, "not the pinned 000000000000"):
-            bootstrap.download_verified(self.source.as_uri(), self.dest, "0" * 64, sleep=sleeps.append)
+            bootstrap.download_verified(self.source.as_uri(), self.dest, "0" * 64, self.size, sleep=sleeps.append)
         self.assertEqual(list(self.dest.parent.iterdir()), [])
         self.assertEqual(sleeps, [])
 
@@ -1763,7 +1795,7 @@ class DownloadTests(_TempDirTestCase):
         def must_not_open(*args, **kwargs):
             raise AssertionError("downloaded again")
 
-        bootstrap.download_verified("https://example.invalid/x", self.dest, self.sha, open_url=must_not_open)
+        bootstrap.download_verified("https://example.invalid/x", self.dest, self.sha, self.size, open_url=must_not_open)
 
     def test_network_errors_are_retried_then_given_up(self) -> None:
         attempts = []
@@ -1775,7 +1807,9 @@ class DownloadTests(_TempDirTestCase):
             return io.BytesIO(b"ollama tarball")
 
         sleeps: list[float] = []
-        bootstrap.download_verified("https://example.invalid/x", self.dest, self.sha, open_url=flaky, sleep=sleeps.append)
+        bootstrap.download_verified(
+            "https://example.invalid/x", self.dest, self.sha, self.size, open_url=flaky, sleep=sleeps.append
+        )
         self.assertEqual((len(attempts), sleeps), (3, [10, 20]))
         self.dest.unlink()
 
@@ -1783,8 +1817,55 @@ class DownloadTests(_TempDirTestCase):
             raise TimeoutError("slow")
 
         with self.assertRaisesRegex(bootstrap.DownloadError, "failed 3 times: TimeoutError"):
-            bootstrap.download_verified("https://example.invalid/x", self.dest, self.sha, open_url=broken, sleep=lambda s: None)
+            bootstrap.download_verified(
+                "https://example.invalid/x", self.dest, self.sha, self.size, open_url=broken, sleep=lambda s: None
+            )
         self.assertEqual(list(self.dest.parent.iterdir()), [])
+
+    def test_a_body_cut_short_is_retried(self) -> None:
+        bodies = [b"ollama", b"ollama tar", b"ollama tarball"]
+
+        def cut(url, timeout):
+            return io.BytesIO(bodies.pop(0))
+
+        sleeps: list[float] = []
+        bootstrap.download_verified(
+            "https://example.invalid/x", self.dest, self.sha, self.size, open_url=cut, sleep=sleeps.append
+        )
+        self.assertEqual((self.dest.read_bytes(), sleeps), (b"ollama tarball", [10, 20]))
+        self.dest.unlink()
+
+        with self.assertRaisesRegex(bootstrap.DownloadError, "failed 3 times: IncompleteRead"):
+            bootstrap.download_verified(
+                "https://example.invalid/x", self.dest, self.sha, self.size,
+                open_url=lambda url, timeout: io.BytesIO(b"ollama"), sleep=lambda s: None,
+            )
+        self.assertEqual(list(self.dest.parent.iterdir()), [])
+
+    def test_a_body_longer_than_the_pin_is_cut_off_and_not_retried(self) -> None:
+        read = []
+
+        class Endless(io.RawIOBase):
+            def read(self, n=-1):
+                read.append(n)
+                return b"x" * (1 << 20)
+
+        opened = []
+
+        def endless(url, timeout):
+            opened.append(url)
+            return Endless()
+
+        with self.assertRaisesRegex(bootstrap.DownloadError, f"longer than the pinned {self.size} bytes"):
+            bootstrap.download_verified("https://example.invalid/x", self.dest, self.sha, self.size, open_url=endless)
+        # One chunk read, one try, nothing left behind.
+        self.assertEqual((len(read), len(opened)), (1, 1))
+        self.assertEqual(list(self.dest.parent.iterdir()), [])
+
+    def test_a_file_already_there_of_another_size_is_downloaded_again(self) -> None:
+        self.dest.write_bytes(b"ollama tarball, older")
+        bootstrap.download_verified(self.source.as_uri(), self.dest, self.sha, self.size)
+        self.assertEqual(self.dest.read_bytes(), b"ollama tarball")
 
 
 class OpsTests(_TempDirTestCase):
@@ -1941,7 +2022,7 @@ class BootstrapFlowTests(_TempDirTestCase):
     def test_a100_run(self) -> None:
         self.assertEqual(self.boot(), 0)
         self.assertEqual(self.steps(), _REAL_STEPS)
-        vram = {"chat_on_gpu": "24128/24128 MiB", "router_on_gpu": "10110/10110 MiB", "used_mib": 35012}
+        vram = {"chat_on_gpu": "24128/24128 MiB", "router_on_gpu": "13306/13306 MiB", "used_mib": 35012}
         self.assertEqual(self.state.read(), {"step": "ready", "ts": int(self.vm.clock), "error": None, "vram": vram})
 
         self.assertEqual(self.vm.ran("nvidia-smi"), [
@@ -1952,10 +2033,13 @@ class BootstrapFlowTests(_TempDirTestCase):
         extract = self.vm.ran("bash")[0]
         self.assertEqual(extract[-2:], [str(self.paths.ollama_archive), str(self.paths.usr)])
         self.assertIn('zstd -dc -- "$1" | tar -x -C "$2"', extract)
-        downloads = [(c[1], c[2], c[3]) for c in self.vm.calls if c[0] == "download"]
+        downloads = [c[1:] for c in self.vm.calls if c[0] == "download"]
         self.assertEqual(downloads, [
-            (_VERSIONS["ollama"]["url"], self.paths.ollama_archive, _VERSIONS["ollama"]["sha256"]),
-            (_VERSIONS["cloudflared"]["url"], self.paths.cloudflared, _VERSIONS["cloudflared"]["sha256"]),
+            (_VERSIONS["ollama"]["url"], self.paths.ollama_archive, _VERSIONS["ollama"]["sha256"], _VERSIONS["ollama"]["size"]),
+            (
+                _VERSIONS["cloudflared"]["url"], self.paths.cloudflared, _VERSIONS["cloudflared"]["sha256"],
+                _VERSIONS["cloudflared"]["size"],
+            ),
         ])
         self.assertFalse(self.paths.ollama_archive.exists())
         self.assertEqual(os.stat(self.paths.cloudflared).st_mode & 0o777, 0o755)
@@ -1987,10 +2071,13 @@ class BootstrapFlowTests(_TempDirTestCase):
             "event": "ready",
             "nbh": _NBH,
             "tunnel_url": f"https://{_QUICK_HOST}",
-            "versions": {"ollama": "0.35.0", "cloudflared": "2026.9.3"},
-            "digests": {model: pin["digest"] for model, pin in _VERSIONS["models"].items()},
+            "versions": {"ollama": "0.40.5", "cloudflared": "2026.9.3"},
+            "digests": {model: pin["verified_digest"] for model, pin in _VERSIONS["models"].items()},
             "gpu": {"name": "NVIDIA A100-SXM4-40GB", "vram_mib": 40960, "driver": "550.54.15", **vram},
         })
+        # No "error": the router is serving. Each digest is logged.
+        for model, pin in _VERSIONS["models"].items():
+            self.assertIn(f"{model} is at digest {pin['verified_digest']}, the verified one", self.log_text)
         self.assertTrue(all(valid for _, _, valid in self.vm.events))
         self.assertEqual(self.vm.unassigns, 0)
         self.assertTrue(all(proc.poll() is None for proc in self.vm.procs), "children must outlive bootstrap")
@@ -2008,7 +2095,7 @@ class BootstrapFlowTests(_TempDirTestCase):
         self.assertEqual(self.vm.spawned("proxy")[0][2]["DRYRUN"], "1")
         (ready,) = self.ready_events()
         self.assertNotIn("gpu", ready)
-        self.assertEqual(ready["digests"], {m: p["digest"] for m, p in _VERSIONS["models"].items()})
+        self.assertEqual(ready["digests"], {m: p["verified_digest"] for m, p in _VERSIONS["models"].items()})
         self.assertFalse([c for c in self.vm.calls if c[0] == "http" and "/api/pull" in c[2]])
 
     def test_named_tunnel(self) -> None:
@@ -2135,7 +2222,7 @@ class BootstrapFlowTests(_TempDirTestCase):
 
     def test_wrong_ollama_version(self) -> None:
         self.vm.upstream_version = "0.34.4"
-        self.assert_failed(self.boot(), "ollama_start", "the upstream is Ollama 0.34.4, not 0.35.0")
+        self.assert_failed(self.boot(), "ollama_start", "the upstream is Ollama 0.34.4, not 0.40.5")
 
     def test_pull_fails_three_times(self) -> None:
         self.vm.pull_failures = {_CHAT: 3}
@@ -2152,47 +2239,79 @@ class BootstrapFlowTests(_TempDirTestCase):
 
         self.assertEqual(self.steps(), _REAL_STEPS)
         (ready,) = self.ready_events()
-        self.assertEqual(ready["digests"], {_CHAT: _VERSIONS["models"][_CHAT]["digest"]})
+        self.assertEqual(ready["digests"], {_CHAT: _VERSIONS["models"][_CHAT]["verified_digest"]})
         self.assertNotIn("router_on_gpu", ready["gpu"])
-        errors = [line for line in self.log_text.splitlines() if line.startswith("ERROR")]
-        self.assertEqual(len(errors), 2, errors)
-        self.assertIn(f"pulling {_ROUTER} failed 3 times: HTTP 500 pull model manifest: EOF; booting on", errors[0])
-        self.assertIn(f"{_ROUTER} did not load (loading {_ROUTER} failed: HTTP 404", errors[1])
+        (error,) = [line for line in self.log_text.splitlines() if line.startswith("ERROR")]
+        self.assertIn(f"pulling {_ROUTER} failed 3 times: HTTP 500 pull model manifest: EOF; booting on", error)
+        # Not pulled, so not loaded either; the bot hears why.
+        self.assertFalse([c for c in self.vm.calls if c[0] == "http" and c[2].endswith("/v1/systemone")])
+        self.assertEqual(ready["error"], f"pulling {_ROUTER} failed 3 times: HTTP 500 pull model manifest: EOF")
         self.assertEqual(self.vm.unassigns, 0)
 
-    def test_a_chat_model_off_its_pin_stops_the_boot(self) -> None:
-        self.vm.tag_digests[_CHAT] = "0" * 64
-        self.assert_failed(self.boot(), "pull", f"{_CHAT} has digest 000000000000, not the pinned 22130167c4c2")
-        self.assertFalse([c for c in self.vm.calls if c[0] == "http" and c[2].endswith("/api/chat")])
+    def test_the_registry_answering_412_names_the_reason(self) -> None:
+        # 2026-10-15: nimble:9b's republish required Ollama 0.40.4, and the
+        # registry refused the 0.35.0 VM's pull; the bot never heard why.
+        original = self.vm._upstream
 
-    def test_a_router_missing_after_the_pull_boots_without_it(self) -> None:
+        def too_old(method, path, body):
+            if (method, path) == ("POST", "/api/pull") and json.loads(body)["model"] == _ROUTER:
+                self.vm.pulled.append(_ROUTER)
+                return _json_reply(412, {"error": "pull model manifest: 412: requires a newer version of Ollama"})
+            return original(method, path, body)
+
+        self.vm._upstream = too_old
+        del self.vm.tag_digests[_ROUTER]
+        self.vm.unloaded.add(_ROUTER)
+
+        self.assertEqual(self.boot(), 0)
+
+        (ready,) = self.ready_events()
+        self.assertIn(f"pulling {_ROUTER} failed 3 times: HTTP 412 pull model manifest: 412", ready["error"])
+
+    def test_a_chat_model_at_a_moved_tag_boots(self) -> None:
+        # The models follow their tags: another digest is news, not a failure.
+        self.vm.tag_digests[_CHAT] = "0" * 64
+
+        self.assertEqual(self.boot(), 0)
+
+        (ready,) = self.ready_events()
+        self.assertEqual(ready["digests"][_CHAT], "0" * 64)
+        self.assertNotIn("error", ready)
+        self.assertIn(f"{_CHAT} is at digest {'0' * 64}, tag moved since it was verified (22130167c4c2)", self.log_text)
+        self.assertFalse([line for line in self.log_text.splitlines() if line.startswith(("ERROR", "WARNING"))])
+
+    def test_a_router_missing_after_the_pull_boots_without_its_digest(self) -> None:
         del self.vm.tag_digests[_ROUTER]
 
         self.assertEqual(self.boot(), 0)
 
         (ready,) = self.ready_events()
-        self.assertEqual(ready["digests"], {_CHAT: _VERSIONS["models"][_CHAT]["digest"]})
-        (error,) = [line for line in self.log_text.splitlines() if line.startswith("ERROR")]
-        self.assertIn(f"{_ROUTER} has digest (none), not the pinned {_VERSIONS['models'][_ROUTER]['digest']}", error)
+        self.assertEqual(ready["digests"], {_CHAT: _VERSIONS["models"][_CHAT]["verified_digest"]})
+        (warning,) = [line for line in self.log_text.splitlines() if line.startswith("WARNING")]
+        self.assertIn(f"{_ROUTER} pulled but /api/tags does not list it", warning)
+        self.assertEqual(ready["error"], f"{_ROUTER} pulled but /api/tags does not list it")
+        self.assertFalse([line for line in self.log_text.splitlines() if line.startswith("ERROR")])
         self.assertEqual(self.vm.unassigns, 0)
 
-    def test_a_chat_model_missing_after_the_pull_stops_the_boot(self) -> None:
+    def test_a_chat_model_missing_after_the_pull_fails_the_probe(self) -> None:
         del self.vm.tag_digests[_CHAT]
-        self.assert_failed(self.boot(), "pull", f"{_CHAT} has digest (none), not the pinned 22130167c4c2")
+        self.assert_failed(self.boot(), "probe", f"{_CHAT} is not pulled (/api/tags)")
 
-    def test_a_republished_router_boots_and_reports_its_digest(self) -> None:
-        republished = "adfcdbb4070d303fb43fc11fc06a14269ec2bc7136a55369e86d412b86ba2831"
-        self.vm.tag_digests[_ROUTER] = republished
+    def test_a_moved_router_tag_boots_and_reports_its_digest(self) -> None:
+        moved = "adfcdbb4070d303fb43fc11fc06a14269ec2bc7136a55369e86d412b86ba2831"
+        self.vm.tag_digests[_ROUTER] = moved
 
         self.assertEqual(self.boot(), 0)
 
         self.assertEqual(self.steps(), _REAL_STEPS)
         self.assertEqual(self.state.read()["error"], None)
         (ready,) = self.ready_events()
-        self.assertEqual(ready["digests"], {_CHAT: _VERSIONS["models"][_CHAT]["digest"], _ROUTER: republished})
-        (error,) = [line for line in self.log_text.splitlines() if line.startswith("ERROR")]
-        self.assertIn(f"{_ROUTER} has digest {republished}, not the pinned {_VERSIONS['models'][_ROUTER]['digest']}", error)
-        # It is still loaded, so the probe's /api/ps check holds.
+        self.assertEqual(ready["digests"], {_CHAT: _VERSIONS["models"][_CHAT]["verified_digest"], _ROUTER: moved})
+        self.assertNotIn("error", ready)
+        verified = _VERSIONS["models"][_ROUTER]["verified_digest"]
+        self.assertIn(f"{_ROUTER} is at digest {moved}, tag moved since it was verified ({verified[:12]})", self.log_text)
+        self.assertFalse([line for line in self.log_text.splitlines() if line.startswith("ERROR")])
+        # It is loaded and used like any other.
         warm = [c[2] for c in self.vm.calls if c[0] == "http" and c[2] == bootstrap.OLLAMA_URL + "/v1/systemone"]
         self.assertEqual(len(warm), 1)
         self.assertEqual(self.vm.unassigns, 0)
@@ -2219,10 +2338,11 @@ class BootstrapFlowTests(_TempDirTestCase):
 
         self.assertEqual(self.steps(), _REAL_STEPS)
         (ready,) = self.ready_events()
-        self.assertEqual(ready["gpu"]["router_on_gpu"], "6144/10110 MiB")
-        self.assertEqual(self.state.read()["vram"]["router_on_gpu"], "6144/10110 MiB")
+        self.assertEqual(ready["gpu"]["router_on_gpu"], "6144/13306 MiB")
+        self.assertEqual(self.state.read()["vram"]["router_on_gpu"], "6144/13306 MiB")
         (error,) = [line for line in self.log_text.splitlines() if line.startswith("ERROR")]
-        self.assertIn(f"{_ROUTER} is not fully on the GPU (6144 of 10110 MiB in VRAM); booting on", error)
+        self.assertIn(f"{_ROUTER} is not fully on the GPU (6144 of 13306 MiB in VRAM); booting on", error)
+        self.assertEqual(ready["error"], f"{_ROUTER} is not fully on the GPU (6144 of 13306 MiB in VRAM)")
         self.assertEqual(self.vm.unassigns, 0)
 
     def test_a_chat_model_not_wholly_in_vram_fails_the_probe(self) -> None:
@@ -2239,7 +2359,7 @@ class BootstrapFlowTests(_TempDirTestCase):
         self.assertNotIn("chat_on_gpu", self.state.read()["vram"])
 
     def test_a_router_that_evicts_the_chat_model_is_unloaded_and_the_boot_goes_on(self) -> None:
-        # Ollama evicts idle qwen3.8 when it predicts nimble will not fit
+        # Ollama evicts idle qwen3.8 when it predicts the router will not fit
         # beside it (sched.go's preflight); the chat tier must not go with it.
         self.vm.no_room_for_both = True
 
@@ -2255,6 +2375,7 @@ class BootstrapFlowTests(_TempDirTestCase):
         (ready,) = self.ready_events()
         self.assertEqual(ready["gpu"]["chat_on_gpu"], "24128/24128 MiB")
         self.assertNotIn("router_on_gpu", ready["gpu"])
+        self.assertEqual(ready["error"], f"loading {_ROUTER} evicted {_CHAT} (not enough VRAM for both); unloaded it")
         self.assertEqual(self.vm.unassigns, 0)
 
     def test_memory_used_is_left_out_when_nvidia_smi_cannot_tell(self) -> None:
@@ -2266,7 +2387,7 @@ class BootstrapFlowTests(_TempDirTestCase):
                 self.assertEqual(self.boot(), 0)
                 (ready,) = self.ready_events()
                 self.assertNotIn("used_mib", ready["gpu"])
-                self.assertEqual(ready["gpu"]["router_on_gpu"], "10110/10110 MiB")
+                self.assertEqual(ready["gpu"]["router_on_gpu"], "13306/13306 MiB")
                 self.assertIn("memory.used", self.log_text)
 
     def test_chat_model_does_not_load(self) -> None:
@@ -2274,7 +2395,7 @@ class BootstrapFlowTests(_TempDirTestCase):
         self.assert_failed(self.boot(), "warmup", "done_reason 'stop', not 'load'")
 
     def test_a_router_that_evicts_the_chat_model_and_then_fails_is_left_out_too(self) -> None:
-        # Ollama evicts idle qwen3.8 first, then nimble's runner fails to start.
+        # Ollama evicts idle qwen3.8 first, then the router's runner fails to start.
         self.vm.no_room_for_both = True
         self.vm.systemone_status = 500
         self.vm.unloaded.add(_ROUTER)
@@ -2295,6 +2416,9 @@ class BootstrapFlowTests(_TempDirTestCase):
         errors = [line for line in self.log_text.splitlines() if line.startswith("ERROR")]
         self.assertEqual(len(errors), 2, errors)
         self.assertIn(f"loading {_ROUTER} evicted {_CHAT}", errors[1])
+        (ready,) = self.ready_events()
+        self.assertIn(f"{_ROUTER} did not load: loading {_ROUTER} failed: HTTP 500", ready["error"])
+        self.assertIn(f"; loading {_ROUTER} evicted {_CHAT}", ready["error"])
         self.assertEqual(self.vm.unassigns, 0)
 
     def test_a_router_that_does_not_load_boots_without_it(self) -> None:
@@ -2308,6 +2432,7 @@ class BootstrapFlowTests(_TempDirTestCase):
         self.assertIn(f"{_ROUTER} did not load (loading {_ROUTER} failed: HTTP 500 scoring failed); booting on", error)
         (ready,) = self.ready_events()
         self.assertNotIn("router_on_gpu", ready["gpu"])
+        self.assertEqual(ready["error"], f"{_ROUTER} did not load: loading {_ROUTER} failed: HTTP 500 scoring failed")
         self.assertEqual(self.vm.unassigns, 0)
 
     def test_proxy_never_answers(self) -> None:
@@ -2512,12 +2637,11 @@ class ServerAgreementTests(unittest.TestCase):
 
     def test_pins_and_limits_agree(self) -> None:
         models = _VERSIONS["models"]
-        self.assertEqual({m: p["digest"] for m, p in models.items()}, self.protocol.pinned_models())
-        self.assertEqual(_VERSIONS["ollama"]["version"], self.protocol.OLLAMA_VERSION)
+        self.assertEqual({m: p["verified_digest"] for m, p in models.items()}, self.protocol.colab_models())
+        self.assertEqual(_VERSIONS["ollama"]["min_version"], self.protocol.OLLAMA_MIN_VERSION)
         self.assertEqual([m for m, p in models.items() if p["role"] == "chat"], self.protocol.chat_models())
-        # The one model both sides let run at another digest than its pin,
-        # or not wholly in VRAM.
-        self.assertEqual([m for m, p in models.items() if not register.must_be_exact(p)], self.protocol.router_models())
+        # The one model both sides let be missing or not wholly in VRAM.
+        self.assertEqual([m for m, p in models.items() if not register.required(p)], self.protocol.router_models())
         self.assertEqual(json.dumps(models[_CHAT]["thinking"]), json.dumps(self.protocol.CHAT_THINK_VALUES))
         self.assertEqual(register.MAX_BODY_BYTES, self.protocol.MAX_REGISTER_BYTES)
         self.assertEqual(register.MAX_CLOCK_SKEW_SECONDS, self.protocol.MAX_CLOCK_SKEW_SECONDS)
@@ -2618,8 +2742,8 @@ class RegistrationRoundTripTests(_RoundTripTestCase):
         body, header = self.vm_sends(
             "ready",
             tunnel_url=f"https://{_QUICK_HOST}",
-            versions={"ollama": "0.35.0", "cloudflared": "2026.9.3"},
-            digests={m: p["digest"] for m, p in _VERSIONS["models"].items()},
+            versions={"ollama": "0.40.5", "cloudflared": "2026.9.3"},
+            digests={m: p["verified_digest"] for m, p in _VERSIONS["models"].items()},
         )
         result = await self.registrar.handle(body, header)
         self.assertEqual((result.status_code, result.body), (200, {"ok": True, "status": "READY"}))
@@ -2655,48 +2779,92 @@ class RegistrationRoundTripTests(_RoundTripTestCase):
         self.assertEqual((await self.registrar.handle(body, header)).status_code, 403)
 
 
-_REPUBLISHED = "adfcdbb4070d303fb43fc11fc06a14269ec2bc7136a55369e86d412b86ba2831"
+_MOVED = "adfcdbb4070d303fb43fc11fc06a14269ec2bc7136a55369e86d412b86ba2831"
 
 
-class RepublishedRouterRoundTripTests(_RoundTripTestCase):
-    """nimble's tag republished under another digest than the pin: the VM
-    boots on, the bot's session is READY, and nimble routes none of it."""
+class MovedRouterTagRoundTripTests(_RoundTripTestCase):
+    """The router's tag moved since its digest was verified: the VM boots
+    on, the bot's session is READY, and the router routes it like any other
+    (the models follow their tags since 2026-10-16)."""
 
     versions = {
         **_VERSIONS,
-        "models": {**_VERSIONS["models"], _ROUTER: {**_VERSIONS["models"][_ROUTER], "digest": _REPUBLISHED}},
+        "models": {**_VERSIONS["models"], _ROUTER: {**_VERSIONS["models"][_ROUTER], "verified_digest": _MOVED}},
     }
 
-    async def test_ready_without_the_router(self) -> None:
+    async def test_ready_with_the_router(self) -> None:
         from types import SimpleNamespace
 
         from src.models.agent_request import AgentRequest
         from src.providers.fallback_chain import Tier
         from src.providers.systemone import RouterGates, SystemOneRouter
 
-        pinned = _VERSIONS["models"][_ROUTER]["digest"]
+        verified = _VERSIONS["models"][_ROUTER]["verified_digest"]
         body, header = self.vm_sends(
             "ready",
             tunnel_url=f"https://{_QUICK_HOST}",
-            versions={"ollama": "0.35.0", "cloudflared": "2026.9.3"},
-            digests={_CHAT: _VERSIONS["models"][_CHAT]["digest"], _ROUTER: _REPUBLISHED},
+            versions={"ollama": "0.40.5", "cloudflared": "2026.9.3"},
+            digests={_CHAT: _VERSIONS["models"][_CHAT]["verified_digest"], _ROUTER: _MOVED},
         )
-        result = await self.registrar.handle(body, header)
+        with self.assertLogs("linebot", "INFO") as logs:
+            result = await self.registrar.handle(body, header)
 
         self.assertEqual((result.status_code, result.body), (200, {"ok": True, "status": "READY"}))
+        self.assertIn(f"{_ROUTER} at digest {_MOVED}, tag moved since it was verified ({verified[:12]})", "\n".join(logs.output))
+        self.assertFalse([record for record in logs.records if record.levelname in ("WARNING", "ERROR")])
         state = await self.store.load()
-        self.assertEqual(state.digests[_ROUTER], _REPUBLISHED)
-        self.assertEqual(self.endpoint.unpinned(), {_ROUTER: (pinned, _REPUBLISHED)})
-        # The stub has it wholly in VRAM: only the digest keeps it out.
+        self.assertEqual(state.digests[_ROUTER], _MOVED)
+        self.assertEqual(self.endpoint.moved_tags(), {_ROUTER: (verified, _MOVED)})
         self.assertEqual(self.endpoint.off_gpu(), {})
-        # The live gate's probe still names it.
-        self.assertEqual(
-            await self.endpoint.probe(f"https://{_QUICK_HOST}", _NBH),
-            [f"{_ROUTER} digest {_REPUBLISHED[:12]}, expected {pinned[:12]}"],
-        )
-        gates = RouterGates(confidence=0.75, think_on=0.85, think_off=0.15)
+        # The live gate's probe finds nothing missing either.
+        self.assertEqual(await self.endpoint.probe(f"https://{_QUICK_HOST}", _NBH), [])
+        gates = RouterGates(confidence=0.9, think_on=0.85, think_off=0.15)
         router = SystemOneRouter(self.endpoint, Tier(SimpleNamespace(name="colab"), _ROUTER, timeout_s=6), gates=gates)
         forwarded = len(self.forwarded)
-        with self.assertLogs("linebot", "ERROR"):
+        # The stub answers inference with Ollama's busy 503: the router was asked.
+        with self.assertLogs("linebot", "WARNING"):
             self.assertIsNone(await router.route(AgentRequest(text="你覺得這個計畫如何")))
-        self.assertEqual(len(self.forwarded), forwarded)
+        self.assertEqual(self.forwarded[forwarded:], [f"{_QUICK_HOST}/v1/systemone"])
+
+
+class LaunchedReleaseRoundTripTests(_RoundTripTestCase):
+    """The launcher picked a newer release than versions.json's fallback:
+    the VM's versions.json names it, the stub serves it, and the bot wants
+    exactly the release the session was launched with."""
+
+    versions = {**_VERSIONS, "ollama": {**_VERSIONS["ollama"], "version": "0.41.2"}}
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        from dataclasses import replace
+
+        await self.store.update(lambda state: replace(state, ollama_version="0.41.2"))
+
+    def ready(self) -> tuple[bytes, str]:
+        return self.vm_sends(
+            "ready",
+            tunnel_url=f"https://{_QUICK_HOST}",
+            versions={"ollama": "0.41.2", "cloudflared": "2026.9.3"},
+            digests={m: p["verified_digest"] for m, p in _VERSIONS["models"].items()},
+        )
+
+    async def test_the_launched_release_is_ready(self) -> None:
+        with self.assertLogs("linebot", "INFO") as logs:
+            result = await self.registrar.handle(*self.ready())
+
+        self.assertEqual(result.status_code, 200)
+        self.assertIn("Colab session READY (Ollama 0.41.2,", "\n".join(logs.output))
+        self.assertTrue(await self.endpoint.check_health())
+
+    async def test_another_release_than_the_launched_one_is_refused(self) -> None:
+        from dataclasses import replace
+
+        await self.store.update(lambda state: replace(state, ollama_version="0.40.5"))
+
+        with self.assertLogs("linebot", "WARNING"):
+            result = await self.registrar.handle(*self.ready())
+
+        self.assertEqual(result.status_code, 503)
+        self.assertIn(
+            "Ollama 0.41.2, expected 0.40.5 (the release this session was launched with)", result.body["problems"]
+        )

@@ -210,7 +210,9 @@ class OpenRouterProviderTests(unittest.IsolatedAsyncioTestCase):
         for options in (None, {"effort": "none"}):
             with self.subTest(options=options):
                 await provider.generate(
-                    "qwen/qwen3.8-27b:free", [{"role": "user", "content": "hi"}], options=options
+                    "dots-studio/dots-3-note-preview:free",
+                    [{"role": "user", "content": "hi"}],
+                    options=options,
                 )
                 payload = fake_post.await_args.kwargs["json"]
                 self.assertEqual(payload["reasoning"], {"effort": "medium"})
@@ -221,7 +223,7 @@ class OpenRouterProviderTests(unittest.IsolatedAsyncioTestCase):
         provider._client = SimpleNamespace(post=fake_post)
 
         await provider.generate(
-            "qwen/qwen3.8-27b:free",
+            "dots-studio/dots-3-note-preview:free",
             [{"role": "user", "content": "hi"}],
             max_tokens=384,
             disable_thinking=True,
@@ -229,7 +231,8 @@ class OpenRouterProviderTests(unittest.IsolatedAsyncioTestCase):
         )
 
         payload = fake_post.await_args.kwargs["json"]
-        # qwen3.8 reasons at xhigh unless reasoning is explicitly switched off.
+        # dots-3 reasons unless reasoning is explicitly switched off (280
+        # reasoning tokens without the object, probe 2026-10-16).
         self.assertEqual(payload["reasoning"], {"effort": "none"})
         self.assertNotIn("include_reasoning", payload)
         self.assertEqual(payload["max_tokens"], 384)
@@ -238,7 +241,7 @@ class OpenRouterProviderTests(unittest.IsolatedAsyncioTestCase):
         # (model, thinking requested, reasoning object sent)
         cases = (
             # Reasons by default: "off" must be said.
-            ("qwen/qwen3.8-27b:free", False, {"effort": "none"}),
+            ("dots-studio/dots-3-note-preview:free", False, {"effort": "none"}),
             ("nvidia/nemotron-3-ultra-550b-a55b:free", False, {"effort": "none"}),
             # Thinking on without a tier effort: the default effort.
             ("nvidia/nemotron-3-ultra-550b-a55b:free", True, {"effort": "medium"}),
@@ -1330,7 +1333,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_record_interaction_compacts_existing_summary_and_recent_window(self) -> None:
         chain = _summary_chain(
             return_value=ProviderResponse(
-                text="更新後的長期摘要", model="nvidia/nemotron-3-super-120b-a12b"
+                text="移除：1\n- 更新後的長期摘要", model="nvidia/nemotron-3-super-120b-a12b"
             )
         )
         service = memory_service_module.MemoryService(
@@ -1382,7 +1385,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
             chat_scope="multi",
             chat_id="G1",
         )
-        self.assertEqual(compacted.summary_text, "更新後的長期摘要")
+        self.assertEqual(compacted.summary_text, "更新後的長期摘要。")
         self.assertEqual(compacted.recent_count, 0)
         # summary_model records whichever target actually answered.
         self.assertEqual(compacted.summary_model, "nvidia/nemotron-3-super-120b-a12b")
@@ -1396,11 +1399,11 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         summary_system_prompt = call_kwargs["messages"][0]["content"]
         summary_prompt = call_kwargs["messages"][1]["content"]
         self.assertIn("請把現有長期記憶視為預設保留", summary_system_prompt)
-        # The output cap is stated, so the model condenses instead of being cut off.
-        self.assertIn("約 300 字以內", summary_system_prompt)
-        self.assertIn("不要寫到被截斷", summary_system_prompt)
+        # Only the change is asked for: the old items stay unless removed.
+        self.assertIn("第一行寫「移除：」", summary_system_prompt)
+        self.assertIn("沒有列在「移除」的舊項目會自動保留", summary_system_prompt)
         self.assertIn("若最近對話沒有帶來足以改寫的長期資訊", summary_system_prompt)
-        self.assertIn("既有摘要", summary_prompt)
+        self.assertIn("[1] 既有摘要", summary_prompt)
         self.assertIn("現有長期記憶摘要（預設保留", summary_prompt)
         self.assertIn("不要因為主題切換就刪除舊的有效資訊", summary_prompt)
         self.assertIn("User_1000: 第一個問題", summary_prompt)
@@ -1713,7 +1716,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
                 started.set()
                 await release.wait()
                 return ProviderResponse(text="陳舊摘要", model="qwen/test")
-            return ProviderResponse(text="重新產生的摘要", model="qwen/test")
+            return ProviderResponse(text="移除：1\n- 重新產生的摘要", model="qwen/test")
 
         chain = _summary_chain(side_effect=fake_generate)
         compactions = _BackgroundCompactions()
@@ -1758,7 +1761,7 @@ class MemoryServiceTests(unittest.IsolatedAsyncioTestCase):
         # scheduled through the same scheduler (a second `compact` task).
         self.assertEqual(len(compactions.tasks), 2)
         self.assertNotEqual(memory.summary_text, "陳舊摘要")
-        self.assertEqual(memory.summary_text, "重新產生的摘要")
+        self.assertEqual(memory.summary_text, "重新產生的摘要。")
         self.assertEqual(chain.generate.await_count, 2)
 
 
@@ -3111,7 +3114,7 @@ class CompositionContainerTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
             self.assertEqual(container.chat_agent.targets, table.tiers("chat"))
-            self.assertEqual(labels(container.chat_agent.targets)[0], "nvidia:nvidia/nemotron-3-ultra-550b-a55b")
+            self.assertEqual(labels(container.chat_agent.targets)[0], "nvidia:nvidia/nemotron-3-super-120b-a12b")
             for agent in (container.chat_agent, container.vision_agent, container.web_search_agent):
                 with self.subTest(agent=agent.name):
                     self.assertEqual(agent.thinking_targets, table.tiers("thinking"))
@@ -3131,6 +3134,7 @@ class CompositionContainerTests(unittest.IsolatedAsyncioTestCase):
                 [
                     "nvidia:nvidia/nemotron-3-super-120b-a12b",
                     "nvidia:nvidia/nemotron-3-ultra-550b-a55b",
+                    "openrouter:dots-studio/dots-3-note-preview:free",
                     "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free",
                 ],
             )
@@ -3148,7 +3152,10 @@ class CompositionContainerTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("nvidia", container.providers)
             self.assertEqual(
                 [tier.label for tier in container.role_table.tiers("utility")],
-                ["openrouter:nvidia/nemotron-3-ultra-550b-a55b:free"],
+                [
+                    "openrouter:dots-studio/dots-3-note-preview:free",
+                    "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free",
+                ],
             )
             self.assertEqual(container.image_gen_agent.image_tiers, [])
             self.assertEqual(
@@ -3332,7 +3339,8 @@ class LifespanInitTests(unittest.IsolatedAsyncioTestCase):
                 embedding = embedding_service_module.get_embedding_service()
 
                 # Summaries use the shared chain over the utility tiers
-                # (NVIDIA Super, then Ultra, then the OpenRouter free Ultra).
+                # (NVIDIA Super, then Ultra, then OpenRouter dots-3 and the
+                # free Ultra).
                 utility = container.role_table.tiers("utility")
                 self.assertIs(memory._summary_chain, container.fallback_chain)
                 self.assertEqual(memory._summary_targets, utility)
@@ -3341,6 +3349,7 @@ class LifespanInitTests(unittest.IsolatedAsyncioTestCase):
                     [
                         "nvidia/nemotron-3-super-120b-a12b",
                         "nvidia/nemotron-3-ultra-550b-a55b",
+                        "dots-studio/dots-3-note-preview:free",
                         "nvidia/nemotron-3-ultra-550b-a55b:free",
                     ],
                 )

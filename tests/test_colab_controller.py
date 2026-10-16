@@ -400,8 +400,10 @@ class BootTests(unittest.TestCase):
         late = tick(state, now=NOW + LEASE_SECONDS["launch"])
         self.assertIn(("launch", {"nbh": NBH, "endpoint": "ep-1"}), late.tasks)
 
-        launched = after_launch(state, NBH, "ep-1", LaunchResult("kernel-9", "session-9", 77), NOW, CFG).state
+        launched = after_launch(state, NBH, "ep-1", LaunchResult("kernel-9", "session-9", 77, "0.41.2"), NOW, CFG).state
         self.assertEqual((launched.kernel_id, launched.session_id, launched.boot_step), ("kernel-9", "session-9", "launched"))
+        # The release the launcher picked: the probe and health checks want it.
+        self.assertEqual(launched.ollama_version, "0.41.2")
         self.assertEqual(launched.last_heartbeat_at, NOW)
         self.assertNotIn("launch", actions(tick(launched, now=NOW + 400)))
 
@@ -598,9 +600,10 @@ class ReleaseTests(unittest.TestCase):
         # The probe's digests and /api/ps sizes belong to one session: none
         # of them may reach the next session's /health/detail.
         probed = {
-            "versions": {"ollama": "0.35.0"},
-            "digests": {"nimble:9b": "a" * 64},
-            "vram": {"nimble:9b": {"size": 10, "size_vram": 10}},
+            "ollama_version": "0.41.2",
+            "versions": {"ollama": "0.41.2"},
+            "digests": {"clef-flash:9b": "a" * 64},
+            "vram": {"clef-flash:9b": {"size": 10, "size_vram": 10}},
             "gpu": {"name": "A100"},
         }
         released = after_unassign(tick(_draining(**probed)).state, "ep-1", True, NOW + 30, CFG).state
@@ -608,6 +611,7 @@ class ReleaseTests(unittest.TestCase):
         for state in (released, restarted):
             with self.subTest(status=state.status):
                 self.assertEqual((state.versions, state.digests, state.vram, state.gpu), ({}, {}, {}, {}))
+                self.assertEqual(state.ollama_version, "")
 
     def test_orphans_ours_are_released_foreign_only_when_dedicated(self) -> None:
         state = _ready(known_endpoints=("ep-old", "ep-1"))

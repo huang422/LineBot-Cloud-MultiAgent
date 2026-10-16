@@ -1,11 +1,19 @@
 """Starts the VM side on a freshly assigned Colab runtime (ADR-0010, colab/README.md).
 
-Three steps through the control plane (:mod:`.control_plane`), all in one
-kernel whose ids the controller keeps for its keep-alive cells:
+First it picks the Ollama release the session installs
+(:class:`OllamaReleases`): the latest GitHub release when it is at least
+versions.json's ``ollama.min_version``, else versions.json's pinned
+fallback. The bot does this rather than the VM so the choice is in Cloud
+Logging and outlives the VM; the VM still checks the tarball's size and
+sha256, so a tampered or cut-off download fails the boot as before.
+
+Then three steps through the control plane (:mod:`.control_plane`), all in
+one kernel whose ids the controller keeps for its keep-alive cells:
 
 1. Upload ``colab.VM_FILES`` (bootstrap.py, auth_proxy.py, register.py,
    versions.json, proxy-requirements.lock) flat into ``/content`` through
-   the Jupyter Contents API.
+   the Jupyter Contents API; the versions.json uploaded is the repository's
+   with its ``ollama`` entry replaced by the release picked.
 2. Write ``/content/.bootstrap.env`` (mode 0600; ``register.BOOTSTRAP_ENV_KEYS``)
    with a *silent* execute: no output, no IPython history. The values never
    pass through ``colab exec --env``, argv, a log or the state document; the
@@ -23,14 +31,21 @@ A failure of any step raises :class:`LaunchError` (a boot failure) or a
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
-from collections.abc import Callable
+import tempfile
+from collections import OrderedDict
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from colab import VM_FILES, register
 from src.services.colab import protocol
+from src.utils.logger import logger
 
 # The VM package in this repository (and in the image).
 VM_DIR = Path(__file__).resolve().parents[3] / "colab"
@@ -40,6 +55,17 @@ LAUNCH_SENTINEL = "BOOTSTRAP_LAUNCHED"
 MISSING_ENV_SENTINEL = "BOOTSTRAP_ENV_MISSING"
 CELL_BUDGET_SECONDS = 30.0
 _LAUNCHED = re.compile(rf"^{LAUNCH_SENTINEL} (\d+)$", re.MULTILINE)
+
+# The Ollama release lookup (GitHub's REST API, unauthenticated: 60
+# requests an hour per address; one per session is far below that).
+OLLAMA_LATEST_RELEASE_URL = "https://api.github.com/repos/ollama/ollama/releases/latest"
+OLLAMA_ASSET = "ollama-linux-amd64.tar.zst"
+OLLAMA_DOWNLOAD_PREFIX = "https://github.com/ollama/ollama/releases/download/"
+RELEASE_TIMEOUT_SECONDS = 10.0
+# Picks kept, one per session (nbh): a session's launch retries reuse its
+# pick, and sessions are a few a day.
+RELEASE_PICKS_KEPT = 8
+_ASSET_DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
 
 
 class LaunchError(Exception):
@@ -51,6 +77,122 @@ class LaunchResult:
     kernel_id: str
     session_id: str
     pid: int
+    # The Ollama release the uploaded versions.json names (the session's).
+    ollama_version: str = ""
+
+
+class _ReleaseUnusable(Exception):
+    """The latest release cannot be used; the message says why."""
+
+
+class OllamaReleases:
+    """Which Ollama release the next session installs.
+
+    The latest GitHub release (``/releases/latest``: never a draft or a
+    pre-release) when it is at least the fallback's ``min_version`` and its
+    ``ollama-linux-amd64.tar.zst`` asset has a GitHub download URL, a
+    ``sha256:`` digest and a size; else the fallback (versions.json's pinned
+    ``ollama`` entry). Any failure (an HTTP error, no answer within
+    RELEASE_TIMEOUT_SECONDS, a rate limit, a missing digest, an odd shape)
+    picks the fallback with a WARNING saying why; a usable latest release is
+    logged at INFO. ``transport`` is for tests.
+
+    The pick is kept per session (nbh), never across sessions: every
+    launch retry of one session uploads the same entry, so a retry cannot
+    name another release than the bootstrap already running from the
+    first upload (the probe would then refuse a healthy session), and each
+    new session asks GitHub afresh, so an asset GitHub replaced after
+    publishing (it rebuilt v0.40.5's a day later) costs at most the one
+    session whose download no longer matches. Only this process keeps it:
+    with ``--max-instances=1`` a retry comes back here unless the instance
+    was replaced in between.
+    """
+
+    def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        self._transport = transport
+        self._picks: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+    async def pick(self, fallback: Mapping[str, Any], nbh: str) -> dict[str, Any]:
+        """versions.json's ``ollama`` entry for session *nbh*: ``version``,
+        ``url``, ``sha256``, ``size`` and the fallback's ``min_version``."""
+        if nbh in self._picks:
+            return dict(self._picks[nbh])
+        minimum = str(fallback["min_version"])
+        try:
+            latest = await self._latest()
+            if not register.version_at_least(latest["version"], minimum):
+                raise _ReleaseUnusable(f"the latest release {latest['version']} is older than {minimum}")
+        except Exception as exc:  # whatever went wrong, the fallback boots
+            why = str(exc) if isinstance(exc, _ReleaseUnusable) else f"{type(exc).__name__}: {exc}"
+            entry = dict(fallback)
+            logger.warning(
+                f"Colab launch: Ollama {entry['version']}, the pinned fallback (the latest release is not used: {why})"
+            )
+        else:
+            entry = {**latest, "min_version": minimum}
+            logger.info(f"Colab launch: Ollama {entry['version']}, the latest release")
+        self._picks[nbh] = entry
+        while len(self._picks) > RELEASE_PICKS_KEPT:
+            self._picks.popitem(last=False)
+        return dict(entry)
+
+    async def _latest(self) -> dict[str, Any]:
+        """The latest release's entry; raises _ReleaseUnusable."""
+        try:
+            async with asyncio.timeout(RELEASE_TIMEOUT_SECONDS):
+                async with httpx.AsyncClient(
+                    transport=self._transport,
+                    timeout=RELEASE_TIMEOUT_SECONDS,
+                    follow_redirects=False,
+                    headers={"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
+                ) as client:
+                    response = await client.get(OLLAMA_LATEST_RELEASE_URL)
+        except TimeoutError:
+            raise _ReleaseUnusable(f"GitHub did not answer within {RELEASE_TIMEOUT_SECONDS:g}s") from None
+        except httpx.HTTPError as exc:
+            raise _ReleaseUnusable(f"GitHub unreachable ({type(exc).__name__})") from None
+        if response.status_code != 200:
+            limited = response.status_code == 429 or response.headers.get("x-ratelimit-remaining") == "0"
+            raise _ReleaseUnusable(f"GitHub answered HTTP {response.status_code}{' (rate limited)' if limited else ''}")
+        try:
+            release = response.json()
+        except ValueError:
+            raise _ReleaseUnusable("GitHub answered something that is not JSON") from None
+        return _release_entry(release)
+
+
+def _release_entry(release: Any) -> dict[str, Any]:
+    """``{"version", "url", "sha256", "size"}`` from a GitHub release object;
+    raises _ReleaseUnusable naming what is wrong."""
+    if not isinstance(release, dict):
+        raise _ReleaseUnusable("the release is not an object")
+    if release.get("draft") is not False or release.get("prerelease") is not False:
+        raise _ReleaseUnusable("the release is a draft or a pre-release")
+    tag = release.get("tag_name")
+    version = tag.removeprefix("v") if isinstance(tag, str) else ""
+    if register.parse_version(version) is None:
+        raise _ReleaseUnusable(f"the tag {str(tag)[:40]!r} is not a release version")
+    assets = release.get("assets")
+    found = [
+        item for item in (assets if isinstance(assets, list) else [])
+        if isinstance(item, dict) and item.get("name") == OLLAMA_ASSET
+    ]
+    if not found:
+        raise _ReleaseUnusable(f"{version} has no {OLLAMA_ASSET}")
+    asset = found[0]
+    url = asset.get("browser_download_url")
+    if not isinstance(url, str) or not url.startswith(OLLAMA_DOWNLOAD_PREFIX) or any(c.isspace() for c in url):
+        raise _ReleaseUnusable(f"{version}'s {OLLAMA_ASSET} is not on {OLLAMA_DOWNLOAD_PREFIX}")
+    # GitHub's own sha256 of the asset ("sha256:<hex>"): the VM checks the
+    # download against it, so a tampered or partial file fails the boot.
+    digest = asset.get("digest")
+    sha256 = _ASSET_DIGEST.fullmatch(digest) if isinstance(digest, str) else None
+    if sha256 is None:
+        raise _ReleaseUnusable(f"{version}'s {OLLAMA_ASSET} has no sha256 digest")
+    size = asset.get("size")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise _ReleaseUnusable(f"{version}'s {OLLAMA_ASSET} has no size")
+    return {"version": version, "url": url, "sha256": sha256.group(1), "size": size}
 
 
 @dataclass(frozen=True)
@@ -129,14 +271,17 @@ class ColabLauncher:
         bot_url: Callable[[], str],
         settings: LaunchSettings,
         vm_dir: Path = VM_DIR,
+        releases: OllamaReleases | None = None,
     ) -> None:
         """``bot_url()`` is the service's public https URL (``BaseUrlResolver``):
-        where the VM registers."""
+        where the VM registers. ``releases`` picks the Ollama release (tests
+        pass one over a fake transport)."""
         self._control_plane = control_plane
         self._secret = secret
         self._bot_url = bot_url
         self.settings = settings
         self._vm_dir = vm_dir
+        self._releases = releases or OllamaReleases()
 
     def bootstrap_env(self, nbh: str) -> str:
         """The env file for session *nbh*. Secret: never log it.
@@ -179,9 +324,20 @@ class ColabLauncher:
         with a fresh proxy token.
         """
         env_text = self.bootstrap_env(nbh)
-        await self._control_plane.upload(
-            runtime, {f"{CONTENT_DIR.lstrip('/')}/{name}": self._vm_dir / name for name in VM_FILES}
-        )
+        try:
+            versions = register.load_versions(self._vm_dir / "versions.json")
+            versions["ollama"] = await self._releases.pick(versions["ollama"], nbh)
+            # The entry the VM will read passes the VM's own check first.
+            register.validate_versions(versions)
+        except (OSError, ValueError) as exc:
+            raise LaunchError(f"versions.json: {exc}") from None
+        with tempfile.TemporaryDirectory(prefix="colab-launch-") as scratch:
+            picked = Path(scratch) / "versions.json"
+            picked.write_text(json.dumps(versions, indent=2) + "\n", encoding="utf-8")
+            files = {name: picked if name == "versions.json" else self._vm_dir / name for name in VM_FILES}
+            await self._control_plane.upload(
+                runtime, {f"{CONTENT_DIR.lstrip('/')}/{name}": path for name, path in files.items()}
+            )
         written = await self._control_plane.run_cell(
             runtime,
             env_cell(env_text),
@@ -204,4 +360,4 @@ class ColabLauncher:
         if pid is None:
             detail = started.error or started.stdout.strip()[-200:] or "no output"
             raise LaunchError(f"bootstrap.py did not start ({started.status}): {detail}")
-        return LaunchResult(started.kernel_id, started.session_id, pid)
+        return LaunchResult(started.kernel_id, started.session_id, pid, versions["ollama"]["version"])

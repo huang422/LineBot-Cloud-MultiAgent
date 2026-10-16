@@ -20,8 +20,8 @@ from src.models.agent_request import AgentRequest
 from src.providers.fallback_chain import Tier
 from src.providers.model_profiles import get_profile
 from src.runtime.model_roles import (
-    COLAB_NIMBLE,
     COLAB_QWEN,
+    COLAB_ROUTER,
     FLUX_DEV,
     FLUX_KLEIN,
     NIM_EMBED_1B,
@@ -29,7 +29,7 @@ from src.runtime.model_roles import (
     NIM_OMNI,
     NIM_SUPER,
     NIM_ULTRA,
-    OR_QWEN,
+    OR_DOTS,
     OR_SUPER,
     OR_ULTRA,
     ROLES,
@@ -76,21 +76,25 @@ class DefaultTableTests(unittest.TestCase):
             {role: _labels(table, role) for role in ROLES},
             {
                 "router": [
-                    f"colab:{COLAB_NIMBLE}",
+                    f"colab:{COLAB_ROUTER}",
                     f"nvidia:{NIM_SUPER}",
                     f"nvidia:{NIM_ULTRA}",
                     f"openrouter:{OR_SUPER}",
                 ],
+                # Colab, then NVIDIA (two models, Super before Ultra since
+                # Ultra hung on every call on 2026-10-16), then OpenRouter.
                 "chat": [
                     f"colab:{COLAB_QWEN}",
+                    f"nvidia:{NIM_SUPER}",
                     f"nvidia:{NIM_ULTRA}",
-                    f"openrouter:{OR_QWEN}",
+                    f"openrouter:{OR_DOTS}",
                     f"openrouter:{OR_ULTRA}",
                 ],
                 "thinking": [
                     f"colab:{COLAB_QWEN}",
+                    f"nvidia:{NIM_SUPER}",
                     f"nvidia:{NIM_ULTRA}",
-                    f"openrouter:{OR_QWEN}",
+                    f"openrouter:{OR_DOTS}",
                     f"openrouter:{OR_ULTRA}",
                 ],
                 # The 2026-10-01 vision probe's pick (D3).
@@ -98,9 +102,15 @@ class DefaultTableTests(unittest.TestCase):
                     f"colab:{COLAB_QWEN}",
                     f"nvidia:{NIM_OMNI}",
                     f"nvidia:{NIM_MUSE}",
-                    f"openrouter:{OR_QWEN}",
+                    f"openrouter:{OR_DOTS}",
                 ],
-                "utility": [f"nvidia:{NIM_SUPER}", f"nvidia:{NIM_ULTRA}", f"openrouter:{OR_ULTRA}"],
+                # dots-3 since 2026-10-16: the one tier NVIDIA does not serve.
+                "utility": [
+                    f"nvidia:{NIM_SUPER}",
+                    f"nvidia:{NIM_ULTRA}",
+                    f"openrouter:{OR_DOTS}",
+                    f"openrouter:{OR_ULTRA}",
+                ],
                 "embed": [f"nvidia:{NIM_EMBED_1B}"],
                 "image": [f"nvidia:{FLUX_KLEIN}", f"nvidia:{FLUX_DEV}"],
             },
@@ -120,23 +130,29 @@ class DefaultTableTests(unittest.TestCase):
             (12, {"thinking": False, "json_mode": "json_schema", "max_tokens": 256, "temperature": 0.1}),
         )
         # Ultra has no structured output: the prompt alone asks for the JSON.
+        # 6 s: it routes in about 2 s when healthy, and hung all of 2026-10-16.
         self.assertEqual(
             row("router", 2),
-            (12, {"thinking": False, "json_mode": "prompt", "max_tokens": 256, "temperature": 0.1}),
+            (6, {"thinking": False, "json_mode": "prompt", "max_tokens": 256, "temperature": 0.1}),
         )
         self.assertEqual(
             row("router", 3), (12, {"effort": "none", "json_mode": "json_object", "thinking": False})
         )
         # The Colab window (90 s) minus the API reserve (20 s).
         self.assertEqual(row("chat", 0), (70, {"think": "false", "thinking": False}))
-        self.assertEqual(row("chat", 1), (40, {"thinking": False}))
-        self.assertEqual(row("chat", 2), (40, {"effort": "none", "thinking": False}))
+        # Super (no tier temperature, so the card's sampling answers), then
+        # Ultra held to 25 s, so a hung Ultra still leaves dots-3 time.
+        self.assertEqual(row("chat", 1), (45, {"thinking": False}))
+        self.assertEqual(row("chat", 2), (25, {"thinking": False}))
         self.assertEqual(row("chat", 3), (40, {"effort": "none", "thinking": False}))
+        self.assertEqual(row("chat", 4), (40, {"effort": "none", "thinking": False}))
         self.assertEqual(row("thinking", 0), (110, {"think": "xhigh", "thinking": True}))
-        # Ultra takes no reasoning_budget on NIM (HTTP 400 in the live gate).
-        self.assertEqual(row("thinking", 1), (100, {"thinking": True}))
-        self.assertEqual(row("thinking", 2), (100, {"effort": "medium", "thinking": True}))
-        self.assertEqual(row("thinking", 3), (100, {"effort": "medium", "thinking": True}))
+        # Super thinks with NVIDIA_THINKING_BUDGET as its reasoning_budget;
+        # Ultra takes none on NIM (HTTP 400 in the live gate).
+        self.assertEqual(row("thinking", 1), (60, {"thinking": True}))
+        self.assertEqual(row("thinking", 2), (30, {"thinking": True}))
+        self.assertEqual(row("thinking", 3), (120, {"effort": "medium", "thinking": True}))
+        self.assertEqual(row("thinking", 4), (30, {"effort": "medium", "thinking": True}))
         self.assertEqual(row("vision", 0), (70, {"think": "false", "thinking": False}))
         # Nano Omni as the probe called it: thinking off, 0.2, 1024 tokens.
         self.assertEqual(
@@ -144,17 +160,44 @@ class DefaultTableTests(unittest.TestCase):
         )
         # The API vision tiers never think, not even for a thinking request.
         self.assertEqual(row("vision", 2), (35, {"thinking": False}))
-        self.assertEqual(row("vision", 3), (15, {"effort": "none", "thinking": False}))
+        self.assertEqual(row("vision", 3), (20, {"effort": "none", "thinking": False}))
         # A deliberately low temperature on Super for utility work.
         self.assertEqual(row("utility", 0), (30, {"thinking": False, "temperature": 0.2}))
         self.assertEqual(row("utility", 1), (30, {"thinking": False}))
         self.assertEqual(row("utility", 2), (30, {"effort": "none", "thinking": False}))
-        for role, count in (("router", 4), ("chat", 4), ("thinking", 4), ("vision", 4), ("utility", 3)):
+        self.assertEqual(row("utility", 3), (30, {"effort": "none", "thinking": False}))
+        for role, count in (("router", 4), ("chat", 5), ("thinking", 5), ("vision", 4), ("utility", 4)):
             with self.subTest(role=role):
                 self.assertEqual(len(table.rows(role)), count)
         self.assertEqual(row("embed", 0), (10, {"dim": 1024}))
         self.assertEqual(row("image", 0), (60, {}))
         self.assertEqual(row("image", 1), (90, {"steps": 50}))
+
+    def test_the_default_timeouts_fit_their_deadlines(self) -> None:
+        settings = _settings()
+        specs = role_specs(settings)
+
+        # The memory summary walks the utility tiers under one deadline.
+        self.assertLessEqual(
+            sum(spec.timeout_s for spec in specs["utility"]), settings.memory_summary_timeout_seconds
+        )
+        # The thinking tiers share at most half of the turn deadline; the
+        # NIM ones leave dots-3 part of it even when both hang.
+        half = settings.turn_deadline_seconds / 2
+        nim = [spec.timeout_s for spec in specs["thinking"] if spec.provider == "nvidia"]
+        self.assertLessEqual(sum(nim) + settings.min_tier_seconds, half)
+        # dots-3, the one thinking tier NVIDIA does not serve, may think for
+        # the whole half when NIM fails fast: the half ends it, not its limit.
+        dots_thinking = next(spec for spec in specs["thinking"] if spec.model == OR_DOTS)
+        self.assertGreaterEqual(dots_thinking.timeout_s, half)
+        # After two hung NIM tiers it gets less than its chat tier's limit,
+        # so timing out there does not skip that tier (a05be403).
+        dots_chat = next(spec for spec in specs["chat"] if spec.model == OR_DOTS)
+        self.assertLess(half - sum(nim), dots_chat.timeout_s)
+        # A plain answer: the NVIDIA tiers leave OpenRouter part of the
+        # reply window.
+        chat_nim = [spec.timeout_s for spec in specs["chat"] if spec.provider == "nvidia"]
+        self.assertLess(sum(chat_nim), settings.reply_window_seconds)
 
     def test_colab_tiers_stay_disabled_until_a_colab_provider_registers(self) -> None:
         table = _table()
@@ -165,7 +208,7 @@ class DefaultTableTests(unittest.TestCase):
                 self.assertEqual(first.spec.provider, "colab")
                 self.assertFalse(first.enabled)
                 self.assertEqual(first.disabled_reason, "colab tier not enabled")
-        self.assertEqual(_enabled(table, "chat")[0], f"nvidia:{NIM_ULTRA}")
+        self.assertEqual(_enabled(table, "chat")[0], f"nvidia:{NIM_SUPER}")
 
     def test_a_provider_registered_as_colab_is_picked_up(self) -> None:
         colab = _provider("colab")
@@ -175,7 +218,7 @@ class DefaultTableTests(unittest.TestCase):
         self.assertIs(chat[0].provider, colab)
         self.assertEqual((chat[0].model, chat[0].timeout_s), (COLAB_QWEN, 70))
         self.assertEqual(chat[0].modalities, frozenset({"text", "image"}))
-        self.assertEqual(table.tiers("router")[0].model, COLAB_NIMBLE)
+        self.assertEqual(table.tiers("router")[0].model, COLAB_ROUTER)
         # A Colab tier leaves the API tiers after it their share of the time
         # left, whatever its thinking setting (5a review: immediate replies).
         for role in ("router", "chat", "thinking", "vision"):
@@ -189,7 +232,7 @@ class DefaultTableTests(unittest.TestCase):
 
         self.assertEqual(
             _enabled(table, "chat"),
-            [f"openrouter:{OR_QWEN}", f"openrouter:{OR_ULTRA}"],
+            [f"openrouter:{OR_DOTS}", f"openrouter:{OR_ULTRA}"],
         )
         self.assertEqual(table.tiers("embed"), [])
         self.assertEqual(
@@ -197,16 +240,17 @@ class DefaultTableTests(unittest.TestCase):
         )
         table = _table(providers=("nvidia",))
         self.assertEqual(
-            [row.disabled_reason for row in table.rows("utility")], ["", "", "OPENROUTER_API_KEY not set"]
+            [row.disabled_reason for row in table.rows("utility")], ["", ""] + ["OPENROUTER_API_KEY not set"] * 2
         )
 
     def test_tiers_carry_the_profile_modalities(self) -> None:
         table = _table()
 
         modalities = {tier.label: tier.modalities for tier in table.tiers("chat")}
-        # Ultra is text only, so an image request skips it.
+        # Ultra and Super are text only, so an image request skips them.
         self.assertEqual(modalities[f"nvidia:{NIM_ULTRA}"], frozenset({"text"}))
-        self.assertIn("image", modalities[f"openrouter:{OR_QWEN}"])
+        self.assertEqual(modalities[f"nvidia:{NIM_SUPER}"], frozenset({"text"}))
+        self.assertIn("image", modalities[f"openrouter:{OR_DOTS}"])
 
     def test_default_vision_tiers_see_images_and_answering_roles_keep_an_api_tier(self) -> None:
         table = _table(providers=("nvidia", "openrouter", "colab"))
@@ -241,12 +285,12 @@ class OverrideTests(unittest.TestCase):
         table = _table(
             model_roles={
                 "utility": [
-                    {"provider": "openrouter", "model": OR_QWEN, "effort": "none", "timeout_s": 20},
+                    {"provider": "openrouter", "model": OR_DOTS, "effort": "none", "timeout_s": 20},
                 ]
             }
         )
 
-        self.assertEqual(_labels(table, "utility"), [f"openrouter:{OR_QWEN}"])
+        self.assertEqual(_labels(table, "utility"), [f"openrouter:{OR_DOTS}"])
         self.assertEqual(table.tiers("utility")[0].timeout_s, 20)
         # Every other role keeps its default.
         self.assertEqual(_labels(table, "router"), _labels(_table(), "router"))
@@ -264,7 +308,7 @@ class OverrideTests(unittest.TestCase):
             model_roles={
                 "thinking": [
                     {"provider": "nvidia", "model": NIM_SUPER},
-                    {"provider": "openrouter", "model": OR_QWEN, "effort": "none"},
+                    {"provider": "openrouter", "model": OR_DOTS, "effort": "none"},
                 ],
                 "vision": [{"provider": "nvidia", "model": NIM_MUSE}],
             }
@@ -287,15 +331,15 @@ class OverrideTests(unittest.TestCase):
         self.assertIn("nvidia:example/new-model has no model profile", table.warnings[0])
 
     def test_an_unprofiled_colab_id_fails_startup(self) -> None:
-        # The VM pulls only the pinned models: any other id would answer 404
-        # and mark the whole Colab endpoint (qwen3.8 chat, nimble) unhealthy.
+        # The VM pulls only versions.json's models: any other id would answer 404
+        # and mark the whole Colab endpoint (qwen3.8 chat, clef-flash) unhealthy.
         roles = {
             "chat": [
                 {"provider": "colab", "model": "qwen3.8:27b", "think": "low"},
                 {"provider": "nvidia", "model": NIM_ULTRA},
             ]
         }
-        with self.assertRaisesRegex(RoleConfigError, "chat: colab:qwen3.8:27b has no model profile; Colab serves only the pinned models"):
+        with self.assertRaisesRegex(RoleConfigError, "chat: colab:qwen3.8:27b has no model profile; Colab serves only the models colab/versions.json lists"):
             _table(providers=("colab", "nvidia"), model_roles=roles)
 
     def test_json_false_is_the_think_level_false(self) -> None:
@@ -327,7 +371,7 @@ class PathPreferenceTests(unittest.TestCase):
         "chat": [
             {"provider": "nvidia", "model": NIM_ULTRA},
             {"provider": "colab", "model": COLAB_QWEN},
-            {"provider": "openrouter", "model": OR_QWEN},
+            {"provider": "openrouter", "model": OR_DOTS},
         ]
     }
 
@@ -336,7 +380,7 @@ class PathPreferenceTests(unittest.TestCase):
 
         self.assertEqual(
             _labels(table, "chat"),
-            [f"colab:{COLAB_QWEN}", f"nvidia:{NIM_ULTRA}", f"openrouter:{OR_QWEN}"],
+            [f"colab:{COLAB_QWEN}", f"nvidia:{NIM_ULTRA}", f"openrouter:{OR_DOTS}"],
         )
 
     def test_api_puts_colab_tiers_last_and_keeps_the_rest_in_order(self) -> None:
@@ -354,7 +398,7 @@ class PathPreferenceTests(unittest.TestCase):
         table = _table(model_path_preference="api", model_roles=self._ROLES)
         self.assertEqual(
             _labels(table, "chat"),
-            [f"nvidia:{NIM_ULTRA}", f"openrouter:{OR_QWEN}", f"colab:{COLAB_QWEN}"],
+            [f"nvidia:{NIM_ULTRA}", f"openrouter:{OR_DOTS}", f"colab:{COLAB_QWEN}"],
         )
 
 
@@ -372,32 +416,28 @@ class ForceTierTests(unittest.TestCase):
         )
 
     def test_force_tier_can_pin_one_model(self) -> None:
-        # qwen3.8 free is in chat, thinking and vision; give the router and
-        # utility one too.
+        # dots-3 free is in chat, thinking, vision and utility; give the
+        # router one too.
         table = _table(
-            force_tier=f"openrouter:{OR_QWEN}",
+            force_tier=f"openrouter:{OR_DOTS}",
             model_roles={
                 "router": [
                     {"provider": "nvidia", "model": NIM_SUPER, "json_mode": "json_schema"},
-                    {"provider": "openrouter", "model": OR_QWEN, "effort": "none", "json_mode": "json_schema"},
-                ],
-                "utility": [
-                    {"provider": "nvidia", "model": NIM_SUPER},
-                    {"provider": "openrouter", "model": OR_QWEN, "effort": "none"},
+                    {"provider": "openrouter", "model": OR_DOTS, "effort": "none", "json_mode": "json_schema"},
                 ],
             },
         )
 
         for role in ("router", "chat", "thinking", "vision", "utility"):
             with self.subTest(role=role):
-                self.assertEqual(_enabled(table, role), [f"openrouter:{OR_QWEN}"])
+                self.assertEqual(_enabled(table, role), [f"openrouter:{OR_DOTS}"])
         self.assertEqual(table.tiers("embed"), [])
         self.assertEqual(table.tiers("image"), [])
 
     def test_pinning_a_model_some_answering_role_lacks_fails_startup(self) -> None:
-        # Super is not a chat tier by default, and is text only: nothing
-        # would answer a message or an image.
-        with self.assertRaisesRegex(RoleConfigError, "leaves no usable tier for: chat, vision$"):
+        # Super answers chat (since 2026-10-16) but is text only: nothing
+        # would answer an image.
+        with self.assertRaisesRegex(RoleConfigError, "leaves no usable tier for: vision$"):
             _table(force_tier=f"nvidia:{NIM_SUPER}")
 
     def test_a_force_tier_that_matches_nothing_fails_startup(self) -> None:
@@ -454,8 +494,8 @@ class ValidationTests(unittest.TestCase):
             ({"chat": [{"provider": "openrouter", "model": "openrouter/free", "thinking": True}]}, "cannot think"),
             ({"chat": [{"provider": "nvidia", "model": NIM_ULTRA, "think": "low"}]}, "only Colab tiers read"),
             ({"chat": [{"provider": "nvidia", "model": NIM_ULTRA, "effort": "low"}]}, "only OpenRouter tiers read"),
-            ({"thinking": [{"provider": "openrouter", "model": OR_QWEN, "effort": "high"}]},
-             "does not accept effort=high"),
+            ({"thinking": [{"provider": "openrouter", "model": OR_SUPER, "effort": "high"}]},
+             r"does not accept effort=high \(it lists low, medium\)"),
             ({"vision": [{"provider": "nvidia", "model": NIM_MUSE, "reasoning_budget": 1024}]},
              "does not take a reasoning_budget"),
             # Any reasoning_budget is HTTP 400 on Ultra (live gate 2026-09-30).
@@ -467,8 +507,8 @@ class ValidationTests(unittest.TestCase):
             ({"chat": [{"provider": "nvidia", "model": NIM_ULTRA, "steps": 4}]}, "only the image role reads"),
             ({"chat": [{"provider": "nvidia", "model": NIM_ULTRA, "dim": 4}]}, "only the embed role reads"),
             ({"chat": [{"provider": "nvidia", "model": FLUX_DEV}]}, "cannot serve the chat role"),
-            ({"embed": [{"provider": "openrouter", "model": OR_QWEN}]}, "cannot serve the embed role"),
-            ({"router": [{"provider": "colab", "model": COLAB_NIMBLE}]}, "router: needs at least one tier that is not Colab"),
+            ({"embed": [{"provider": "openrouter", "model": OR_DOTS}]}, "cannot serve the embed role"),
+            ({"router": [{"provider": "colab", "model": COLAB_ROUTER}]}, "router: needs at least one tier that is not Colab"),
             ({"chat": [{"provider": "colab", "model": COLAB_QWEN}]}, "chat: needs at least one tier that is not Colab"),
             ({"chat": [{"provider": "nvidia", "model": "qwen/qwen3.5-397b-a17b"}]}, r"is retired \(HTTP 410\)"),
             ({"embed": [
@@ -524,11 +564,12 @@ class DetailViewTests(unittest.TestCase):
 
         view = table.view(health, lifecycle)
 
-        colab, ultra = view["chat"][:2]
+        colab, _, ultra = view["chat"][:3]
         self.assertEqual(
             (colab["enabled"], colab["disabled_reason"], colab["health"]),
             (False, "colab tier not enabled", "untried"),
         )
+        self.assertEqual(ultra["model"], NIM_ULTRA)
         self.assertEqual((ultra["health"], ultra["dead"], ultra["eol"]), ("dead", True, "2027-01-01T00:00:00Z"))
         self.assertEqual(view["utility"][0]["lifecycle"], {"state": "ok", "eol": None})
         self.assertEqual(view["utility"][0]["protocol"], "nim_nemotron3")
@@ -564,16 +605,23 @@ class AgentTierSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tiers[: len(thinking)], thinking)
         # Review: Colab qwen came again with thinking off, so a READY but
         # slow session took 1/2 then 1/4 of the window and the API 1/4. It
-        # gets its one half-share; the API tiers keep the other half.
+        # gets its one half-share; the API tiers keep the other half. The
+        # API models stay: the chain skips one that already timed out.
         self.assertEqual(
             [(tier.label, tier.options.get("thinking")) for tier in tiers[len(thinking):]],
-            [(f"nvidia:{NIM_ULTRA}", False), (f"openrouter:{OR_QWEN}", False), (f"openrouter:{OR_ULTRA}", False)],
+            [
+                (f"nvidia:{NIM_SUPER}", False),
+                (f"nvidia:{NIM_ULTRA}", False),
+                (f"openrouter:{OR_DOTS}", False),
+                (f"openrouter:{OR_ULTRA}", False),
+            ],
         )
         self.assertEqual(tiers[0].label, f"colab:{COLAB_QWEN}")
         self.assertEqual(dict(tiers[0].options), {"think": "xhigh", "thinking": True})
-        self.assertEqual(dict(tiers[1].options), {"thinking": True})
-        self.assertEqual(tiers[2].options["effort"], "medium")
-        self.assertEqual((tiers[3].label, tiers[3].options["effort"]), (f"openrouter:{OR_ULTRA}", "medium"))
+        self.assertEqual((tiers[1].label, dict(tiers[1].options)), (f"nvidia:{NIM_SUPER}", {"thinking": True}))
+        self.assertEqual((tiers[2].label, dict(tiers[2].options)), (f"nvidia:{NIM_ULTRA}", {"thinking": True}))
+        self.assertEqual(tiers[3].options["effort"], "medium")
+        self.assertEqual((tiers[4].label, tiers[4].options["effort"]), (f"openrouter:{OR_ULTRA}", "medium"))
 
     def test_a_colab_tier_only_in_the_chat_role_still_runs_with_thinking_off(self) -> None:
         roles = {"thinking": [{"provider": "nvidia", "model": NIM_ULTRA, "thinking": True}]}
@@ -622,7 +670,7 @@ class AgentTierSelectionTests(unittest.IsolatedAsyncioTestCase):
                 (f"colab:{COLAB_QWEN}", True),
                 (f"nvidia:{NIM_OMNI}", False),
                 (f"nvidia:{NIM_MUSE}", False),
-                (f"openrouter:{OR_QWEN}", False),
+                (f"openrouter:{OR_DOTS}", False),
             ],
         )
         # The Colab tier thinks at the deep level.
@@ -642,7 +690,7 @@ class AgentTierSelectionTests(unittest.IsolatedAsyncioTestCase):
         await agent.process(AgentRequest(text="請一步一步推導", disable_thinking=False))
 
         sent = chain.generate.await_args.kwargs["targets"]
-        self.assertEqual(sent[0].label, f"nvidia:{NIM_ULTRA}")
+        self.assertEqual(sent[0].label, f"nvidia:{NIM_SUPER}")
         self.assertIs(sent[0].options["thinking"], True)
         self.assertIsInstance(sent[0], Tier)
 

@@ -7,8 +7,9 @@ per-request options and input modalities; the role table
 1. once the caller's ``deadline`` (``time.monotonic()`` seconds) has
    passed, stop with :class:`DeadlineExceededError`;
 2. skip a tier whose modalities lack ``"image"`` when the request carries
-   images, and a tier :class:`ModelHealth` reports dead, cooling down or
-   over its provider budget;
+   images, a tier :class:`ModelHealth` reports dead, cooling down or over
+   its provider budget, and a tier whose model (same provider, same id)
+   already timed out earlier in this walk after a fair try (see below);
 3. call it under ``asyncio.timeout(min(tier.timeout_s, time left))``. A
    thinking tier (``options["thinking"] is True``) that has a tier after it
    that could run (step 2) must be done by the *thinking cutoff*, set
@@ -32,17 +33,36 @@ Colab tier, its share of the time left) cut it off, so a hung endpoint
 cools down instead of eating every request's reply window. It does not
 count when the deadline left the tier only a moment, or for a thinking
 tier serving a request that needs thinking (``disable_thinking=False``):
-thinking is slow by design (the same model is usually tried again right
-after with thinking off, which does tell). A tier that thinks although the
-request does not need it (Colab chat at ``COLAB_CHAT_THINK=low``) is held
-to its timeouts like any other. A caller whose deadline
-is its own short budget rather than the reply window (the search query
-planner) passes ``hold_deadline_timeouts=False``: a timeout that budget
-cut short then never counts, since the model may simply need longer than
-the caller chose to wait. Every walk, ending in an answer or an error, is
-also recorded for the request's summary log line: each tier reached, its
-outcome and seconds (:func:`src.utils.request_trace.record_walk`); a call
-that only asks for tools is ``tools`` there, not ``ok``.
+thinking is slow by design (the plain requests that call the same model
+with thinking off do tell). A tier that thinks although the request does
+not need it (Colab chat at ``COLAB_CHAT_THINK=low``) is held to its
+timeouts like any other. A caller whose deadline is its own short budget
+rather than the reply window (the search query planner) passes
+``hold_deadline_timeouts=False``: a timeout that budget cut short then
+never counts, since the model may simply need longer than the caller chose
+to wait.
+
+Within one walk a model that timed out after a fair try is not called
+again. A timeout after at least ``min_tier_seconds`` marks the model (same
+provider, same id) with the seconds it had; a later tier on it is skipped
+(``skip(timed out earlier)``), thinking or not, when that call ran its
+tier's whole ``timeout_s``, or when the later tier's ``timeout_s`` would
+give it less than ``min_tier_seconds`` more than it had (a sliver more is
+no new chance): a thinking request whose thinking tier on NIM Ultra hung
+does not wait on Ultra again with thinking off, even when the thinking
+half cut that tier a little short. A later tier that gives the model
+clearly longer than a share of the time left gave it still runs: on
+2026-10-16 dots-3 at medium effort got 15 s of the thinking half, timed
+out, then answered with thinking off in 20 s. The marks last for the
+walk, or for all the walks that share one ``timed_out`` (chat's tool loop:
+its rounds, its last request and the plain retry after it); the next
+request calls the model again, and across requests only ModelHealth
+decides. None of this changes what ModelHealth records.
+
+Every walk, ending in an answer or an error, is also recorded for the
+request's summary log line: each tier reached, its outcome and seconds
+(:func:`src.utils.request_trace.record_walk`); a call that only asks for
+tools is ``tools`` there, not ``ok``.
 
 ``options["thinking"]`` (True/False) overrides the call's
 ``disable_thinking`` for that tier, so a thinking request is simply the
@@ -55,6 +75,7 @@ thinking role's tiers followed by the chat tiers with thinking off
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -89,6 +110,12 @@ _THINKING_SHARE = 0.5
 # half the time left: in the reply window (REPLY_WINDOW_SECONDS, 90 s) Colab
 # runs about 70 s and an API backup still has time to answer.
 COLAB_API_RESERVE_SECONDS = 20.0
+
+# (provider, model) -> the seconds a model had when it timed out, math.inf
+# when that was its tier's whole timeout_s. FallbackChain.generate's
+# ``timed_out``: walks that pass the same one never call a model again for
+# hardly longer than it already had.
+TimedOutModels = dict[tuple[str, str], float]
 
 
 class LLMProvider(Protocol):
@@ -159,6 +186,9 @@ class _Walk:
     dead: list[str] = field(default_factory=list)
     # Each tier's outcome, for the request's summary line (request_trace).
     attempts: list[Attempt] = field(default_factory=list)
+    # The models that timed out after a fair try, and the seconds each had:
+    # a later tier that would give one hardly longer is skipped.
+    timed_out: TimedOutModels = field(default_factory=dict)
 
     def deadline_error(self, label: str) -> DeadlineExceededError:
         return DeadlineExceededError(
@@ -171,7 +201,8 @@ class FallbackChain:
     """Tries tiers in order with per-tier time limits and health checks.
 
     ``min_tier_seconds`` (MIN_TIER_SECONDS) is the least time a tier must
-    have had before a deadline timeout counts against its model.
+    have had before a deadline timeout counts against its model, and
+    before any timeout keeps later tiers of the walk off it.
     """
 
     def __init__(
@@ -197,6 +228,7 @@ class FallbackChain:
         tool_choice: str | dict | None = None,
         json_schema: dict | None = None,
         hold_deadline_timeouts: bool = True,
+        timed_out: TimedOutModels | None = None,
         **kwargs: Any,
     ) -> ProviderResponse:
         """Answer from the first tier that can.
@@ -212,6 +244,10 @@ class FallbackChain:
             hold_deadline_timeouts: False when ``deadline`` is the caller's
                 own budget: a timeout it cut short is not held against the
                 model (one that ran the tier's full ``timeout_s`` still is).
+            timed_out: The models that already timed out, which this walk
+                skips and adds to; pass the same one to every walk of a
+                request that must not wait on a hung model twice (a tool
+                loop). None: this walk's own, empty at the start.
             **kwargs: Forwarded to ``provider.generate()`` (temperature, ...).
 
         Raises:
@@ -223,7 +259,7 @@ class FallbackChain:
         if not tiers:
             raise AllProvidersFailedError("No fallback targets configured")
         has_images = has_image_parts(messages)
-        walk = _Walk()
+        walk = _Walk(timed_out={} if timed_out is None else timed_out)
         try:
             # When the thinking tiers must be done, set at the first of them.
             thinking_cutoff: float | None = None
@@ -250,6 +286,10 @@ class FallbackChain:
                     else:
                         walk.saw_failure = True
                     continue
+                if self._timed_out_earlier(tier, walk):
+                    logger.info(f"Skipping {tier.label} (timed out earlier)")
+                    walk.attempts.append(request_trace.skipped(tier.label, "timed out earlier"))
+                    continue
 
                 thinking = tier.options.get("thinking") is True
                 # Where this tier must stop: the deadline, or the end of its
@@ -258,7 +298,7 @@ class FallbackChain:
                 if (
                     deadline is not None
                     and (thinking or tier.shares_time)
-                    and any(self._can_run(later, has_images) for later in tiers[index + 1 :])
+                    and any(self._can_run(later, has_images, walk) for later in tiers[index + 1 :])
                 ):
                     # A Colab tier thinking for a plain request (COLAB_CHAT_THINK)
                     # keeps its Colab share, not the thinking tiers' half.
@@ -306,6 +346,11 @@ class FallbackChain:
                         walk.saw_failure = True
                     else:
                         self._failed(walk, tier, timeout)
+                    if limit >= self.min_tier_seconds:
+                        # A fair try: a later tier that would give it hardly
+                        # longer does not wait on it again.
+                        had = limit if deadline_bound else math.inf
+                        walk.timed_out[(name, model)] = max(had, walk.timed_out.get((name, model), 0.0))
                     # A tier cut off at the end of its share leaves the rest to
                     # the tiers after it.
                     if (deadline_bound and not shared) or (deadline is not None and self._clock() >= deadline):
@@ -355,11 +400,20 @@ class FallbackChain:
         finally:
             request_trace.record_walk(walk.attempts)
 
-    def _can_run(self, tier: Tier, has_images: bool) -> bool:
+    def _can_run(self, tier: Tier, has_images: bool, walk: _Walk) -> bool:
         """Whether the walk would call *tier* now (step 2 would not skip it)."""
         if has_images and "image" not in tier.modalities:
             return False
+        if self._timed_out_earlier(tier, walk):
+            return False
         return self.health.unavailable(tier.provider_name, tier.model) is None
+
+    def _timed_out_earlier(self, tier: Tier, walk: _Walk) -> bool:
+        """Whether *tier*'s model already timed out in *walk* having had its
+        tier's whole ``timeout_s``, or so long that *tier* would give it less
+        than ``min_tier_seconds`` more."""
+        had = walk.timed_out.get((tier.provider_name, tier.model))
+        return had is not None and tier.timeout_s < had + self.min_tier_seconds
 
     @staticmethod
     def _time_limit(tier: Tier, until: float | None, now: float) -> tuple[float, bool]:

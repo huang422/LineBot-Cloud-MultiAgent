@@ -35,8 +35,8 @@ from src.services.colab.state import IDLE
 from src.services.model_health import COOLDOWN, ModelHealth
 from src.utils import request_trace
 from tests.colab_fakes import (
-    NIMBLE,
     QWEN,
+    ROUTER,
     TUNNEL,
     Clock,
     FakeTunnel,
@@ -505,14 +505,14 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
             tiers = [Tier(OllamaChatProvider(endpoint), QWEN, shares_time=True), Tier(_Api(), "ultra")]
             router = SystemOneRouter(
                 endpoint,
-                Tier(OllamaChatProvider(endpoint), NIMBLE, timeout_s=6),
+                Tier(OllamaChatProvider(endpoint), ROUTER, timeout_s=6),
                 gates=RouterGates(confidence=0.75, think_on=0.85, think_off=0.15),
                 health=health,
             )
             with self.subTest(answer=answer):
                 self.assertEqual((await FallbackChain(health).generate(tiers, _USER)).text, "API 答案")
                 self.assertIsNone(health.unavailable("colab", QWEN))
-                self.assertIsNone(health.unavailable("colab", NIMBLE))
+                self.assertIsNone(health.unavailable("colab", ROUTER))
                 self.assertFalse(endpoint.is_ready())
                 self.assertIsNone(await router.route(AgentRequest(text="你好")))
 
@@ -563,7 +563,7 @@ class ChainTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(tunnel.requests), 2)
         self.assertEqual(health.unavailable("colab", QWEN).kind, COOLDOWN)
-        self.assertIsNone(health.unavailable("colab", NIMBLE))
+        self.assertIsNone(health.unavailable("colab", ROUTER))
         self.assertFalse(endpoint.breaker_open())
         await endpoint.close()
 

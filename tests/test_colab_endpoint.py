@@ -33,8 +33,8 @@ from src.services.colab.state import (
 from src.services.search.page_fetcher import BlockedURLError
 from tests.colab_fakes import (
     NBH,
-    NIMBLE,
     QWEN,
+    ROUTER,
     SECRET,
     TUNNEL,
     Clock,
@@ -149,8 +149,9 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
         clock = Clock()
         cases = {
             "old ollama": {"GET /api/version": (200, {"version": "0.34.4"})},
+            "ollama under the minimum": {"GET /api/version": (200, {"version": "0.40.3"})},
             "model unloaded": {"GET /api/ps": (200, {"models": []})},
-            "chat unloaded": {"GET /api/ps": (200, {"models": [{"name": NIMBLE, **on_gpu(NIMBLE)}]})},
+            "chat unloaded": {"GET /api/ps": (200, {"models": [{"name": ROUTER, **on_gpu(ROUTER)}]})},
             "proxy down": {"GET /api/version": httpx.ConnectError("refused")},
             "slow": {"GET /api/ps": ("hang", 30)},
         }
@@ -170,9 +171,29 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tunnel.requests, [])
         await endpoint.close()
 
+    async def test_the_health_check_wants_the_release_the_session_was_launched_with(self) -> None:
+        clock = Clock()
+        for launched, served, healthy in (
+            ("0.41.2", "0.41.2", True),
+            # Ollama changed under a running session (a restart, a swap):
+            # not the release its probe passed.
+            ("0.41.2", "0.41.3", False),
+            ("0.41.2", "0.40.5", False),
+            # Launched before 2026-10-16: the minimum alone.
+            ("", "0.41.3", True),
+        ):
+            tunnel = FakeTunnel(**{"GET /api/version": (200, {"version": served})})
+            endpoint, _ = make_endpoint(ready_state(clock(), ollama_version=launched), tunnel, clock=clock)
+            await endpoint.ready()
+            with self.subTest(launched=launched, served=served):
+                self.assertEqual(await endpoint.check_health(), healthy)
+                if not healthy:
+                    self.assertIn(f"Ollama {served}, expected {launched}", endpoint.last_error)
+            await endpoint.close()
+
 
     async def test_a_router_gone_from_the_gpu_sits_the_session_out_and_chat_goes_on(self) -> None:
-        # qwen3.8 reloaded with nimble resident: Ollama evicts nimble.
+        # qwen3.8 reloaded with the router resident: Ollama evicts the router.
         clock = Clock()
         only_chat = {"GET /api/ps": (200, {"models": [{"name": QWEN, **on_gpu(QWEN)}]})}
         endpoint, tunnel = make_endpoint(tunnel=FakeTunnel(**only_chat), clock=clock)
@@ -186,15 +207,15 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(endpoint.is_ready())
         self.assertEqual((endpoint.last_error, endpoint.breaker_open()), ("", False))
-        self.assertEqual(endpoint.off_gpu(), {NIMBLE: (0, 0)})
+        self.assertEqual(endpoint.off_gpu(), {ROUTER: (0, 0)})
         (warning,) = logs.output
-        self.assertIn(f"health check found {NIMBLE} not loaded; the router sits the rest of this session out", warning)
+        self.assertIn(f"health check found {ROUTER} not loaded; the router sits the rest of this session out", warning)
         # Loaded again (nothing here calls it, but say it were): still out,
         # since a call could evict qwen3.8 the next time.
         tunnel.routes.update(healthy_routes())
         self.assertTrue(await endpoint.check_health())
-        self.assertEqual(endpoint.off_gpu(), {NIMBLE: (0, 0)})
-        self.assertEqual(endpoint.view()["off_gpu"], {NIMBLE: {"size_vram": 0, "size": 0}})
+        self.assertEqual(endpoint.off_gpu(), {ROUTER: (0, 0)})
+        self.assertEqual(endpoint.view()["off_gpu"], {ROUTER: {"size_vram": 0, "size": 0}})
         # A new session starts with its router.
         await endpoint.store.update(lambda s: ready_state(clock(), nbh="new-session"))
         self.assertEqual(endpoint.off_gpu(), {})
@@ -202,16 +223,30 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_router_partly_on_the_cpu_at_a_health_check_sits_the_session_out(self) -> None:
         clock = Clock()
-        spilled = {"GET /api/ps": (200, {"models": [{"name": QWEN, **on_gpu(QWEN)}, {"name": NIMBLE, **on_gpu(NIMBLE, 1 << 30)}]})}
+        spilled = {"GET /api/ps": (200, {"models": [{"name": QWEN, **on_gpu(QWEN)}, {"name": ROUTER, **on_gpu(ROUTER, 1 << 30)}]})}
         endpoint, _ = make_endpoint(tunnel=FakeTunnel(**spilled), clock=clock)
         await endpoint.ready()
 
         with self.assertLogs("linebot", "WARNING") as logs:
             self.assertTrue(await endpoint.check_health())
 
-        self.assertEqual(endpoint.off_gpu(), {NIMBLE: (1 << 30, on_gpu(NIMBLE)["size"])})
+        self.assertEqual(endpoint.off_gpu(), {ROUTER: (1 << 30, on_gpu(ROUTER)["size"])})
         self.assertIn("not wholly in VRAM", logs.output[0])
         await endpoint.close()
+
+    async def test_a_router_missing_since_ready_is_dropped_without_another_warning(self) -> None:
+        # Registration logged it at ERROR when the session became READY
+        # (its probe saw no router in /api/ps): the WARNING is only for a
+        # mid-session eviction.
+        clock = Clock()
+        only_chat = {"GET /api/ps": (200, {"models": [{"name": QWEN, **on_gpu(QWEN)}]})}
+        for vram in ({QWEN: on_gpu(QWEN)}, {QWEN: on_gpu(QWEN), ROUTER: on_gpu(ROUTER, 1 << 30)}):
+            endpoint, _ = make_endpoint(ready_state(clock(), vram=vram), FakeTunnel(**only_chat), clock=clock)
+            await endpoint.ready()
+            with self.subTest(vram=vram), self.assertNoLogs("linebot", "WARNING"):
+                self.assertTrue(await endpoint.check_health())
+                self.assertIn(ROUTER, endpoint.off_gpu())
+            await endpoint.close()
 
     async def test_a_failed_health_check_drops_no_router(self) -> None:
         clock = Clock()
@@ -221,7 +256,7 @@ class ReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await endpoint.check_health())
 
         self.assertIn(f"not loaded: {QWEN}", endpoint.last_error)
-        self.assertNotIn(NIMBLE, endpoint.last_error)
+        self.assertNotIn(ROUTER, endpoint.last_error)
         # A failed check says nothing about the router: it stays in.
         self.assertEqual(endpoint.off_gpu(), {})
         await endpoint.close()
@@ -270,8 +305,8 @@ class BusyGateTests(unittest.IsolatedAsyncioTestCase):
         endpoint, _ = make_endpoint()
         async with endpoint.semaphore(QWEN):
             self.assertTrue(endpoint.semaphore(QWEN).locked())
-            self.assertFalse(endpoint.semaphore(NIMBLE).locked())
-        self.assertIsNot(endpoint.semaphore(QWEN), endpoint.semaphore(NIMBLE))
+            self.assertFalse(endpoint.semaphore(ROUTER).locked())
+        self.assertIsNot(endpoint.semaphore(QWEN), endpoint.semaphore(ROUTER))
         self.assertIs(endpoint.semaphore(QWEN), endpoint.semaphore(QWEN))
         await endpoint.close()
 
@@ -419,35 +454,39 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((view["status"], view["ready"], view["tunnel"]), (READY, True, "quick"))
         self.assertEqual((view["ccu_balance"], view["ccu_rate_per_hour"], view["cu_used_today"]), (123.4, 5.37, 2.5))
         self.assertEqual(view["limits"]["daily_cu_cap"], 30)
-        self.assertIsNone(view["unpinned"])
+        self.assertIsNone(view["tags_moved"])
+        self.assertEqual(view["digests"], protocol.colab_models())
         self.assertIsNone(view["off_gpu"])
         dumped = json.dumps(view)
         for secret in (TUNNEL, bearer(), NBH, "colab-endpoint-id", "kernel-1", SECRET):
             self.assertNotIn(secret, dumped)
 
-    async def test_a_republished_router_shows_both_digests(self) -> None:
-        pins = protocol.pinned_models()
+    async def test_a_moved_tag_shows_both_digests_and_the_router_stays_in(self) -> None:
+        verified = protocol.colab_models()
         other = "adfcdbb4070d303fb43fc11fc06a14269ec2bc7136a55369e86d412b86ba2831"
-        endpoint, _ = make_endpoint(ready_state(digests={QWEN: pins[QWEN], NIMBLE: other}))
+        endpoint, _ = make_endpoint(ready_state(digests={QWEN: verified[QWEN], ROUTER: other}))
         await endpoint.ready()
 
         view = endpoint.view()
 
-        self.assertEqual(view["unpinned"], {NIMBLE: {"pinned": pins[NIMBLE], "actual": other}})
+        self.assertEqual(view["tags_moved"], {ROUTER: {"verified": verified[ROUTER], "actual": other}})
+        self.assertEqual(view["digests"], {QWEN: verified[QWEN], ROUTER: other})
         self.assertIsNone(view["off_gpu"])
+        self.assertEqual(endpoint.off_gpu(), {})
         self.assertTrue(view["ready"])
         await endpoint.close()
 
-    async def test_a_router_with_no_digest_or_not_wholly_in_vram_shows_why_it_sits_out(self) -> None:
-        pins = protocol.pinned_models()
-        spilled = {QWEN: on_gpu(QWEN), NIMBLE: on_gpu(NIMBLE, size_vram=1 << 30)}
-        endpoint, _ = make_endpoint(ready_state(digests={QWEN: pins[QWEN]}, vram=spilled))
+    async def test_a_router_not_wholly_in_vram_shows_why_it_sits_out(self) -> None:
+        verified = protocol.colab_models()
+        spilled = {QWEN: on_gpu(QWEN), ROUTER: on_gpu(ROUTER, size_vram=1 << 30)}
+        endpoint, _ = make_endpoint(ready_state(digests={QWEN: verified[QWEN]}, vram=spilled))
         await endpoint.ready()
 
         view = endpoint.view()
 
-        self.assertEqual(view["unpinned"], {NIMBLE: {"pinned": pins[NIMBLE], "actual": None}})
-        self.assertEqual(view["off_gpu"], {NIMBLE: {"size_vram": 1 << 30, "size": on_gpu(NIMBLE)["size"]}})
+        # No digest recorded for the router is no reason by itself.
+        self.assertIsNone(view["tags_moved"])
+        self.assertEqual(view["off_gpu"], {ROUTER: {"size_vram": 1 << 30, "size": on_gpu(ROUTER)["size"]}})
         self.assertTrue(view["ready"])
         await endpoint.close()
 
@@ -457,9 +496,10 @@ class ViewTests(unittest.IsolatedAsyncioTestCase):
             endpoint, _ = make_endpoint(ColabState(status=status))
             await endpoint.ready()
             with self.subTest(status=status):
-                self.assertEqual((endpoint.unpinned(), endpoint.off_gpu()), ({}, {}))
+                self.assertEqual((endpoint.moved_tags(), endpoint.off_gpu()), ({}, {}))
                 view = endpoint.view()
-                self.assertEqual((view["unpinned"], view["off_gpu"]), (None, None))
+                self.assertEqual(view.get("tags_moved"), None)
+                self.assertEqual(view.get("off_gpu"), None)
             await endpoint.close()
 
     async def test_a_named_tunnel_shows_as_named(self) -> None:

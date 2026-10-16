@@ -11,21 +11,30 @@ from __future__ import annotations
 import re
 import time
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from src.agents import routing_rules as rules
 from src.agents.base_agent import CURRENT_MESSAGE_LABEL
 from src.agents.orchestrator import Orchestrator, RouterDecision
+from src.agents.web_search_agent import WebSearchAgent
 from src.config import Settings
 from src.models.agent_request import AgentRequest, InputType
 from src.providers.base import ProviderResponse
+from src.providers.fallback_chain import Tier
 from src.providers.messages import has_image_parts
+from src.services.search.query import SearchQueryPlanner
+from src.services.search.types import SearchResult, WebSearchResponse
 from src.utils.validators import MAX_INPUT_LENGTH
 
 _WEATHER_TURNS = [
     {"role": "user", "content": "台北今天天氣如何"},
     {"role": "assistant", "content": "台北今天晴時多雲，氣溫 28 度。"},
+]
+_TSMC_TURNS = [
+    {"role": "user", "content": "幫我查台積電目前的股價"},
+    {"role": "assistant", "content": "台積電今天收盤 1,450 元。"},
 ]
 
 
@@ -592,6 +601,93 @@ class FollowUpTests(unittest.TestCase):
         decision = _fast("再詳細一點", previous_agent="vision", previous_task_description="描述圖片內容")
         self.assertEqual(decision.agent, "chat")
 
+    def test_asking_to_search_or_check_again_keeps_the_previous_route(self) -> None:
+        # 2026-10-16: a search-again with 再 mistyped as 在 (like "在查詢確認一下")
+        # went to the LLM router and was then searched as typed.
+        for text in (
+            "再搜尋一次",
+            "重新搜尋",
+            "在查詢確認一下",
+            "再確認一下",
+            "確認一次",
+            "再查一次吧",
+            "再次確認",
+            "重新查詢一遍",
+            "再搜一下",
+            "幫我再上網查一下",
+            "在查一下",
+            "在確認一次？",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(rules.is_follow_up_text(text))
+                decision = _fast(text, previous_agent="web_search", conversation_history=_TSMC_TURNS)
+                self.assertEqual(
+                    (decision.agent, decision.reasoning), ("web_search", "follow-up continuation from previous route")
+                )
+                self.assertIn("延續上一輪", decision.task_description)
+
+    def test_search_words_in_a_sentence_are_not_a_search_again(self) -> None:
+        # 在 counts as a typo for 再 only in the whole short form.
+        for text in (
+            "在台北搜尋美食",
+            "我在查資料",
+            "搜尋台積電股價",
+            "確認訂單狀態怎麼查",
+            "再確認一下明天開會的時間",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(rules.is_follow_up_text(text))
+                decision = _fast(text, previous_agent="web_search", conversation_history=_TSMC_TURNS)
+                self.assertTrue(
+                    decision is None or decision.reasoning != "follow-up continuation from previous route", decision
+                )
+
+
+class SearchAgainTests(unittest.IsolatedAsyncioTestCase):
+    def test_a_bare_verb_after_the_typo_or_a_bare_check_is_not_one(self) -> None:
+        # "在查" / "在搜尋" read "(I am) checking / searching"; 確認 needs 一下 or 一次.
+        for text in ("在查", "在搜尋", "在確認", "確認", "我在搜尋一次"):
+            with self.subTest(text=text):
+                self.assertFalse(rules.is_follow_up_text(text))
+
+    async def test_a_search_again_is_rewritten_from_the_last_turn(self) -> None:
+        # The whole path of a message like the 2026-10-16 one: fast rule,
+        # follow-up, rewrite from the conversation, search for the rewritten
+        # query.
+        request = AgentRequest(
+            text="在查詢確認一下",
+            previous_agent="web_search",
+            previous_task_description="查詢台積電今天的股價",
+            conversation_history=_TSMC_TURNS,
+        )
+        decision = _orchestrator()._apply_fast_rules(request)
+        self.assertEqual(decision.agent, "web_search")
+        request = replace(request, task_description=decision.task_description)
+        self.assertTrue(rules.looks_like_follow_up(request))
+
+        planner_chain = SimpleNamespace(
+            generate=AsyncMock(return_value=ProviderResponse(text="台積電 目前 股價", model="m"))
+        )
+        found = WebSearchResponse(
+            query="台積電 目前 股價", results=[SearchResult(title="t", url="https://a.example/", content="ctx")]
+        )
+        search = SimpleNamespace(is_configured=True, search=AsyncMock(return_value=found))
+        agent = WebSearchAgent(
+            Settings(_env_file=None),
+            SimpleNamespace(generate=AsyncMock(return_value=ProviderResponse(text="台積電今天收 1,450 元", model="m"))),
+            targets=[],
+            query_planner=SearchQueryPlanner(planner_chain, [Tier(SimpleNamespace(name="nvidia"), "m")]),
+            search=search,
+        )
+
+        response = await agent.process(request)
+
+        self.assertEqual(response.text, "台積電今天收 1,450 元")
+        self.assertEqual(search.search.await_args.args[0], "台積電 目前 股價")
+        rewrite_request = planner_chain.generate.await_args.kwargs["messages"][1]["content"]
+        self.assertIn("使用者：幫我查台積電目前的股價", rewrite_request)
+        self.assertTrue(rewrite_request.endswith("在查詢確認一下"))
+
 
 class RouterDecisionTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_router_choosing_vision_without_an_image_gets_chat(self) -> None:
@@ -766,6 +862,8 @@ class BacktrackingTests(unittest.TestCase):
         _repeat("讀出來。"),
         _repeat("念一下"),
         _repeat("不要再"),
+        _repeat("再搜尋確認"),
+        "在" + _repeat("查", MAX_INPUT_LENGTH - 1),
         _repeat("draw a "),
         "draw a " + "x" * (MAX_INPUT_LENGTH - 7),
         "make me a " + _repeat("a-", MAX_INPUT_LENGTH - 10),
@@ -785,22 +883,25 @@ class BacktrackingTests(unittest.TestCase):
                     self.assertIsNone(re.search(r"(?<!\\)\.[*+]", value.pattern))
 
     def test_every_rule_is_linear_on_adversarial_input(self) -> None:
+        # CPU time, not wall time: on a loaded machine (load 200-350 on
+        # 2026-10-16) a search was descheduled past the budget, each run on
+        # a different pattern; backtracking costs CPU either way.
         patterns = {name: value for name, value in vars(rules).items() if isinstance(value, re.Pattern)}
         for text in self.ADVERSARIAL:
             for name, pattern in patterns.items():
                 with self.subTest(pattern=name, text=text[:12]):
-                    started = time.perf_counter()
+                    started = time.process_time()
                     pattern.search(text)
-                    self.assertLess(time.perf_counter() - started, self.BUDGET_SECONDS)
+                    self.assertLess(time.process_time() - started, self.BUDGET_SECONDS)
             with self.subTest(helpers=text[:12]):
-                started = time.perf_counter()
+                started = time.process_time()
                 rules.should_disable_thinking(text)
                 rules.should_disable_thinking(text, has_image=True)
                 rules.wants_image_gen(text, has_image=True)
                 rules.needs_web_search(text)
                 rules.prefers_voice_output(text)
                 rules.extract_urls(text)
-                self.assertLess(time.perf_counter() - started, 6 * self.BUDGET_SECONDS)
+                self.assertLess(time.process_time() - started, 6 * self.BUDGET_SECONDS)
 
 
 class ImageContextTests(unittest.TestCase):

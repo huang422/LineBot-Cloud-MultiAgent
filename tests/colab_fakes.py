@@ -1,11 +1,12 @@
 """Shared fakes for the Colab tests: a scripted tunnel and a READY session.
 
 :class:`FakeTunnel` stands in for the Cloudflare tunnel + auth proxy +
-Ollama 0.35.0 behind an ``httpx.MockTransport``: it records every request
-and answers each path from a script (a status and JSON, a callable, or
-``("hang", seconds)``). By default it answers like a healthy session with
-both pinned models loaded wholly in VRAM, and :func:`ready_state` records
-what a passing readiness probe saw.
+Ollama behind an ``httpx.MockTransport``: it records every request and
+answers each path from a script (a status and JSON, a callable, or
+``("hang", seconds)``). By default it answers like a healthy session
+(Ollama :data:`OLLAMA`) with both models loaded wholly in VRAM at their
+verified digests, and :func:`ready_state` records what a passing readiness
+probe saw.
 """
 
 from __future__ import annotations
@@ -28,9 +29,11 @@ NBH = "6f1c1f4e-0b8e-4c55-9f5a-2b4d6c8e0a13"
 TUNNEL_HOST = "brave-otter-42.trycloudflare.com"
 TUNNEL = f"https://{TUNNEL_HOST}"
 QWEN = "qwen3.8:27b-mtp-q4_K_M"
-NIMBLE = "nimble:9b"
-# What /api/ps reports for each pinned model (bytes, all of it in VRAM).
-LOADED_SIZES = {QWEN: 25_300_000_000, NIMBLE: 10_601_505_280}
+ROUTER = "clef-flash:9b"
+# The Ollama the fake session runs (versions.json's fallback).
+OLLAMA = "0.40.5"
+# What /api/ps reports for each Colab model (bytes, all of it in VRAM).
+LOADED_SIZES = {QWEN: 25_300_000_000, ROUTER: 10_601_505_280}
 
 
 def write_adc(directory: str | Path) -> Path:
@@ -61,7 +64,8 @@ def on_gpu(model: str, size_vram: int | None = None) -> dict[str, int]:
 
 
 def ready_state(now: float | None = None, **changes: Any) -> ColabState:
-    """A READY session whose probe saw the pinned digests, all in VRAM."""
+    """A READY session whose probe saw the verified digests, all in VRAM.
+    No ``ollama_version``, like a session launched before 2026-10-16."""
     now = time.time() if now is None else now
     values: dict[str, Any] = {
         "status": READY,
@@ -70,17 +74,17 @@ def ready_state(now: float | None = None, **changes: Any) -> ColabState:
         "tunnel_url": TUNNEL,
         "ready_at": now - 60,
         "last_health_at": now,
-        "digests": protocol.pinned_models(),
-        "vram": {model: on_gpu(model) for model in protocol.pinned_models()},
+        "digests": protocol.colab_models(),
+        "vram": {model: on_gpu(model) for model in protocol.colab_models()},
     }
     values.update(changes)
     return ColabState(**values)
 
 
 def healthy_routes() -> dict[str, Any]:
-    pins = protocol.pinned_models()
+    pins = protocol.colab_models()
     return {
-        "GET /api/version": (200, {"version": protocol.OLLAMA_VERSION}),
+        "GET /api/version": (200, {"version": OLLAMA}),
         "GET /api/ps": (200, {"models": [{"name": model, "model": model, **on_gpu(model)} for model in pins]}),
         "GET /api/tags": (
             200,
@@ -106,7 +110,7 @@ def systemone_answer(
     noul: float = 0.05,
 ) -> dict:
     return {
-        "model": NIMBLE,
+        "model": ROUTER,
         "answers": {
             "agent": {"type": "choice", "choice": agent, "probabilities": {agent: 0.97}, "confidence": agent_confidence},
             "output_format": {
@@ -239,6 +243,9 @@ class FakeControlPlane:
         self.by_nbh: dict[str, str] = {}
         self.vm_state: dict[str, Any] = {"step": "pull", "ts": 1, "error": None}
         self.uploads: list[dict[str, Any]] = []
+        # Each upload's file contents, read when it was made (the launcher's
+        # versions.json is a temporary file).
+        self.uploaded: list[dict[str, bytes]] = []
         self._next = 0
 
     def names(self) -> list[str]:
@@ -296,6 +303,7 @@ class FakeControlPlane:
     async def upload(self, assignment: Any, files: Any) -> None:
         self.calls.append(("upload", assignment.endpoint))
         self.uploads.append(dict(files))
+        self.uploaded.append({remote: Path(local).read_bytes() for remote, local in files.items()})
 
     async def run_cell(
         self,

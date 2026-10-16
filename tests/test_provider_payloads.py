@@ -30,7 +30,7 @@ from src.runtime.model_roles import (
     NIM_OMNI,
     NIM_SUPER,
     NIM_ULTRA,
-    OR_QWEN,
+    OR_DOTS,
     OR_SUPER,
     OR_ULTRA,
     role_specs,
@@ -87,6 +87,33 @@ class NimChatPayloadTests(unittest.TestCase):
         payload = _nim(NIM_SUPER, thinking=True, options={"reasoning_budget": 40_000})
         self.assertEqual(payload["reasoning_budget"], 32_768)
         self.assertEqual(payload["max_tokens"], 32_768)  # the profile's cap
+
+    def test_the_default_super_thinking_tier_sends_the_body_the_ab_accepted(self) -> None:
+        # The 2026-10-16 A/B called Super through NvidiaProvider with
+        # thinking on (3/3 answered in 22-50 s): enable_thinking, the
+        # thinking budget as a top-level reasoning_budget and in max_tokens,
+        # and the card's sampling.
+        [super_] = [
+            spec for spec in role_specs(Settings(_env_file=None))["thinking"]
+            if spec.provider == "nvidia" and spec.model == NIM_SUPER
+        ]
+        self.assertTrue(get_profile("nvidia", NIM_SUPER).can_think)
+
+        payload = _nim(NIM_SUPER, thinking=True, options=super_.options(), temperature=0.7, max_tokens=3072)
+
+        self.assertEqual(
+            payload,
+            {
+                "model": NIM_SUPER,
+                "messages": _MESSAGES,
+                "stream": False,
+                "chat_template_kwargs": {"enable_thinking": True},
+                "reasoning_budget": 2000,
+                "max_tokens": 5072,
+                "temperature": 1.0,
+                "top_p": 0.95,
+            },
+        )
 
     def test_ultra_never_sends_a_reasoning_budget(self) -> None:
         payload = _nim(NIM_ULTRA, thinking=True, options={"reasoning_budget": 4096})
@@ -264,14 +291,14 @@ class OpenRouterPayloadTests(unittest.TestCase):
     def test_reasoning_per_profile_and_tier_effort(self) -> None:
         # (model, thinking, options, reasoning object, max_tokens)
         cases = (
-            # qwen3.8 thinks at xhigh unless told "none".
-            (OR_QWEN, False, {"effort": "none"}, {"effort": "none"}, 1000),
-            (OR_QWEN, False, {}, {"effort": "none"}, 1000),
-            (OR_QWEN, True, {"effort": "medium"}, {"effort": "medium"}, 3000),
+            # dots-3 reasons unless told "none" (probe 2026-10-16).
+            (OR_DOTS, False, {"effort": "none"}, {"effort": "none"}, 1000),
+            (OR_DOTS, False, {}, {"effort": "none"}, 1000),
+            (OR_DOTS, True, {"effort": "medium"}, {"effort": "medium"}, 3000),
             # effort "none" is the chat tier's off switch; a thinking request
             # (the thinking flag) still thinks, at medium.
-            (OR_QWEN, True, {"effort": "none"}, {"effort": "medium"}, 3000),
-            (OR_QWEN, True, {"effort": "low", "reasoning_budget": 500}, {"effort": "low"}, 1500),
+            (OR_DOTS, True, {"effort": "none"}, {"effort": "medium"}, 3000),
+            (OR_DOTS, True, {"effort": "low", "reasoning_budget": 500}, {"effort": "low"}, 1500),
             # openrouter/free cannot be asked to think, and some of the models
             # it picks reason by default: a thinking request still says off.
             ("openrouter/free", True, {}, {"effort": "none"}, 1000),
@@ -292,13 +319,20 @@ class OpenRouterPayloadTests(unittest.TestCase):
     def test_json_modes_follow_the_tier(self) -> None:
         self.assertNotIn(
             "response_format",
-            _openrouter(OR_QWEN, thinking=False, options={"json_mode": "prompt"}, json_schema=_SCHEMA),
+            _openrouter(OR_DOTS, thinking=False, options={"json_mode": "prompt"}, json_schema=_SCHEMA),
         )
         self.assertEqual(
-            _openrouter(OR_QWEN, thinking=False, options={"json_mode": "json_schema"}, json_schema=_SCHEMA)[
+            _openrouter(OR_DOTS, thinking=False, options={"json_mode": "json_schema"}, json_schema=_SCHEMA)[
                 "response_format"
             ],
             _STRICT,
+        )
+        # dots-3 takes json_object too (response_format, probe 2026-10-16).
+        self.assertEqual(
+            _openrouter(OR_DOTS, thinking=False, options={"json_mode": "json_object"}, json_schema=_SCHEMA)[
+                "response_format"
+            ],
+            {"type": "json_object"},
         )
         # Ultra :free takes no response_format: its tiers set no json_mode.
         self.assertNotIn(
@@ -313,13 +347,13 @@ class OpenRouterPayloadTests(unittest.TestCase):
         )
 
     def test_the_tier_sampling_wins_over_the_call(self) -> None:
-        payload = _openrouter(OR_QWEN, thinking=False, options={"max_tokens": 64, "temperature": 0.2})
+        payload = _openrouter(OR_DOTS, thinking=False, options={"max_tokens": 64, "temperature": 0.2})
 
         self.assertEqual((payload["temperature"], payload["max_tokens"]), (0.2, 64))
 
     def test_openrouter_ids_keep_the_calls_sampling(self) -> None:
         # Card sampling is set only on the NIM Nemotron profiles.
-        for model in (OR_QWEN, OR_ULTRA):
+        for model in (OR_DOTS, OR_ULTRA):
             with self.subTest(model=model):
                 payload = _openrouter(model, thinking=False, temperature=0.7)
                 self.assertEqual(payload["temperature"], 0.7)

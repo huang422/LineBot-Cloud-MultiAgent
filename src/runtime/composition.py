@@ -358,7 +358,7 @@ def new_colab_endpoint(settings, store: ColabStateStore, *, transport=None) -> C
 def split_router_tiers(role_table: RoleTable) -> tuple[list[Tier], Tier | None, bool]:
     """``(json_tiers, system_one_tier, system_one_first)`` from the router role.
 
-    The Colab router (nimble) answers on /v1/systemone, not in JSON, so it
+    The Colab router (clef-flash) answers on /v1/systemone, not in JSON, so it
     is not a chain tier: the orchestrator asks it directly, first when it
     comes before every JSON tier in the table (MODEL_PATH_PREFERENCE=colab)
     and after them otherwise.

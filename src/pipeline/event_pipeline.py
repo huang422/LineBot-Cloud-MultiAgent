@@ -327,7 +327,9 @@ async def process_event(event: dict, deps: PipelineDeps) -> None:
 
     except Exception as e:
         logger.error(f"Event processing error: {e}", exc_info=True)
-        await _send_error_message(line, reply_token, chat_id, "❌ 處理請求時發生錯誤，請稍後再試。")
+        # Once the answer is out, an error message would be a second reply.
+        if not trace.delivered:
+            await _send_error_message(line, reply_token, chat_id, "❌ 處理請求時發生錯誤，請稍後再試。")
         _log_summary(trace, error=e)
 
     except BaseException as e:  # cancelled (the task's time ran out)

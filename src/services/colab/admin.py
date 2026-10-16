@@ -17,8 +17,9 @@ every member, so there it only says to ask in private.
   DRAINING at once (its tiers stop being used, a late ``ready`` from its VM
   is refused), and the controller releases it.
 - ``status`` (or a bare ``!colab``): the session in a few lines (a READY
-  session whose router is not the pinned digest, not loaded or not
-  wholly in VRAM says it routes without it).
+  session whose router is not loaded or not wholly in VRAM says it routes
+  without it; a model whose tag moved since its digest was verified is
+  named, for information).
 
 The commands answer with a reply (free) and skip the rate limit, the
 router and the models.
@@ -179,10 +180,11 @@ def format_status(state: ColabState, colab: Any, now: float) -> str:
             )
             for model, (in_vram, size) in colab.off_gpu().items()
         }
-        for model, (_, actual) in colab.unpinned().items():
-            reasons[model] = f"digest {actual[:12]} 不是釘住的版本" if actual else "沒有記錄到 digest"
         for model, reason in reasons.items():
             lines.append(f"{model}：{reason}，這次不用它路由（改用 API）")
+        # The models follow their tags: a moved one is news, not a problem.
+        for model, (verified, actual) in colab.moved_tags().items():
+            lines.append(f"{model}：tag 已更新（digest {actual[:12]}，驗證過的是 {verified[:12]}）")
     if state.ccu_balance is not None:
         rate = f"，每小時 {state.ccu_rate:.2f}" if state.ccu_rate is not None else ""
         lines.append(f"CU 餘額：{state.ccu_balance:.1f}{rate}（{_when(state.ccu_checked_at)} 讀取）")

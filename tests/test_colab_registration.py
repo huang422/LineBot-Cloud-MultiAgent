@@ -15,6 +15,9 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import main as main_module
+from src.models.agent_request import AgentRequest
+from src.providers.fallback_chain import Tier
+from src.providers.systemone import RouterGates, SystemOneRouter
 from src.services.colab import protocol
 from src.services.colab.registration import ColabRegistrar
 from src.services.colab.state import (
@@ -32,8 +35,8 @@ from src.services.colab.state import (
 )
 from tests.colab_fakes import (
     NBH,
-    NIMBLE,
     QWEN,
+    ROUTER,
     SECRET,
     TUNNEL,
     TUNNEL_HOST,
@@ -56,8 +59,8 @@ def _body(event: str = "ready", **extra) -> bytes:
     if event == "ready":
         payload.update(
             tunnel_url=TUNNEL,
-            versions={"ollama": "0.35.0", "cloudflared": "2026.9.3"},
-            digests=protocol.pinned_models(),
+            versions={"ollama": "0.40.5", "cloudflared": "2026.9.3"},
+            digests=protocol.colab_models(),
             gpu={
                 "name": "NVIDIA A100-SXM4-40GB",
                 "vram_mib": 40960,
@@ -156,41 +159,59 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(protocol.TunnelURLError):
             protocol.check_tunnel_url("https://other.example.org", "ollama.example.org")
 
-    def test_pins_come_from_the_model_profiles(self) -> None:
+    def test_colab_models_come_from_the_model_profiles(self) -> None:
         self.assertEqual(
-            protocol.pinned_models(),
+            protocol.colab_models(),
             {
                 QWEN: "22130167c4c20e20c7b71454612966ca8e8171e9b3cc8ab6ce8aa6cbfec79643",
-                NIMBLE: "24e550a16a7081881be2f1f0d91e8cc13a597472735c04119f035a0a85c67e0c",
+                ROUTER: "73e026ff389b28464bb26f8978f3164851a76832f0d339032747e2c56f98ea29",
             },
         )
         self.assertEqual(protocol.chat_models(), [QWEN])
-        self.assertEqual(protocol.router_models(), [NIMBLE])
+        self.assertEqual(protocol.router_models(), [ROUTER])
         self.assertEqual(protocol.CHAT_THINK_VALUES, [False, "low", "medium", "xhigh"])
+        # From colab/versions.json: clef-flash's config "requires" 0.40.4.
+        self.assertEqual(protocol.OLLAMA_MIN_VERSION, "0.40.4")
 
-    def test_unpinned_names_a_router_at_another_digest_or_none(self) -> None:
-        pins = protocol.pinned_models()
+    def test_moved_tags_names_a_model_at_another_digest_for_display(self) -> None:
+        verified = protocol.colab_models()
         other = "adfcdbb4" + "0" * 56
 
-        self.assertEqual(protocol.unpinned(pins), {})
-        self.assertEqual(protocol.unpinned({QWEN: pins[QWEN], NIMBLE: other}), {NIMBLE: (pins[NIMBLE], other)})
-        self.assertEqual(protocol.unpinned({NIMBLE: "sha256:" + pins[NIMBLE].upper()}), {})
-        # No digest recorded for the router: not trusted either.
-        self.assertEqual(protocol.unpinned({}), {NIMBLE: (pins[NIMBLE], "")})
-        self.assertEqual(protocol.unpinned({QWEN: "", "llama3:8b": other}), {NIMBLE: (pins[NIMBLE], "")})
-        # Only a router is judged here; the chat model's pin is the probe's.
-        self.assertEqual(protocol.unpinned({QWEN: other, NIMBLE: pins[NIMBLE]}), {})
+        self.assertEqual(protocol.moved_tags(verified), {})
+        self.assertEqual(protocol.moved_tags({QWEN: verified[QWEN], ROUTER: other}), {ROUTER: (verified[ROUTER], other)})
+        self.assertEqual(protocol.moved_tags({QWEN: other}), {QWEN: (verified[QWEN], other)})
+        self.assertEqual(protocol.moved_tags({ROUTER: "sha256:" + verified[ROUTER].upper()}), {})
+        # Nothing recorded is nothing moved; an unknown model is not ours.
+        self.assertEqual(protocol.moved_tags({}), {})
+        self.assertEqual(protocol.moved_tags({QWEN: "", "llama3:8b": other}), {})
+
+    def test_the_ollama_version_rule(self) -> None:
+        problem = protocol.ollama_version_problem
+        # A session from before 2026-10-16 recorded no release: the minimum alone.
+        for version in ("0.40.4", "0.40.5", "0.41.0", "1.0.0"):
+            with self.subTest(version=version):
+                self.assertEqual(problem(version), "")
+        for found in ("0.40.3", "0.35.0", "0.41.0-rc1", "", None, 41, ["0.40.5"], "x" * 100):
+            with self.subTest(found=found):
+                self.assertIn("expected 0.40.4 or later", problem(found))
+        self.assertLessEqual(len(problem("9" * 100)), 120)
+        # Launched with a release: exactly it, a newer one is wrong too.
+        self.assertEqual(problem("0.41.2", "0.41.2"), "")
+        self.assertEqual(
+            problem("0.41.3", "0.41.2"), "Ollama 0.41.3, expected 0.41.2 (the release this session was launched with)"
+        )
+        self.assertIn("expected 0.40.4 or later", problem("0.40.3", "0.40.3"))
 
     def test_off_gpu_names_a_router_not_wholly_in_vram_or_without_sizes(self) -> None:
-        whole = {QWEN: on_gpu(QWEN), NIMBLE: on_gpu(NIMBLE)}
-        size = whole[NIMBLE]["size"]
+        whole = {QWEN: on_gpu(QWEN), ROUTER: on_gpu(ROUTER)}
+        size = whole[ROUTER]["size"]
 
         self.assertEqual(protocol.off_gpu(whole), {})
-        self.assertEqual(protocol.off_gpu({**whole, NIMBLE: on_gpu(NIMBLE, size - 1)}), {NIMBLE: (size - 1, size)})
-        self.assertEqual(protocol.off_gpu({QWEN: on_gpu(QWEN)}), {NIMBLE: (0, 0)})
+        self.assertEqual(protocol.off_gpu({**whole, ROUTER: on_gpu(ROUTER, size - 1)}), {ROUTER: (size - 1, size)})
+        self.assertEqual(protocol.off_gpu({QWEN: on_gpu(QWEN)}), {ROUTER: (0, 0)})
         for broken in ({"size": 0, "size_vram": 0}, {"size": "10", "size_vram": "10"}, {"size": True}, None, "x"):
             with self.subTest(broken=broken):
-                self.assertIn(NIMBLE, protocol.off_gpu({**whole, NIMBLE: broken}))
+                self.assertIn(ROUTER, protocol.off_gpu({**whole, ROUTER: broken}))
         # Only a router is judged here; the chat model's share is the probe's.
         self.assertEqual(protocol.off_gpu({**whole, QWEN: on_gpu(QWEN, 0)}), {})
 
@@ -216,9 +237,9 @@ class RegistrarTests(unittest.IsolatedAsyncioTestCase):
         state = self.store.cached
         self.assertEqual((state.status, state.since, state.tunnel_url), (READY, _NOW, TUNNEL))
         self.assertEqual((state.ready_at, state.last_health_at, state.boot_step), (_NOW, _NOW, "ready"))
-        self.assertEqual(state.versions, {"ollama": "0.35.0", "cloudflared": "2026.9.3"})
+        self.assertEqual(state.versions, {"ollama": "0.40.5", "cloudflared": "2026.9.3"})
         self.assertEqual(state.gpu["name"], "NVIDIA A100-SXM4-40GB")
-        self.assertEqual((state.digests, self.endpoint.unpinned()), (protocol.pinned_models(), {}))
+        self.assertEqual((state.digests, self.endpoint.moved_tags()), (protocol.colab_models(), {}))
         self.assertTrue(self.endpoint.is_ready())
         # The probe went through the tunnel with the session's bearer.
         self.assertEqual(
@@ -228,6 +249,42 @@ class RegistrarTests(unittest.IsolatedAsyncioTestCase):
         bearer = protocol.derive_proxy_token(SECRET, NBH)
         self.assertTrue(all(r.headers["authorization"] == f"Bearer {bearer}" for r in self.tunnel.requests))
         self.assertEqual(self.tunnel.bodies("POST /api/show"), [{"model": QWEN}])
+
+    async def test_ready_is_logged_with_the_actual_version_and_each_digest(self) -> None:
+        registrar = self._registrar()
+        body = _body()
+
+        with self.assertLogs("linebot", "INFO") as logs:
+            await registrar.handle(body, _signed(body))
+
+        lines = [record.getMessage() for record in logs.records]
+        self.assertIn("Colab session READY (Ollama 0.40.5, gpu=NVIDIA A100-SXM4-40GB)", lines)
+        for model, digest in protocol.colab_models().items():
+            self.assertIn(f"Colab session READY: {model} at digest {digest}, the verified one", lines)
+        self.assertEqual([r for r in logs.records if r.levelname != "INFO"], [])
+
+    async def test_the_probe_wants_the_release_the_session_was_launched_with(self) -> None:
+        for launched, served, status in (
+            ("0.41.2", "0.41.2", 200),
+            ("0.41.2", "0.40.5", 503),
+            ("0.40.5", "0.41.2", 503),
+            # A state from before 2026-10-16: any release at the minimum or later.
+            ("", "0.41.2", 200),
+            ("", "0.40.3", 503),
+        ):
+            tunnel = FakeTunnel(**{"GET /api/version": (200, {"version": served})})
+            registrar = self._registrar(tunnel=tunnel, ollama_version=launched)
+            body = _body()
+            with self.subTest(launched=launched, served=served), self.assertLogs("linebot", "INFO") as logs:
+                result = await registrar.handle(body, _signed(body))
+                self.assertEqual(result.status_code, status)
+                if status == 200:
+                    self.assertIn(f"Colab session READY (Ollama {served},", "\n".join(logs.output))
+                    # The health check keeps wanting it.
+                    self.assertTrue(await self.endpoint.check_health())
+                else:
+                    self.assertIn(f"Ollama {served}, expected", " ".join(result.body["problems"]))
+            await self.endpoint.close()
 
     async def test_ready_is_accepted_while_assigning_booting_or_ready(self) -> None:
         for status in (ASSIGNING, BOOTING, READY):
@@ -437,21 +494,21 @@ class RegistrarTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.cached.tunnel_url, "https://ollama.example.org")
 
     async def test_a_failing_probe_keeps_booting_and_asks_to_retry(self) -> None:
-        pins = protocol.pinned_models()
+        pins = protocol.colab_models()
         cases = {
             "old ollama": {"GET /api/version": (200, {"version": "0.34.4"})},
-            "chat not loaded": {"GET /api/ps": (200, {"models": [{"name": NIMBLE, **on_gpu(NIMBLE)}]})},
+            # The one 2026-10-15's VM ran, which the registry no longer serves.
+            "ollama under the minimum": {"GET /api/version": (200, {"version": "0.35.0"})},
+            "a pre-release": {"GET /api/version": (200, {"version": "0.41.0-rc1"})},
+            "chat not loaded": {"GET /api/ps": (200, {"models": [{"name": ROUTER, **on_gpu(ROUTER)}]})},
             "chat not wholly in VRAM": {
                 "GET /api/ps": (
                     200,
-                    {"models": [{"name": QWEN, **on_gpu(QWEN, 20 << 30)}, {"name": NIMBLE, **on_gpu(NIMBLE)}]},
+                    {"models": [{"name": QWEN, **on_gpu(QWEN, 20 << 30)}, {"name": ROUTER, **on_gpu(ROUTER)}]},
                 )
             },
-            "chat sizes missing": {"GET /api/ps": (200, {"models": [{"name": QWEN}, {"name": NIMBLE, **on_gpu(NIMBLE)}]})},
-            "chat digest mismatch": {
-                "GET /api/tags": (200, {"models": [{"name": QWEN, "digest": "0" * 64}, {"name": NIMBLE, "digest": pins[NIMBLE]}]})
-            },
-            "chat not pulled": {"GET /api/tags": (200, {"models": [{"name": NIMBLE, "digest": pins[NIMBLE]}]})},
+            "chat sizes missing": {"GET /api/ps": (200, {"models": [{"name": QWEN}, {"name": ROUTER, **on_gpu(ROUTER)}]})},
+            "chat not pulled": {"GET /api/tags": (200, {"models": [{"name": ROUTER, "digest": pins[ROUTER]}]})},
             "think values": {"POST /api/show": (200, {"thinking": {"values": [False, "low"]}})},
             "proxy refuses": {"GET /api/version": (401, {"error": "unauthorized"})},
             "not json": {"GET /api/ps": (200, b"<html>")},
@@ -469,68 +526,128 @@ class RegistrarTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(self.endpoint.is_ready())
             await self.endpoint.close()
 
-    async def test_a_republished_router_is_ready_without_it(self) -> None:
-        pins = protocol.pinned_models()
-        other = "adfcdbb4070d303fb43fc11fc06a14269ec2bc7136a55369e86d412b86ba2831"
-        tags = {"models": [{"name": QWEN, "digest": pins[QWEN]}, {"name": NIMBLE, "digest": "sha256:" + other}]}
+    async def test_moved_tags_are_ready_and_logged(self) -> None:
+        # The models follow their tags (2026-10-16): another digest than the
+        # verified one, the chat model's too, is news at INFO, never a refusal.
+        verified = protocol.colab_models()
+        other_chat, other_router = "0" * 64, "adfcdbb4070d303fb43fc11fc06a14269ec2bc7136a55369e86d412b86ba2831"
+        tags = {"models": [{"name": QWEN, "digest": other_chat}, {"name": ROUTER, "digest": "sha256:" + other_router}]}
         registrar = self._registrar(tunnel=FakeTunnel(**{"GET /api/tags": (200, tags)}))
         # The session keeps what the probe saw, not what the VM says.
-        body = _body(digests=pins)
+        body = _body(digests=verified)
 
-        result = await registrar.handle(body, _signed(body))
+        with self.assertLogs("linebot", "INFO") as logs:
+            result = await registrar.handle(body, _signed(body))
 
         self.assertEqual((result.status_code, result.body), (200, {"ok": True, "status": READY}))
-        self.assertEqual(self.store.cached.digests, {QWEN: pins[QWEN], NIMBLE: other})
+        self.assertEqual(self.store.cached.digests, {QWEN: other_chat, ROUTER: other_router})
         self.assertTrue(self.endpoint.is_ready())
-        self.assertEqual(self.endpoint.unpinned(), {NIMBLE: (pins[NIMBLE], other)})
-        self.assertEqual(self.endpoint.view()["unpinned"], {NIMBLE: {"pinned": pins[NIMBLE], "actual": other}})
-        # The live gate's probe still names it; READY does not need it.
-        self.assertEqual(await self.endpoint.probe(TUNNEL, NBH), [f"{NIMBLE} digest adfcdbb4070d, expected 24e550a16a70"])
+        self.assertEqual(self.endpoint.off_gpu(), {})
+        self.assertEqual(
+            self.endpoint.moved_tags(), {QWEN: (verified[QWEN], other_chat), ROUTER: (verified[ROUTER], other_router)}
+        )
+        self.assertEqual(
+            self.endpoint.view()["tags_moved"][ROUTER], {"verified": verified[ROUTER], "actual": other_router}
+        )
+        lines = [record.getMessage() for record in logs.records]
+        self.assertIn(
+            f"Colab session READY: {ROUTER} at digest {other_router}, tag moved since it was verified (73e026ff389b)",
+            lines,
+        )
+        self.assertEqual([r for r in logs.records if r.levelname != "INFO"], [])
+        # The live gate's probe finds nothing missing either.
+        self.assertEqual(await self.endpoint.probe(TUNNEL, NBH), [])
 
-    async def test_a_router_not_pulled_or_loaded_is_ready_without_it(self) -> None:
-        pins = protocol.pinned_models()
+    async def test_a_router_not_pulled_is_ready_without_it_and_says_why_once(self) -> None:
+        pins = protocol.colab_models()
         routes = {
             "GET /api/ps": (200, {"models": [{"name": QWEN, **on_gpu(QWEN)}]}),
             "GET /api/tags": (200, {"models": [{"name": QWEN, "digest": pins[QWEN]}]}),
         }
         registrar = self._registrar(tunnel=FakeTunnel(**routes))
-        body = _body()
+        # 2026-10-15: what the VM saw, which the bot's log never showed.
+        why = f"pulling {ROUTER} failed 3 times: HTTP 412 pull model manifest: 412"
+        body = _body(error=why, digests={QWEN: pins[QWEN]})
 
-        result = await registrar.handle(body, _signed(body))
+        with self.assertLogs("linebot", "INFO") as logs:
+            result = await registrar.handle(body, _signed(body))
 
         self.assertEqual((result.status_code, result.body), (200, {"ok": True, "status": READY}))
+        (error,) = [record.getMessage() for record in logs.records if record.levelname == "ERROR"]
+        self.assertEqual(
+            error,
+            f"Colab session READY without its router: {ROUTER} not pulled (/api/tags does not list it); "
+            f"the VM says: {why}; the API router decides this session (colab/README.md, 疑難排解)",
+        )
         state = self.store.cached
         self.assertEqual((state.digests, state.vram), ({QWEN: pins[QWEN]}, {QWEN: on_gpu(QWEN)}))
-        self.assertEqual(self.endpoint.unpinned(), {NIMBLE: (pins[NIMBLE], "")})
-        self.assertEqual(self.endpoint.off_gpu(), {NIMBLE: (0, 0)})
+        self.assertEqual(self.endpoint.off_gpu(), {ROUTER: (0, 0)})
         self.assertTrue(self.endpoint.is_ready())
-        # The live gate's probe names it; READY and the health check do not need it.
-        self.assertEqual(await self.endpoint.probe(TUNNEL, NBH), [f"not listed: {NIMBLE}", f"not loaded: {NIMBLE}"])
-        self.assertTrue(await self.endpoint.check_health())
+        # The live gate's probe names it; READY and the health check do not
+        # need it, and the health check does not warn again about it.
+        self.assertEqual(await self.endpoint.probe(TUNNEL, NBH), [f"not listed: {ROUTER}", f"not loaded: {ROUTER}"])
+        with self.assertNoLogs("linebot", "WARNING"):
+            self.assertTrue(await self.endpoint.check_health())
+            self.assertTrue(await self.endpoint.check_health())
+        # Nor does the router when messages come: that ERROR was the one.
+        router = SystemOneRouter(
+            self.endpoint,
+            Tier(SimpleNamespace(name="colab"), ROUTER, timeout_s=6),
+            gates=RouterGates(confidence=0.90, think_on=0.85, think_off=0.15),
+        )
+        with self.assertNoLogs("linebot", "WARNING"):
+            for _ in range(2):
+                self.assertIsNone(await router.route(AgentRequest(text="你覺得這個計畫如何")))
+        self.assertNotIn("POST /v1/systemone", self.tunnel.paths())
+
+    async def test_a_router_pulled_but_not_loaded_is_named_so(self) -> None:
+        routes = {"GET /api/ps": (200, {"models": [{"name": QWEN, **on_gpu(QWEN)}]})}
+        registrar = self._registrar(tunnel=FakeTunnel(**routes))
+        why = f"{ROUTER} did not load: loading {ROUTER} failed: HTTP 500 llama runner process has terminated"
+        body = _body(error=why)
+
+        with self.assertLogs("linebot", "ERROR") as logs:
+            self.assertEqual((await registrar.handle(body, _signed(body))).status_code, 200)
+
+        (error,) = logs.output
+        self.assertIn(f"{ROUTER} not loaded (/api/ps does not list it); the VM says: {why}", error)
 
     async def test_a_router_not_wholly_in_vram_is_ready_without_it(self) -> None:
-        running = {"models": [{"name": QWEN, **on_gpu(QWEN)}, {"name": NIMBLE, **on_gpu(NIMBLE, 7 << 30)}]}
+        running = {"models": [{"name": QWEN, **on_gpu(QWEN)}, {"name": ROUTER, **on_gpu(ROUTER, 7 << 30)}]}
         registrar = self._registrar(tunnel=FakeTunnel(**{"GET /api/ps": (200, running)}))
         body = _body()
 
-        result = await registrar.handle(body, _signed(body))
+        with self.assertLogs("linebot", "ERROR") as logs:
+            result = await registrar.handle(body, _signed(body))
 
         self.assertEqual((result.status_code, result.body), (200, {"ok": True, "status": READY}))
+        # No word from the VM (its ready had no error): what the probe saw.
+        (error,) = logs.output
+        self.assertIn(f"without its router: {ROUTER} not wholly in VRAM (7168 of 10110 MiB); the API router", error)
+        self.assertTrue(error.endswith("(colab/README.md, VRAM)"))
         state = self.store.cached
-        self.assertEqual(state.vram, {QWEN: on_gpu(QWEN), NIMBLE: on_gpu(NIMBLE, 7 << 30)})
-        self.assertEqual((state.digests, self.endpoint.unpinned()), (protocol.pinned_models(), {}))
-        self.assertEqual(self.endpoint.off_gpu(), {NIMBLE: (7 << 30, on_gpu(NIMBLE)["size"])})
+        self.assertEqual(state.vram, {QWEN: on_gpu(QWEN), ROUTER: on_gpu(ROUTER, 7 << 30)})
+        self.assertEqual(state.digests, protocol.colab_models())
+        self.assertEqual(self.endpoint.off_gpu(), {ROUTER: (7 << 30, on_gpu(ROUTER)["size"])})
         self.assertTrue(self.endpoint.is_ready())
         # What the VM reported is kept for display.
         self.assertEqual((state.gpu["router_on_gpu"], state.gpu["used_mib"]), ("10110/10110 MiB", 35012))
         # The live gate's probe names it; READY does not need it.
-        self.assertEqual(await self.endpoint.probe(TUNNEL, NBH), [f"{NIMBLE} not fully on the GPU (7168 of 10110 MiB in VRAM)"])
-        # The per-minute health check judges only what is loaded, not where.
-        self.assertTrue(await self.endpoint.check_health())
+        self.assertEqual(await self.endpoint.probe(TUNNEL, NBH), [f"{ROUTER} not fully on the GPU (7168 of 10110 MiB in VRAM)"])
+        # The per-minute health check judges only what is loaded, not where,
+        # and says nothing more about a router READY already reported.
+        with self.assertNoLogs("linebot", "WARNING"):
+            self.assertTrue(await self.endpoint.check_health())
+
+    async def test_a_ready_with_its_router_logs_no_error(self) -> None:
+        registrar = self._registrar()
+        body = _body()
+        with self.assertNoLogs("linebot", "WARNING"):
+            self.assertEqual((await registrar.handle(body, _signed(body))).status_code, 200)
 
     async def test_failed_drains_and_counts(self) -> None:
         registrar = self._registrar(BOOTING, failures=1)
-        body = _body("failed", step="pull", error="digest mismatch for nimble:9b " + "x" * 500)
+        body = _body("failed", step="pull", error="digest mismatch for qwen3.8:27b-mtp-q4_K_M " + "x" * 500)
 
         result = await registrar.handle(body, _signed(body))
 

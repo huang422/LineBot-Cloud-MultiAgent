@@ -70,7 +70,7 @@ REMOVED_ENV_KEYS: dict[str, str] = {
     ),
     "NVIDIA_THINKING_MODEL": (
         "there is no separate thinking model; the thinking role of the model role "
-        "table runs Nemotron Ultra with thinking on"
+        "table runs Nemotron Super, then Ultra, with thinking on"
     ),
     **{
         key: _ROLE_TABLE_NOTE
@@ -294,16 +294,19 @@ class Settings(BaseSettings):
     # The named tunnel's hostname; with quick tunnels leave it empty.
     colab_tunnel_host: str = ""
     colab_tunnel_token: str = ""
-    # The Colab router (nimble on /v1/systemone) routes first (colab
+    # The Colab router (clef-flash on /v1/systemone) routes first (colab
     # preference) or last (api) once the session is READY. Its gates belong
-    # to the router model: below COLAB_ROUTER_CONFIDENCE (normalised
-    # entropy) on either choice the API router decides; needs_thinking at
-    # or above THINK_ON turns thinking on, at or below THINK_OFF off, and
-    # in between the rulebook decides. These are provisional, strict values
-    # for nimble:9b, whose probabilities are uncalibrated: re-tune them
-    # with scripts/evals/routing_eval.py (ADR-0010).
+    # to the router model: below COLAB_ROUTER_CONFIDENCE on either choice
+    # the API router decides; needs_thinking at or above THINK_ON turns
+    # thinking on, at or below THINK_OFF off, and in between the rulebook
+    # decides. A choice's confidence is (p_max - 1/N) / (1 - 1/N) since
+    # Ollama 0.40.4 (llama.cpp scores clef-flash). The default 0.0 takes
+    # the top choice always (argmax; an exact tie goes to the alphabetically
+    # first option): the uncalibrated softmax put real messages at 0.39 to
+    # 0.43, so a gate of 0.90 deferred every one. Provisional values:
+    # scripts/evals/routing_eval.py can re-tune them (ADR-0010).
     colab_router_enabled: bool = True
-    colab_router_confidence: float = 0.75
+    colab_router_confidence: float = 0.0
     colab_router_think_on: float = 0.85
     colab_router_think_off: float = 0.15
     # The session is released after this long without a triggered message,
@@ -656,14 +659,20 @@ class Settings(BaseSettings):
             raise ValueError(f"Invalid Colab think level: {v} (expected false, low, medium or xhigh)")
         return v
 
-    @field_validator("colab_router_confidence", "colab_router_think_on")
+    @field_validator("colab_router_confidence")
     @classmethod
-    def validate_colab_router_high_gate(cls, v: float) -> float:
-        # Under 0.5 a gate would take a guess for an answer; 1 never passes.
+    def validate_colab_router_confidence(cls, v: float) -> float:
+        # 0 takes the top choice always (argmax); 1 never passes.
+        if not 0.0 <= v <= 0.99:
+            raise ValueError("colab_router_confidence must be between 0.0 and 0.99")
+        return v
+
+    @field_validator("colab_router_think_on")
+    @classmethod
+    def validate_colab_router_think_on(cls, v: float) -> float:
+        # Under 0.5 it would turn thinking on for a guess; 1 never passes.
         if not 0.5 <= v <= 0.99:
-            raise ValueError(
-                "colab_router_confidence and colab_router_think_on must be between 0.5 and 0.99"
-            )
+            raise ValueError("colab_router_think_on must be between 0.5 and 0.99")
         return v
 
     @field_validator("colab_router_think_off")

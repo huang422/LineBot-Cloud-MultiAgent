@@ -118,31 +118,31 @@ class SummaryFormatTests(unittest.TestCase):
 
         self.assertIn(f"tiers=[{ULTRA} ok x2 1.5s] calls=2", summary_line(trace, now=101))
 
-    def test_nimble_probabilities_are_shown_whether_used_or_not(self) -> None:
+    def test_colab_router_probabilities_are_shown_whether_used_or_not(self) -> None:
         scores = RouterScores(
-            model="nimble:9b",
+            model="clef-flash:9b",
             agent={"chat": 0.91, "web_search": 0.05},
-            agent_confidence=0.84,
+            agent_confidence=0.94,
             output={"text": 0.96, "voice": float("nan")},
-            output_confidence=0.9,
+            output_confidence=0.95,
             think_p=0.5,
-            gate=0.75,
+            gate=0.90,
             think_on=0.85,
             think_off=0.15,
             thinking="rules->on",
         )
-        used = summary_line(_trace(route=request_trace.ROUTE_NIMBLE, router_scores=scores), now=100)
+        used = summary_line(_trace(route=request_trace.ROUTE_ROUTER, router_scores=scores), now=100)
         refused_scores = replace(scores, agent_confidence=0.6, verdict="gate fail", thinking="")
         refused = summary_line(_trace(route=request_trace.ROUTE_FALLBACK, router_scores=refused_scores), now=100)
 
-        self.assertIn(" route=colab:nimble:9b ", used)
+        self.assertIn(" route=colab:clef-flash:9b ", used)
         self.assertIn(
-            "router_p=[agent={chat:0.91,web_search:0.05} conf=0.84 gate=0.75 ok | format={text:0.96,voice:?} "
-            "conf=0.90 ok | think p=0.50 (on>=0.85 off<=0.15) -> rules->on]",
+            "router_p=[agent={chat:0.91,web_search:0.05} conf=0.94 gate=0.90 ok | format={text:0.96,voice:?} "
+            "conf=0.95 ok | think p=0.50 (on>=0.85 off<=0.15) -> rules->on]",
             used,
         )
         self.assertIn(" route=fallback ", refused)
-        self.assertIn("conf=0.60 gate=0.75 fail", refused)
+        self.assertIn("conf=0.60 gate=0.90 fail", refused)
         self.assertIn("think p=0.50 (on>=0.85 off<=0.15) | gate fail -> API router]", refused)
 
     def test_probabilities_keep_only_the_defined_options_highest_first(self) -> None:

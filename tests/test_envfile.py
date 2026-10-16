@@ -748,6 +748,21 @@ class CheckV3Tests(unittest.TestCase):
             with self.subTest(values=clean):
                 self.assertFalse(_check(clean).dropped_model_roles)
 
+    def test_an_old_colab_router_gate_is_noted_but_does_not_fail(self) -> None:
+        # The default became 0.0 on 2026-10-16; an env file copied earlier sets 0.75 or 0.90.
+        for value in ("0.75", "0.9", "0.90"):
+            with self.subTest(value=value):
+                report = _check({"colab_router_confidence": value})
+                self.assertTrue(report.ok)
+                self.assertTrue(report.old_router_gate)
+                lines = "\n".join(format_v3_report(report, Path(".env")))
+                self.assertIn("COLAB_ROUTER_CONFIDENCE keeps an old default", lines)
+                self.assertIn("in .env or delete it", lines)
+        for value in ("0.0", "0.5", "x", ""):
+            with self.subTest(value=value):
+                self.assertFalse(_check({"COLAB_ROUTER_CONFIDENCE": value}).old_router_gate)
+        self.assertFalse(_check({}).old_router_gate)
+
     def test_model_roles_that_is_not_a_json_object_fails(self) -> None:
         for raw in ("{not json", '["chat"]'):
             with self.subTest(raw=raw):

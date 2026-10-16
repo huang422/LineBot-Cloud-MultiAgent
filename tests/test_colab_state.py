@@ -41,8 +41,9 @@ class StateDocumentTests(unittest.TestCase):
             desired=OFF,
             nbh="n",
             tunnel_url="https://a.trycloudflare.com",
+            ollama_version="0.41.2",
             digests={"qwen3.8:27b-mtp-q4_K_M": "2213"},
-            vram={"nimble:9b": {"size": 10_601_505_280, "size_vram": 10_601_505_280}},
+            vram={"clef-flash:9b": {"size": 10_601_505_280, "size_vram": 10_601_505_280}},
             gpu={"name": "A100", "vram_mib": 40960, "router_on_gpu": "10110/10110 MiB"},
             ccu_balance=12.5,
             failures=2,
@@ -67,6 +68,14 @@ class StateDocumentTests(unittest.TestCase):
         self.assertEqual(doc["known_endpoints"], ["ep-1", "ep-2"])
         self.assertEqual(doc["unanswered_nbhs"], ["nbh-a"])
         self.assertEqual(ColabState.from_doc(doc), state)
+
+    def test_a_document_from_before_the_launched_release_reads_as_none(self) -> None:
+        # Written before 2026-10-16: no ollama_version, so the bot holds the
+        # session to the minimum Ollama alone.
+        doc = ColabState(status=READY, nbh="n").to_doc()
+        del doc["ollama_version"]
+        self.assertEqual(ColabState.from_doc(doc).ollama_version, "")
+        self.assertEqual(ColabState.from_doc({**doc, "ollama_version": 41}).ollama_version, "")
 
     def test_a_missing_or_broken_document_falls_back_field_by_field(self) -> None:
         self.assertEqual(ColabState.from_doc(None), ColabState())

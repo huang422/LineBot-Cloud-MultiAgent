@@ -7,12 +7,24 @@ otherwise bill account credits without anyone noticing.
 Reasoning and JSON mode follow the model's profile
 (:mod:`src.providers.model_profiles`) and the tier options: thinking on
 sends ``reasoning.effort`` (the tier's effort, else medium); thinking off
-sends ``effort: "none"`` to models that reason by default (qwen3.8 would
-think at xhigh otherwise) and nothing to the rest.
+sends ``effort: "none"`` to models that reason by default (dots-3 and the
+Nemotron ``:free`` ids would reason otherwise) and nothing to the rest.
+
+A 502 or 503 that says the model's upstream was unavailable or overloaded
+(:func:`is_upstream_unavailable`), as an HTTP status or as the ``code`` of
+an error in a 200 body, is sent once more after
+UPSTREAM_RETRY_PAUSE_SECONDS, if the model may still take a request
+(:class:`ModelHealth`: not cooling down, within the free budget, which the
+retry counts against too). Nothing else is retried here: 4xx, 429,
+timeouts and a blocked paid id go straight back to the fallback chain,
+whose tier limit also bounds the retry (it is cancelled there like any
+slow call).
 """
 
 from __future__ import annotations
 
+import asyncio
+import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -20,8 +32,10 @@ import httpx
 
 from src.providers.base import (
     PayloadError,
+    ProviderError,
     ProviderResponse,
     SkipTierError,
+    TransientError,
     parse_openai_response,
     require_output,
 )
@@ -50,10 +64,34 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 # Effort a thinking tier gets when it names none.
 _DEFAULT_EFFORT = "medium"
 
+# Seconds before the one retry of an unavailable upstream. dots-3 has one
+# upstream (AtlasCloud); on 2026-10-16 it answered a 200 whose error object
+# was {"message": "JSON error injected into SSE stream", "code": 502,
+# "metadata": {"error_type": "provider_unavailable"}} to a memory summary
+# after 15 s and once in a live gate run, where the retries a few seconds
+# later passed.
+UPSTREAM_RETRY_PAUSE_SECONDS = 1.0
+# OpenRouter's metadata.error_type ("provider_unavailable",
+# "provider_overloaded") and the upstream's words ("Upstream error from
+# Nvidia: Service temporarily overloaded").
+_UPSTREAM_UNAVAILABLE_RE = re.compile(
+    r"provider[_ ]unavailable|overloaded|temporarily unavailable", re.IGNORECASE
+)
+
 
 def is_free_model_id(model: str) -> bool:
     """True for OpenRouter ids that never bill credits."""
     return model.endswith(":free") or model == FREE_ROUTER_MODEL
+
+
+def is_upstream_unavailable(error: ProviderError) -> bool:
+    """A 502 or 503 whose error says the model's upstream was unavailable or
+    overloaded: worth one more try on the same model."""
+    return (
+        isinstance(error, TransientError)
+        and error.status in (502, 503)
+        and bool(_UPSTREAM_UNAVAILABLE_RE.search(error.detail or ""))
+    )
 
 
 def build_chat_payload(
@@ -159,7 +197,7 @@ class OpenRouterProvider:
         """Call OpenRouter and return a unified response.
 
         Args:
-            model: Model ID (e.g. "qwen/qwen3.8-27b:free")
+            model: Model ID (e.g. "dots-studio/dots-3-note-preview:free")
             messages: OpenAI-format message list
             temperature: Sampling temperature
             max_tokens: Maximum completion tokens
@@ -173,7 +211,9 @@ class OpenRouterProvider:
             SkipTierError: Paid model id without ``allow_paid`` (no request
                 is sent).
             ProviderError: A subclass per failure, see src/providers/base.py;
-                EmptyCompletionError when a 200 carries nothing usable.
+                EmptyCompletionError when a 200 carries nothing usable. An
+                unavailable upstream raises only when its one retry fails
+                too (the retry's error).
         """
         model = model.strip()
         if not model:
@@ -210,15 +250,7 @@ class OpenRouterProvider:
             f"OpenRouter request → {model} "
             f"(temp={payload['temperature']}, max_tok={payload['max_tokens']}, reasoning={reasoning})"
         )
-        self.health.record_request(self.name, model)
-        data = await post_chat_completion(
-            self._client,
-            self.BASE_URL,
-            payload,
-            provider=self.name,
-            model=model,
-            timeout=_REQUEST_TIMEOUT_SECONDS,
-        )
+        data = await self._post(model, payload)
         response = parse_openai_response(data, model=model, provider=self.name)
         if response.reasoning_content:
             logger.info(f"OpenRouter reasoning ← {model} ({len(response.reasoning_content)} chars)")
@@ -230,3 +262,32 @@ class OpenRouterProvider:
             f"reasoning_tokens={response.reasoning_tokens})"
         )
         return require_output(response)
+
+    async def _post(self, model: str, payload: dict) -> dict:
+        """POST *payload*, and once more when the upstream was unavailable
+        (see the module docstring); each POST counts against the budget."""
+        self.health.record_request(self.name, model)
+        try:
+            return await self._post_once(model, payload)
+        except TransientError as exc:
+            if not is_upstream_unavailable(exc):
+                raise
+            if self.health.unavailable(self.name, model) is not None:
+                raise  # cooling down, or the budget is spent
+            logger.warning(
+                f"OpenRouter: {model} answered {exc.status} (upstream unavailable); "
+                f"retrying once in {UPSTREAM_RETRY_PAUSE_SECONDS:g}s"
+            )
+        await asyncio.sleep(UPSTREAM_RETRY_PAUSE_SECONDS)
+        self.health.record_request(self.name, model)
+        return await self._post_once(model, payload)
+
+    async def _post_once(self, model: str, payload: dict) -> dict:
+        return await post_chat_completion(
+            self._client,
+            self.BASE_URL,
+            payload,
+            provider=self.name,
+            model=model,
+            timeout=_REQUEST_TIMEOUT_SECONDS,
+        )

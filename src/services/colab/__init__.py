@@ -1,7 +1,8 @@
 """The Colab Ollama tier: session state, the tunnel endpoint, registration, commands.
 
 - :mod:`.protocol` — the wire contract with the VM (key derivation, the
-  registration signature, the tunnel URL rule, the pinned versions);
+  registration signature, the tunnel URL rule, the minimum Ollama, the
+  Colab models and their last verified digests);
 - :mod:`.state` — the session's state document and its stores;
 - :mod:`.endpoint` — :class:`~.endpoint.ColabEndpoint`, what the request
   path asks before it calls Colab (READY, busy, breaker) and the HTTP

@@ -29,6 +29,9 @@ session's tunnel:
   finds not loaded (evicted when qwen3.8 was reloaded) or not wholly in
   VRAM sits the rest of the session out (:meth:`off_gpu`), and nothing
   calls it: a call would load it again, and loading it can evict qwen3.8.
+- **The Ollama version.** Every probe and health check wants
+  :func:`.protocol.ollama_version_problem` to pass: at least the minimum,
+  and the release the launcher picked when the session recorded it.
 
 The tunnel client uses the SSRF-safe transport of the page fetcher (port
 443 only, every address public, the connection pinned to the address that
@@ -190,15 +193,15 @@ class ColabEndpoint:
         await self.ensure_loaded()
         return self.is_ready()
 
-    def unpinned(self) -> dict[str, tuple[str, str]]:
-        """The READY session's routers at another digest than their pin (or
-        none recorded): model → (pinned, actual), from the digests its
-        readiness probe saw. The router then stays out of the session.
+    def moved_tags(self) -> dict[str, tuple[str, str]]:
+        """The READY session's models at another digest than the last
+        verified one: model → (verified, actual), from the digests its
+        readiness probe saw. For display only: the models follow their tags.
         Empty while no session is READY."""
         state = self._sync_session()
         if state is None or state.status != READY:
             return {}
-        return protocol.unpinned(state.digests)
+        return protocol.moved_tags(state.digests)
 
     def off_gpu(self) -> dict[str, tuple[int, int]]:
         """The READY session's routers not wholly in VRAM, or not loaded:
@@ -210,6 +213,16 @@ class ColabEndpoint:
         if state is None or state.status != READY:
             return {}
         return {**protocol.off_gpu(state.vram), **self._routers_dropped}
+
+    def off_gpu_at_ready(self) -> dict[str, tuple[int, int]]:
+        """The part of :meth:`off_gpu` the readiness probe saw: routers the
+        session went READY without, which registration already logged at
+        ERROR with the reason (:mod:`.registration`). Empty while no session
+        is READY."""
+        state = self._sync_session()
+        if state is None or state.status != READY:
+            return {}
+        return protocol.off_gpu(state.vram)
 
     @property
     def base_url(self) -> str | None:
@@ -300,9 +313,11 @@ class ColabEndpoint:
         """
         if self.base_url is None or self.bearer() is None:
             return False
+        state = self.store.cached
+        launched = state.ollama_version if state is not None else ""
         try:
             async with asyncio.timeout(HEALTH_TIMEOUT_SECONDS):
-                problems, sizes = await self._check_serving(self.base_url, self.bearer())
+                problems, sizes, _ = await self._check_serving(self.base_url, self.bearer(), launched)
         except TimeoutError:
             problems = [f"no answer within {HEALTH_TIMEOUT_SECONDS:.0f}s"]
         except Exception as exc:
@@ -317,32 +332,42 @@ class ColabEndpoint:
 
     def _drop_routers_off_gpu(self, sizes: dict[str, dict[str, int]]) -> None:
         """Keeps each router *sizes* (a passing health check's ``/api/ps``)
-        does not show wholly in VRAM out of the rest of the session."""
-        for model, share in protocol.off_gpu(sizes).items():
-            if model not in self._routers_dropped:
-                self._routers_dropped[model] = share
-                logger.warning(
-                    f"Colab: health check found {model} "
-                    + ("not loaded" if not share[1] else "not wholly in VRAM")
-                    + "; the router sits the rest of this session out, chat goes on"
-                )
+        does not show wholly in VRAM out of the rest of the session.
 
-    async def readiness(self, tunnel_url: str, nbh: str) -> ProbeReport:
+        The WARNING means a mid-session eviction: a router the readiness
+        probe already found missing or off the GPU was logged at ERROR when
+        the session became READY (:mod:`.registration`), so it is dropped
+        quietly."""
+        at_ready = self.off_gpu_at_ready()
+        for model, share in protocol.off_gpu(sizes).items():
+            if model in self._routers_dropped:
+                continue
+            self._routers_dropped[model] = share
+            if model in at_ready:
+                continue
+            logger.warning(
+                f"Colab: health check found {model} "
+                + ("not loaded" if not share[1] else "not wholly in VRAM")
+                + "; the router sits the rest of this session out, chat goes on"
+            )
+
+    async def readiness(self, tunnel_url: str, nbh: str, *, ollama_version: str = "") -> ProbeReport:
         """The readiness probe after a ``ready`` registration.
 
-        Within PROBE_TIMEOUT_SECONDS: the Ollama version, the chat model
-        loaded, listed, wholly in VRAM and at its pinned digest, and its
-        think values. A router that is not listed or loaded, at another
-        digest or not wholly in VRAM is no problem, only missing from or
-        shown in the report's digests and sizes (:func:`.protocol.unpinned`,
-        :func:`.protocol.off_gpu`).
+        Within PROBE_TIMEOUT_SECONDS: the Ollama version (at least the
+        minimum, and *ollama_version*, the release the session was launched
+        with, when known), the chat model loaded, listed and wholly in VRAM,
+        and its think values. No digest is compared (the models follow
+        their tags). A router that is not listed or loaded, or not wholly in
+        VRAM is no problem, only missing from or shown in the report's
+        digests and sizes (:func:`.protocol.off_gpu`).
         """
         token = self.bearer(nbh)
         try:
             async with asyncio.timeout(protocol.PROBE_TIMEOUT_SECONDS):
-                (serving, vram), (listed, digests), *think = await asyncio.gather(
-                    self._check_serving(tunnel_url, token),
-                    self._check_digests(tunnel_url, token),
+                (serving, vram, version), (listed, digests), *think = await asyncio.gather(
+                    self._check_serving(tunnel_url, token, ollama_version),
+                    self._check_tags(tunnel_url, token),
                     *(self._check_think(tunnel_url, token, model) for model in protocol.chat_models()),
                 )
         except TimeoutError:
@@ -356,17 +381,18 @@ class ColabEndpoint:
             if model not in routers and not protocol.on_gpu(sizes)
         ]
         problems = [*serving, *spilled, *listed, *(problem for problems in think for problem in problems)]
-        return ProbeReport(problems, digests, vram)
+        return ProbeReport(problems, digests, vram, version)
 
-    async def probe(self, tunnel_url: str, nbh: str) -> list[str]:
-        """Everything that differs from the pins, the router's too (listed,
-        loaded, its digest and VRAM); [] means nothing does. The live gate's
-        check (scripts/live_gate.py): a session can be READY without its
-        router (:meth:`readiness`)."""
-        report = await self.readiness(tunnel_url, nbh)
+    async def probe(self, tunnel_url: str, nbh: str, *, ollama_version: str = "") -> list[str]:
+        """Everything a full session lacks, the router's too (listed,
+        loaded, wholly in VRAM); [] means nothing does. No digest counts.
+        The live gate's check (scripts/live_gate.py): a session can be
+        READY without its router (:meth:`readiness`)."""
+        report = await self.readiness(tunnel_url, nbh, ollama_version=ollama_version)
         problems = list(report.problems)
-        for model, (pinned, actual) in protocol.unpinned(report.digests).items():
-            problems.append(_digest_problem(model, actual, pinned) if actual else f"not listed: {model}")
+        for model in protocol.router_models():
+            if model not in report.digests:
+                problems.append(f"not listed: {model}")
         for model in protocol.off_gpu(report.vram):
             problems.append(_gpu_problem(model, report.vram[model]) if model in report.vram else f"not loaded: {model}")
         return problems
@@ -385,29 +411,34 @@ class ColabEndpoint:
         except ValueError:
             raise _ProbeFailed(f"{path} answered something that is not JSON") from None
 
-    async def _check_serving(self, base: str, token: str | None) -> tuple[list[str], dict[str, dict[str, int]]]:
-        """The problems (a pinned model other than a router not loaded), and
-        each loaded pinned model's ``/api/ps`` sizes (``{"size",
-        "size_vram"}``, which the callers judge)."""
+    async def _check_serving(
+        self, base: str, token: str | None, launched: str = ""
+    ) -> tuple[list[str], dict[str, dict[str, int]], str]:
+        """The problems (an Ollama version the session may not run, a Colab
+        model other than a router not loaded), each loaded Colab model's
+        ``/api/ps`` sizes (``{"size", "size_vram"}``, which the callers
+        judge) and the version ``/api/version`` gave ("" when none)."""
         try:
             version = await self._get_json(base, token, "GET", "/api/version")
             running = await self._get_json(base, token, "GET", "/api/ps")
         except _ProbeFailed as exc:
-            return [str(exc)], {}
+            return [str(exc)], {}, ""
         problems: list[str] = []
         found = version.get("version") if isinstance(version, dict) else None
-        if found != protocol.OLLAMA_VERSION:
-            problems.append(f"Ollama {clip(str(found), 40)}, expected {protocol.OLLAMA_VERSION}")
-        pins = protocol.pinned_models()
+        if problem := protocol.ollama_version_problem(found, launched):
+            problems.append(problem)
+        models = protocol.colab_models()
         loaded = _loaded_sizes(running)
-        missing = sorted(set(pins) - set(loaded) - set(protocol.router_models()))
+        missing = sorted(set(models) - set(loaded) - set(protocol.router_models()))
         if missing:
             problems.append(f"not loaded: {', '.join(missing)}")
-        return problems, {model: sizes for model, sizes in loaded.items() if model in pins}
+        shown = clip(found, 40) if isinstance(found, str) else ""
+        return problems, {model: sizes for model, sizes in loaded.items() if model in models}, shown
 
-    async def _check_digests(self, base: str, token: str | None) -> tuple[list[str], dict[str, str]]:
-        """The problems, and each listed pinned model's digest in ``/api/tags``:
-        every pinned model but a router must be listed at its pin."""
+    async def _check_tags(self, base: str, token: str | None) -> tuple[list[str], dict[str, str]]:
+        """The problems, and each listed Colab model's digest in ``/api/tags``:
+        every Colab model but a router must be listed, at whatever digest
+        its tag pointed to (the models follow their tags)."""
         try:
             tags = await self._get_json(base, token, "GET", "/api/tags")
         except _ProbeFailed as exc:
@@ -419,14 +450,10 @@ class ColabEndpoint:
                 for key in ("name", "model"):
                     if isinstance(entry.get(key), str):
                         listed[entry[key]] = digest
-        pins = protocol.pinned_models()
+        models = protocol.colab_models()
         routers = protocol.router_models()
-        problems = [
-            _digest_problem(model, listed.get(model, "missing"), expected)
-            for model, expected in sorted(pins.items())
-            if listed.get(model) != expected and model not in routers
-        ]
-        return problems, {model: listed[model] for model in pins if model in listed}
+        problems = [f"not listed: {model}" for model in sorted(models) if model not in listed and model not in routers]
+        return problems, {model: listed[model] for model in models if model in listed}
 
     async def _check_think(self, base: str, token: str | None, model: str) -> list[str]:
         try:
@@ -506,13 +533,16 @@ class ColabEndpoint:
                 "boot_step": state.boot_step or None,
                 "versions": dict(state.versions),
                 "gpu": dict(state.gpu),
-                # A republished router, or one not loaded or partly on the
-                # CPU: the READY session routes without it.
-                "unpinned": {
-                    model: {"pinned": pinned, "actual": actual or None}
-                    for model, (pinned, actual) in self.unpinned().items()
+                # What the probe saw in /api/tags, and the models whose tag
+                # moved since its digest was verified (display only).
+                "digests": dict(state.digests),
+                "tags_moved": {
+                    model: {"verified": verified, "actual": actual}
+                    for model, (verified, actual) in self.moved_tags().items()
                 }
                 or None,
+                # A router not loaded or partly on the CPU: the READY
+                # session routes without it.
                 "off_gpu": {
                     model: {"size_vram": in_vram, "size": size}
                     for model, (in_vram, size) in self.off_gpu().items()
@@ -545,18 +575,16 @@ class ProbeReport:
 
     # Each one keeps the session from READY.
     problems: list[str]
-    # Each pinned model's digest in /api/tags (those it lists).
+    # Each Colab model's digest in /api/tags (those it lists).
     digests: dict[str, str] = field(default_factory=dict)
-    # Each pinned model's {"size", "size_vram"} in /api/ps (those it lists).
+    # Each Colab model's {"size", "size_vram"} in /api/ps (those it lists).
     vram: dict[str, dict[str, int]] = field(default_factory=dict)
+    # What /api/version answered ("" when it did not).
+    ollama_version: str = ""
 
 
 class _ProbeFailed(Exception):
     """One probe call did not answer 200 with JSON."""
-
-
-def _digest_problem(model: str, actual: str, pinned: str) -> str:
-    return f"{model} digest {actual[:12]}, expected {pinned[:12]}"
 
 
 def _gpu_problem(model: str, sizes: dict[str, int]) -> str:

@@ -27,7 +27,10 @@ model's health (``hold_deadline_timeouts=False``): the same tiers serve the
 router and memory summaries, and a rewrite that needs more than a few
 seconds says nothing about them. The model answers with the query alone on one line (a
 JSON object with a "query" field is read too); any failure falls back to
-the text as typed. The recent turns, the quote and the router's task
+the text as typed. So does a rewrite that loses a name or version the
+message spells with letters and digits (:func:`lost_identifiers`): on
+2026-10-16 qwen3.8 came back as Qwen3-8B, and the search looked up another
+model. The recent turns, the quote and the router's task
 summary lose the rewrite request's block labels (look-alikes too), so a
 group member's message cannot close its block or pose as the message to
 rewrite.
@@ -57,6 +60,13 @@ _CONTEXT_CHARS = {"user": 200, "assistant": 300, "quoted": 300, "task": 200}
 
 _CJK_CHAR = re.compile(r"[㐀-䶿一-鿿]")
 _ASCII_WORD = re.compile(r"[A-Za-z0-9]+")
+# A run of Latin letters and digits, joined by inner . - _ (qwen3.8,
+# gpt-5, nemotron-3-super); see lost_identifiers.
+_IDENTIFIER = re.compile(r"[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*")
+_LETTER = re.compile(r"[A-Za-z]")
+_DIGIT = re.compile(r"[0-9]")
+# What may stand between an identifier's characters in the query.
+_SEPARATOR = r"[\s_-]*"
 # Words that point back at something said before; with recent turns to
 # resolve them, the query is rewritten even when it is short.
 _CONTEXT_REFERENCE = re.compile(
@@ -131,9 +141,11 @@ _REWRITE_SYSTEM = (
     "改寫成不需要上下文也看得懂的搜尋字串\n"
     "2. 去除語氣詞、助詞與客套話（嗎、呢、吧、的、了、啊、請問、幫我、可以）\n"
     "3. 保留專有名詞、地點、數字、品牌、人名等限定詞，以及搜尋意圖詞：比較、推薦、評價、教學、價格、怎麼去、差異、優缺點\n"
-    "4. 保留使用者原本的時間詞（今天、最近、最新），不要自己加上年份或日期\n"
-    "5. 多個子主題用空格分隔；本來就很精簡的查詢直接照抄\n"
-    "6. 只輸出搜尋字串本身，一行，不加引號、標籤或任何說明\n\n"
+    "4. 模型名稱、產品名稱、型號、版本號等識別字，照要改寫的訊息裡的寫法逐字照抄；調度任務摘要或對話的寫法不同時，一律以訊息為準"
+    "（訊息裡沒有的才照上下文）。不要改寫、拆開、補全或換成你知道的名稱：qwen3.8 就寫 qwen3.8，不能寫成 Qwen3-8B 或 Qwen 3.8B\n"
+    "5. 保留使用者原本的時間詞（今天、最近、最新），不要自己加上年份或日期\n"
+    "6. 多個子主題用空格分隔；本來就很精簡的查詢直接照抄\n"
+    "7. 只輸出搜尋字串本身，一行，不加引號、標籤或任何說明\n\n"
     "範例：\n"
     "「台灣最近有什麼重要的新聞嗎」→ 台灣 最新 重要新聞\n"
     "「諮商心理師的收費標準大概是多少」→ 諮商心理師 收費標準\n"
@@ -243,7 +255,14 @@ class SearchQueryPlanner:
         except Exception as exc:
             logger.warning(f"Search query rewrite failed, searching the text as typed: {exc}")
             return None
-        return parse_query_reply(resp.text)
+        query = parse_query_reply(resp.text)
+        lost = lost_identifiers(text, query) if query else []
+        if lost:
+            logger.info(
+                f"Search query rewrite {query!r} lost {', '.join(lost)}; searching the text as typed"
+            )
+            return None
+        return query
 
 
 def needs_rewrite(text: str, context: SearchContext) -> bool:
@@ -262,6 +281,32 @@ def is_short_query(text: str) -> bool:
         len(_CJK_CHAR.findall(text)) < STANDALONE_CJK_CHARS
         and len(_ASCII_WORD.findall(text)) < STANDALONE_ASCII_WORDS
     )
+
+
+def lost_identifiers(text: str, query: str) -> list[str]:
+    """The names and versions in *text* that *query* does not spell out.
+
+    They are the runs of Latin letters and digits (joined by inner . - _)
+    with at least one of each: qwen3.8, gemma4, v4.1, gpt-5, rtx5090,
+    iPhone17. A bare number (2330, 3.8, 2026) is not one, since a date,
+    price or stock code may fairly be reworded or dropped. Case does not
+    count, nor do spaces, hyphens or underscores between the characters;
+    dots do, and the query's spelling must not run on into more letters or
+    digits, directly or after a dot: "Gemma 4" and "Gemma-4" keep gemma4
+    and "DeepSeek-V4.1" keeps v4.1, while "Qwen3-8B" and "Qwen 3.8B" lose
+    qwen3.8 and "V4.1" loses v4.
+    """
+    return [
+        token
+        for token in dict.fromkeys(_IDENTIFIER.findall(text))
+        if _LETTER.search(token) and _DIGIT.search(token) and not _spelled_out(token, query)
+    ]
+
+
+def _spelled_out(token: str, query: str) -> bool:
+    chars = token.replace("-", "").replace("_", "")
+    spelling = _SEPARATOR.join(map(re.escape, chars))
+    return re.search(rf"(?<![A-Za-z0-9]){spelling}(?!\.?[A-Za-z0-9])", query, re.IGNORECASE) is not None
 
 
 def parse_query_reply(text: str | None) -> str | None:

@@ -7,12 +7,12 @@ Analyses every incoming message and decides:
 
 Uses fast rules for obvious cases (zero LLM calls) and falls back to
 LLM classification only for ambiguous text. With a READY Colab session,
-the Colab router (nimble, :class:`~src.providers.systemone.SystemOneRouter`)
+the Colab router (clef-flash, :class:`~src.providers.systemone.SystemOneRouter`)
 is asked too: before the API router tiers under MODEL_PATH_PREFERENCE=colab,
-and only when they all failed under "api". It answers only when it is
-confident; otherwise, and whenever Colab is not READY or the session's
-router is not the pinned digest, not loaded or not wholly in VRAM, the
-API router decides at once.
+and only when they all failed under "api". It answers with its top
+choice unless a non-zero COLAB_ROUTER_CONFIDENCE or an invariant defers;
+then, and whenever Colab is not READY or the session's router is not
+loaded or not wholly in VRAM, the API router decides at once.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ _ROUTING_LABELS = (*FENCE_LABELS, *_ROUTING_CONTEXT_LABELS)
 # request's summary line does.
 _COLAB_ROUTER, _LLM, _FALLBACK = "Colab router", "LLM", "fallback"
 _TRACE_ROUTES = {
-    _COLAB_ROUTER: request_trace.ROUTE_NIMBLE,
+    _COLAB_ROUTER: request_trace.ROUTE_ROUTER,
     _LLM: request_trace.ROUTE_LLM,
     _FALLBACK: request_trace.ROUTE_FALLBACK,
 }
@@ -230,7 +230,7 @@ class Orchestrator(BaseAgent):
         return _fallback_decision(request, failure), _FALLBACK
 
     async def _system_one_route(self, request: AgentRequest) -> RouterDecision | None:
-        """The Colab router's confident decision, or None; never raises."""
+        """The Colab router's decision, or None; never raises."""
         try:
             return await self.system_one.route(
                 request, deadline=self._deadline_for(request, thinking=False)

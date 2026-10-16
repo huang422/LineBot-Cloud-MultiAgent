@@ -1,7 +1,7 @@
 """The request path with Colab: a real container, real providers, a fake tunnel.
 
 Each test runs ``process_event`` end to end: the orchestrator (fast rules,
-the nimble router, the API router), the chat agent and the fallback chain, with the
+the Colab router, the API router), the chat agent and the fallback chain, with the
 Colab endpoint over :class:`tests.colab_fakes.FakeTunnel` and the NVIDIA
 provider replaced by a scripted fake. It checks who answered, what reached
 the tunnel, and whether demand was recorded.
@@ -25,10 +25,11 @@ from src.runtime.composition import build_container
 from src.runtime.model_roles import NIM_SUPER, NIM_ULTRA
 from src.services.colab.state import IDLE, ColabState, InMemoryColabStateStore
 from tests.colab_fakes import (
-    NIMBLE,
     QWEN,
+    ROUTER,
     SECRET,
     FakeTunnel,
+    healthy_routes,
     make_endpoint,
     ready_state,
     systemone_answer,
@@ -165,7 +166,7 @@ class ColabPipelineTests(unittest.IsolatedAsyncioTestCase):
         [response] = run.sent
         self.assertEqual(response.text, "Colab 的回答")
         self.assertEqual(run.tunnel.paths(), ["POST /v1/systemone", "POST /api/chat"])
-        self.assertTrue(run.request.routing_reasoning.startswith(f"{NIMBLE}:"))
+        self.assertTrue(run.request.routing_reasoning.startswith(f"{ROUTER}:"))
         self.assertEqual(run.api.calls, [])
         # Thinking on by default (COLAB_CHAT_THINK=low) for chat.
         self.assertEqual(run.tunnel.bodies("POST /api/chat")[0]["think"], "low")
@@ -243,7 +244,7 @@ class ColabPipelineTests(unittest.IsolatedAsyncioTestCase):
         run = await self._run(preference="api", api=FakeApi(router_error=down))
 
         self.assertEqual(run.tunnel.paths()[0], "POST /v1/systemone")
-        self.assertTrue(run.request.routing_reasoning.startswith(f"{NIMBLE}:"))
+        self.assertTrue(run.request.routing_reasoning.startswith(f"{ROUTER}:"))
         self.assertEqual(run.sent[0].text, "API 的回答")
 
     async def test_api_preference_never_waits_for_a_colab_that_is_not_ready(self) -> None:
@@ -284,6 +285,33 @@ class ColabPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(run.elapsed, 1.0)
         self.assertLess(run.elapsed, 3.0)
         self.assertEqual(run.tunnel.paths(), ["POST /v1/systemone", "POST /api/chat"])
+
+    async def test_a_late_colab_answer_is_cancelled_never_sent(self) -> None:
+        # Colab would answer after its share of the window (a slow thinking
+        # qwen3.8): its request is cancelled when the share ends, so nothing
+        # is left to deliver that answer; the API's is the only reply.
+        colab: list[str] = []
+
+        async def late_answer(request):
+            colab.append("started")
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                colab.append("cancelled")
+                raise
+            colab.append("answered")
+            return httpx.Response(200, json=healthy_routes()["POST /api/chat"][1])
+
+        run = await self._run(
+            tunnel=FakeTunnel(**{"POST /api/chat": late_answer}),
+            min_tier_seconds=1,
+            reply_window_seconds=3,
+        )
+
+        [response] = run.sent
+        self.assertEqual(response.text, "API 的回答")
+        self.assertEqual(colab, ["started", "cancelled"])
+        run.line.send_text.assert_not_called()
 
     # (d2) one reply window ──────────────────────────────────
 
@@ -339,11 +367,22 @@ class ColabPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     # (e) ─────────────────────────────────────────────────────
 
-    async def test_an_unsure_colab_router_hands_routing_to_the_api_router(self) -> None:
-        # Under the provisional COLAB_ROUTER_CONFIDENCE (0.75).
-        tunnel = FakeTunnel(**{"POST /v1/systemone": (200, systemone_answer(agent="web_search", agent_confidence=0.7))})
+    async def test_at_the_default_gate_the_colab_router_takes_its_top_choice_however_unsure(self) -> None:
+        # COLAB_ROUTER_CONFIDENCE 0.0 (argmax); 0.39 is what real messages scored.
+        tunnel = FakeTunnel(**{"POST /v1/systemone": (200, systemone_answer(agent_confidence=0.39))})
 
         run = await self._run(tunnel=tunnel)
+
+        self.assertEqual(run.api.calls, [])
+        self.assertEqual(run.request.target_agent, "chat")
+        self.assertTrue(run.request.routing_reasoning.startswith(f"{ROUTER}: agent 0.39"))
+        self.assertEqual(run.tunnel.paths(), ["POST /v1/systemone", "POST /api/chat"])
+
+    async def test_an_unsure_colab_router_hands_routing_to_the_api_router(self) -> None:
+        # Only under a gate set above its confidence (the default 0.0 never is).
+        tunnel = FakeTunnel(**{"POST /v1/systemone": (200, systemone_answer(agent="web_search", agent_confidence=0.7))})
+
+        run = await self._run(tunnel=tunnel, colab_router_confidence=0.90)
 
         self.assertEqual(run.api.calls, ["router"])
         self.assertEqual((run.request.target_agent, run.request.routing_reasoning), ("chat", "API 判斷"))
@@ -361,7 +400,7 @@ class ColabPipelineTests(unittest.IsolatedAsyncioTestCase):
         container = build_container(settings, extra_providers={"nvidia": api}, colab=endpoint)
         self.addAsyncCleanup(container.aclose)
 
-        async with endpoint.semaphore(NIMBLE):
+        async with endpoint.semaphore(ROUTER):
             decision = await container.orchestrator.route(AgentRequest(text=_TEXT))
 
         self.assertEqual((decision.reasoning, api.calls), ("API 判斷", ["router"]))
@@ -378,8 +417,8 @@ class ColabPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(run.request.text, line)
         return line
 
-    async def test_summary_colab_answer_routed_by_nimble_with_its_probabilities(self) -> None:
-        answer = systemone_answer(agent_confidence=0.84, output_confidence=0.9, noul=0.05)
+    async def test_summary_colab_answer_routed_by_the_colab_router_with_its_probabilities(self) -> None:
+        answer = systemone_answer(agent_confidence=0.94, output_confidence=0.95, noul=0.05)
         answer["answers"]["agent"]["probabilities"] = {
             "web_search": 0.041, "chat": 0.934, "vision": 0.02, "image_gen": 0.005, "other": 0.5,
         }
@@ -388,15 +427,15 @@ class ColabPipelineTests(unittest.IsolatedAsyncioTestCase):
         line = await self._summary(tunnel=FakeTunnel(**{"POST /v1/systemone": (200, answer)}))
 
         self.assertIn(
-            f"summary pref=colab path=colab route=colab:{NIMBLE} agent=chat out=text think=off "
+            f"summary pref=colab path=colab route=colab:{ROUTER} agent=chat out=text think=off "
             f"answer=colab:{QWEN} ",
             line,
         )
         # Colab chat thinks at COLAB_CHAT_THINK=low although the route says off.
         self.assertIn(" answer_think=low ", line)
         self.assertIn(
-            " router_p=[agent={chat:0.93,web_search:0.04,vision:0.02,image_gen:0.01} conf=0.84 gate=0.75 ok"
-            " | format={text:0.97,voice:0.02,image:0.01} conf=0.90 ok"
+            " router_p=[agent={chat:0.93,web_search:0.04,vision:0.02,image_gen:0.01} conf=0.94 gate=0.00 ok"
+            " | format={text:0.97,voice:0.02,image:0.01} conf=0.95 ok"
             " | think p=0.05 (on>=0.85 off<=0.15) -> off] ",
             line,
         )
@@ -407,38 +446,38 @@ class ColabPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(
             f"summary pref=api path=api route=nvidia:{NIM_SUPER} agent=chat out=text think=off "
-            f"answer=nvidia:{NIM_ULTRA} ",
+            f"answer=nvidia:{NIM_SUPER} ",
             line,
         )
         self.assertIn(" answer_think=off ", line)
         self.assertIn(" router_p=n/a ", line)
-        self.assertRegex(line, rf"tiers=\[nvidia:{NIM_ULTRA} ok \d+\.\ds\]$")
+        self.assertRegex(line, rf"tiers=\[nvidia:{NIM_SUPER} ok \d+\.\ds\]$")
 
-    async def test_summary_an_unsure_nimble_shows_its_probabilities_and_the_api_router(self) -> None:
+    async def test_summary_an_unsure_colab_router_shows_its_probabilities_and_the_api_router(self) -> None:
         tunnel = FakeTunnel(**{"POST /v1/systemone": (200, systemone_answer(agent="web_search", agent_confidence=0.7))})
 
-        line = await self._summary(tunnel=tunnel)
+        line = await self._summary(tunnel=tunnel, colab_router_confidence=0.90)
 
         self.assertIn(f" route=nvidia:{NIM_SUPER} ", line)
         self.assertIn(
-            "router_p=[agent={web_search:0.97} conf=0.70 gate=0.75 fail | format={text:0.98} conf=0.95 ok"
+            "router_p=[agent={web_search:0.97} conf=0.70 gate=0.90 fail | format={text:0.98} conf=0.95 ok"
             " | think p=0.05 (on>=0.85 off<=0.15) | gate fail -> API router]",
             line,
         )
 
-    async def test_summary_a_fast_rule_route_and_why_nimble_was_not_asked(self) -> None:
+    async def test_summary_a_fast_rule_route_and_why_the_colab_router_was_not_asked(self) -> None:
         line = await self._summary(text="你好", state=ColabState(status=IDLE))
 
         self.assertIn(
-            f"summary pref=colab path=api route=rules agent=chat out=text think=off answer=nvidia:{NIM_ULTRA} ",
+            f"summary pref=colab path=api route=rules agent=chat out=text think=off answer=nvidia:{NIM_SUPER} ",
             line,
         )
         self.assertIn(" router_p=n/a ", line)
-        self.assertIn(f"tiers=[colab:{QWEN} skip(Colab session not READY), nvidia:{NIM_ULTRA} ok ", line)
+        self.assertIn(f"tiers=[colab:{QWEN} skip(Colab session not READY), nvidia:{NIM_SUPER} ok ", line)
 
         line = await self._summary(state=ColabState(status=IDLE))
         self.assertIn(f" route=nvidia:{NIM_SUPER} ", line)
-        self.assertIn(" router_p=n/a(nimble not READY) ", line)
+        self.assertIn(" router_p=n/a(router not READY) ", line)
 
     async def test_summary_every_tier_failed(self) -> None:
         down = TransientError(NIM_ULTRA, 503, "down", "nvidia")

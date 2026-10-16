@@ -41,7 +41,7 @@ Four kinds of checks:
 - tier checks (``tier.<role>.<n>.<provider>:<model>``, ``--path tiers``)
   make one minimal call to every tier of the configured table, in call
   order: a routing decision the orchestrator's parser reads from JSON that
-  holds to the router schema (nimble through SystemOneRouter), a zh-TW chat answer, a zh-TW reasoning answer
+  holds to the router schema (clef-flash through SystemOneRouter), a zh-TW chat answer, a zh-TW reasoning answer
   with thinking on, the red circle described as red and round, a zh-TW
   memory summary, an embedding EMBEDDING_DIMENSIONS wide, image bytes.
   Each may take its tier's ``timeout_s`` plus TIER_SLACK_SECONDS. They are
@@ -58,7 +58,7 @@ Four kinds of checks:
   bearer from COLAB_SHARED_SECRET in the env file, re-checks the tunnel
   rule, then runs the bot's readiness probe (with both models wholly in
   VRAM), a qwen3.8 chat reply at COLAB_CHAT_THINK, the red-circle vision
-  check and a nimble routing decision through the bot's own
+  check and a clef-flash routing decision through the bot's own
   OllamaChatProvider and SystemOneRouter.
   Without COLAB_ENABLED, a readable document or a READY session each
   check SKIPs with the reason; with COLAB_DRY_RUN (a stub Ollama) only the
@@ -82,8 +82,8 @@ workers are often busy: an HTTP 503 "ResourceExhausted" FAILs its check
 
 The script prints PASS/FAIL/SKIP with short evidence and latency, never API
 keys or full model output, and exits 1 when any selected check fails. A full
-run uses a little of the free quotas: about 33 NVIDIA and 15-18 OpenRouter
-requests, of which the tier checks of the default table send 11 and 7.
+run uses a little of the free quotas: about 37 NVIDIA and 16-19 OpenRouter
+requests, of which the tier checks of the default table send 13 and 8.
 Tests import the helpers with a mocked transport; tests and CI never send
 live requests.
 """
@@ -150,8 +150,8 @@ from src.runtime.composition import (  # noqa: E402
 )
 from src.runtime.model_roles import (  # noqa: E402
     COLAB,
-    COLAB_NIMBLE,
     COLAB_QWEN,
+    COLAB_ROUTER,
     ROLES,
     RoleConfigError,
     RoleTable,
@@ -166,7 +166,7 @@ from src.runtime.model_roles import NIM_MUSE as MUSE  # noqa: E402
 from src.runtime.model_roles import NIM_OMNI as OMNI  # noqa: E402
 from src.runtime.model_roles import NIM_SUPER as SUPER  # noqa: E402
 from src.runtime.model_roles import NIM_ULTRA as ULTRA  # noqa: E402
-from src.runtime.model_roles import OR_QWEN as OR_QWEN  # noqa: E402
+from src.runtime.model_roles import OR_DOTS as OR_DOTS  # noqa: E402
 from src.runtime.model_roles import OR_SUPER as OR_SUPER  # noqa: E402
 from src.runtime.model_roles import OR_ULTRA as OR_ULTRA  # noqa: E402
 from src.services.colab import protocol  # noqa: E402
@@ -178,7 +178,11 @@ from src.services.colab.state import (  # noqa: E402
     build_state_store,
 )
 from src.services.embedding_service import build_embedding_service  # noqa: E402
-from src.services.memory_service import summary_messages  # noqa: E402
+from src.services.memory_service import (  # noqa: E402
+    apply_summary_update,
+    summary_items,
+    summary_messages,
+)
 from src.utils.line_text import to_line_text  # noqa: E402
 
 NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -219,7 +223,7 @@ TOOL_SYSTEM_PROMPT = "你是 LINE 聊天助理。需要現在時間時一定要�
 TOOL_RESULT = {"timezone": "Asia/Taipei", "now": "2026-09-29T15:04:00+08:00"}
 
 # (prompt, text the answer should contain or None): zh-TW quality of a
-# thinking answer, which runs on the thinking role's Ultra tier.
+# thinking answer, as the thinking role's NIM tiers (Super, then Ultra) give it.
 THINKING_PROMPTS: tuple[tuple[str, str | None], ...] = (
     (
         "水池有甲、乙兩個進水管，甲管單獨注滿要 6 小時，乙管單獨注滿要 3 小時。"
@@ -248,8 +252,11 @@ TIER_NOTE_LIMIT = 80
 # Least share of CJK among an answer's letters for a zh-TW answer.
 ZH_MIN_CJK = 0.3
 EMBED_TEXT = "台北今天會下雨嗎？"
-# The recent dialogue of the memory summary check, as
-# MemoryService._format_recent_for_summary writes it.
+# The memory summary check folds this dialogue (as
+# MemoryService._format_recent_for_summary writes it) into this summary:
+# the answer must name the change in the update format and keep the old
+# items, which the dialogue does not touch.
+UTILITY_SUMMARY = "使用者住在台北；喜歡喝無糖綠茶。"
 UTILITY_DIALOGUE = (
     "User: 我最近開始學鋼琴，每週六早上上課。\n"
     "Assistant: 很棒！固定練習會進步很快。\n"
@@ -1051,6 +1058,10 @@ def check_ultra_tools(ctx: GateContext) -> str:
     return _tool_round_trip(ctx, "nvidia", ULTRA)
 
 
+def check_super_tools(ctx: GateContext) -> str:
+    return _tool_round_trip(ctx, "nvidia", SUPER)
+
+
 def _router_check(ctx: GateContext, path: str, model: str) -> str:
     """The bot's router call: Orchestrator._llm_classify with thinking off."""
     settings = ctx.bot_settings()
@@ -1347,8 +1358,8 @@ def _openrouter_no_reasoning(ctx: GateContext, model: str) -> str:
     raise GateError(evidence)
 
 
-def check_openrouter_qwen_no_reasoning(ctx: GateContext) -> str:
-    return _openrouter_no_reasoning(ctx, OR_QWEN)
+def check_openrouter_dots_no_reasoning(ctx: GateContext) -> str:
+    return _openrouter_no_reasoning(ctx, OR_DOTS)
 
 
 def check_openrouter_ultra_no_reasoning(ctx: GateContext) -> str:
@@ -1386,27 +1397,27 @@ def _openrouter_thinking(ctx: GateContext, model: str) -> str:
     return evidence
 
 
-def check_openrouter_qwen_thinking(ctx: GateContext) -> str:
-    """The bot's thinking request when NVIDIA is down: qwen3.8 with its effort."""
-    return _openrouter_thinking(ctx, OR_QWEN)
+def check_openrouter_dots_thinking(ctx: GateContext) -> str:
+    """The bot's thinking request when NVIDIA is down: dots-3 with its effort."""
+    return _openrouter_thinking(ctx, OR_DOTS)
 
 
 def check_openrouter_ultra_thinking(ctx: GateContext) -> str:
     return _openrouter_thinking(ctx, OR_ULTRA)
 
 
-def check_openrouter_qwen_tools(ctx: GateContext) -> str:
-    return _tool_round_trip(ctx, "openrouter", OR_QWEN)
+def check_openrouter_dots_tools(ctx: GateContext) -> str:
+    return _tool_round_trip(ctx, "openrouter", OR_DOTS)
 
 
-def check_openrouter_qwen_vision(ctx: GateContext) -> str:
+def check_openrouter_dots_vision(ctx: GateContext) -> str:
     """The vision role's OpenRouter tier (effort none) on the red-circle PNG."""
     settings = ctx.bot_settings()
     call = bot_chat(
         ctx,
         "vision",
         "openrouter",
-        OR_QWEN,
+        OR_DOTS,
         _vision_messages(settings),
         temperature=settings.vision_temperature,
         max_tokens=settings.vision_max_tokens,
@@ -1571,7 +1582,7 @@ def check_colab_probe(ctx: GateContext) -> str:
     async def work(bridge: BridgeTransport) -> list[str]:
         endpoint = colab_endpoint(settings, state, bridge)
         try:
-            return await endpoint.probe(state.tunnel_url, state.nbh)
+            return await endpoint.probe(state.tunnel_url, state.nbh, ollama_version=state.ollama_version)
         finally:
             await endpoint.close()
 
@@ -1583,16 +1594,28 @@ def check_colab_probe(ctx: GateContext) -> str:
         "?",
     )
     running = next((exchange.data for exchange in exchanges if exchange.url.endswith("/api/ps")), None) or {}
-    pins = protocol.pinned_models()
+    models = protocol.colab_models()
     in_vram = ", ".join(
         f"{entry['name']} {protocol.mib(protocol.model_size(entry.get('size_vram')))} MiB"
         for entry in running.get("models") or []
-        if isinstance(entry, dict) and entry.get("name") in pins
+        if isinstance(entry, dict) and entry.get("name") in models
+    )
+    tags = next((exchange.data for exchange in exchanges if exchange.url.endswith("/api/tags")), None) or {}
+    digests = {
+        str(entry.get("name")): protocol.normalize_digest(entry.get("digest"))
+        for entry in tags.get("models") or []
+        if isinstance(entry, dict) and entry.get("name") in models
+    }
+    moved = protocol.moved_tags(digests)
+    tag_note = (
+        "tags moved since verified: " + ", ".join(f"{model} {actual[:12]}" for model, (_, actual) in moved.items())
+        if moved
+        else "at the verified digests"
     )
     think = "/".join(str(value).lower() for value in protocol.CHAT_THINK_VALUES)
     return (
-        f"Ollama {version}; {', '.join(pins)} loaded wholly in VRAM ({in_vram}) with the pinned "
-        f"digests; think values {think}"
+        f"Ollama {version}; {', '.join(models)} loaded wholly in VRAM ({in_vram}), {tag_note}; "
+        f"think values {think}"
     )
 
 
@@ -1665,8 +1688,8 @@ def _scored(answers: Mapping, name: str, allowed: set[str]) -> tuple[str, float]
 
 
 def check_colab_router(ctx: GateContext) -> str:
-    """nimble on /v1/systemone through the bot's SystemOneRouter, within its limit."""
-    return _colab_router_check(ctx, COLAB_NIMBLE)
+    """clef-flash on /v1/systemone through the bot's SystemOneRouter, within its limit."""
+    return _colab_router_check(ctx, COLAB_ROUTER)
 
 
 def _colab_router_check(ctx: GateContext, model: str) -> str:
@@ -1705,11 +1728,13 @@ def _colab_router_check(ctx: GateContext, model: str) -> str:
     noul = (answers.get("needs_thinking") or {}).get("noul")
     if not isinstance(noul, (int, float)) or isinstance(noul, bool):
         raise GateError("the needs_thinking answer has no noul")
-    verdict = (
-        f"decides {decision.agent}"
-        if decision is not None
-        else f"below the {gates.confidence:g} gate, the API router decides"
-    )
+    if decision is not None:
+        verdict = f"decides {decision.agent}"
+    elif min(agent_confidence, output_confidence) < gates.confidence:
+        verdict = f"below the {gates.confidence:g} gate, the API router decides"
+    else:
+        # At the default gate (0.0) only an invariant refuses the answer.
+        verdict = "the API router decides"
     expected = "" if agent == "web_search" else " (expected web_search)"
     tokens = (data.get("usage") or {}).get("input_tokens", "?")
     return (
@@ -1741,6 +1766,12 @@ class Check:
 CHECKS: tuple[Check, ...] = (
     Check("nvidia.ultra.plain", "nvidia", "Ultra chat reply (bot payload, thinking off)", check_ultra_plain),
     Check("nvidia.ultra.tools", "nvidia", "Ultra run_tool_loop round-trip", check_ultra_tools),
+    Check(
+        "nvidia.super.tools",
+        "nvidia",
+        "Super run_tool_loop round-trip (the first chat API tier)",
+        check_super_tools,
+    ),
     Check(
         "nvidia.super.router",
         "nvidia",
@@ -1776,22 +1807,22 @@ CHECKS: tuple[Check, ...] = (
     Check("nvidia.flux2_klein.image", "nvidia", "FLUX.2 klein 4B returns an image", check_flux_klein),
     Check("nvidia.flux1_dev.image", "nvidia", "FLUX.1-dev returns an image", check_flux_dev),
     Check(
-        "openrouter.qwen.no_reasoning",
+        "openrouter.dots.no_reasoning",
         "openrouter",
-        "qwen3.8-27b:free chat with reasoning effort none",
-        check_openrouter_qwen_no_reasoning,
+        "dots-3-note-preview:free chat with reasoning effort none",
+        check_openrouter_dots_no_reasoning,
     ),
     Check(
-        "openrouter.qwen.thinking",
+        "openrouter.dots.thinking",
         "openrouter",
-        "qwen3.8-27b:free thinking request (the thinking role's effort)",
-        check_openrouter_qwen_thinking,
+        "dots-3-note-preview:free thinking request (the thinking role's effort)",
+        check_openrouter_dots_thinking,
     ),
     Check(
-        "openrouter.qwen.tools",
+        "openrouter.dots.tools",
         "openrouter",
-        "qwen3.8-27b:free run_tool_loop round-trip",
-        check_openrouter_qwen_tools,
+        "dots-3-note-preview:free run_tool_loop round-trip",
+        check_openrouter_dots_tools,
     ),
     Check(
         "openrouter.ultra.no_reasoning",
@@ -1806,10 +1837,10 @@ CHECKS: tuple[Check, ...] = (
         check_openrouter_ultra_thinking,
     ),
     Check(
-        "openrouter.qwen.vision",
+        "openrouter.dots.vision",
         "openrouter",
-        "qwen3.8-27b:free vision with reasoning effort none (red circle PNG)",
-        check_openrouter_qwen_vision,
+        "dots-3-note-preview:free vision with reasoning effort none (red circle PNG)",
+        check_openrouter_dots_vision,
     ),
     Check(
         "openrouter.super.router",
@@ -1820,15 +1851,16 @@ CHECKS: tuple[Check, ...] = (
     Check(
         "colab.probe",
         "colab",
-        "Colab readiness probe: Ollama 0.35.0, both models loaded wholly in VRAM, pinned digests, think values",
+        f"Colab readiness probe: Ollama {protocol.OLLAMA_MIN_VERSION}+ (the launched release), both models "
+        "loaded wholly in VRAM, think values",
         check_colab_probe,
     ),
     Check("colab.qwen.chat", "colab", "qwen3.8 zh-TW chat reply at COLAB_CHAT_THINK (tier limit)", check_colab_chat),
     Check("colab.qwen.vision", "colab", "qwen3.8 vision (red circle PNG, tier limit)", check_colab_vision),
     Check(
-        "colab.nimble.router",
+        "colab.router",
         "colab",
-        "nimble routing decision via SystemOneRouter (/v1/systemone)",
+        "clef-flash routing decision via SystemOneRouter (/v1/systemone)",
         check_colab_router,
     ),
     *(
@@ -1870,8 +1902,22 @@ def _zh_answer(answer: str, what: str) -> str:
 
 
 def _utility_messages() -> list[dict]:
-    """What MemoryService._summarize_memory sends for a first summary of UTILITY_DIALOGUE."""
-    return summary_messages("", UTILITY_DIALOGUE)
+    """What MemoryService._summarize_memory sends to fold UTILITY_DIALOGUE into UTILITY_SUMMARY."""
+    return summary_messages(UTILITY_SUMMARY, UTILITY_DIALOGUE)
+
+
+def _utility_evidence(answer: str) -> str:
+    """Evidence for a summary update; GateError when MemoryService would
+    reject it, or it drops an old item or adds none."""
+    summary = apply_summary_update(UTILITY_SUMMARY, answer)
+    if not summary:
+        raise GateError(f"not an update in the summary format: {short(answer, 40)}")
+    old_items = summary_items(UTILITY_SUMMARY)
+    lost = sum(item[:-1] not in summary for item in old_items)
+    added = len(summary_items(summary)) - len(old_items) + lost
+    if lost or added < 1:
+        raise GateError(f"the update dropped {lost} old item(s) and added {added}: {short(answer, 40)}")
+    return f"{_zh_answer(answer, 'summary')}, {added} new item(s)"
 
 
 def _image_bytes(data_url: str) -> bytes:
@@ -1958,7 +2004,7 @@ async def _tier_answer(settings: Settings, role: str, tier: Tier, bridge: Bridge
         if response.finish_reason == "length":
             # MemoryService rejects a summary cut off at max_tokens.
             raise GateError(f"summary cut off at max_tokens ({len(answer)} chars)")
-        return _zh_answer(answer, "summary")
+        return _utility_evidence(answer)
 
     prompt, expected = THINKING_PROMPTS[0] if thinking else (_ROLE_TEXT, None)
     response = await tier.provider.generate(
@@ -1987,7 +2033,7 @@ def _tier_check(role: str, index: int, label: str) -> Callable[[GateContext], st
         spec = _tier_spec(settings, role, index, label)
         profile = get_profile(spec.provider, spec.model)
         if profile is not None and profile.protocol == SYSTEMONE:
-            # nimble answers on /v1/systemone, not in JSON: the bot asks
+            # clef-flash answers on /v1/systemone, not in JSON: the bot asks
             # SystemOneRouter, so the gate does too.
             return _colab_router_check(ctx, spec.model)
         state = _inference_session(ctx) if spec.provider == COLAB else None

@@ -10,7 +10,7 @@ work):
 - :class:`~src.providers.fallback_chain.FallbackChain` records each walk
   (:func:`record_walk`): every tier with its outcome and seconds;
 - the orchestrator records who chose the agent (:func:`note_route`), and the
-  Colab router (nimble) its scores, accepted or not
+  Colab router (clef-flash) its scores, accepted or not
   (:func:`note_router_scores`), or why it was not used
   (:func:`note_router_skip`);
 - the image agent records its image tiers as a walk, and the output
@@ -58,11 +58,11 @@ EMPTY = "empty"
 
 # Who chose the agent (RequestTrace.route).
 ROUTE_RULES = "rules"
-ROUTE_NIMBLE = "nimble"
+ROUTE_ROUTER = "router"
 ROUTE_LLM = "llm"
 ROUTE_FALLBACK = "fallback"
 
-# RouterScores.verdict when nimble's decision was used.
+# RouterScores.verdict when the Colab router's decision was used.
 ACCEPTED = "ok"
 
 # How a send went out (RequestTrace.delivery): the free reply, or a push.
@@ -117,7 +117,7 @@ class Walk:
 
 @dataclass(frozen=True)
 class RouterScores:
-    """nimble's answer: probabilities per option (sorted, rounded, only the
+    """The Colab router's answer: probabilities per option (sorted, rounded, only the
     defined options), the confidences against the gate, ``needs_thinking``
     against its thresholds, and what came of it."""
 
@@ -267,8 +267,8 @@ def summary_line(trace: RequestTrace, *, now: float | None = None) -> str:
       ``x<n>``, seconds added up), so two passes over the same tiers
       (thinking, then not) do not show which ran between them;
       ``calls=<n>`` when there were several walks (a tool loop);
-    - ``router_p``: nimble's probabilities, or ``n/a`` (with why nimble
-      was not used, when it was asked);
+    - ``router_p``: the Colab router's probabilities, or ``n/a`` (with why
+      the router was not used, when it was asked);
     - ``delivery``: ``reply`` or ``push`` (any send of the event that was a
       push), absent when nothing went out.
     """
@@ -321,7 +321,7 @@ def _path(answered: Attempt | None) -> str:
 
 
 def _route(trace: RequestTrace) -> str:
-    if trace.route == ROUTE_NIMBLE:
+    if trace.route == ROUTE_ROUTER:
         scores = trace.router_scores
         return f"{_COLAB_PROVIDER}:{scores.model}" if scores else _COLAB_PROVIDER
     if trace.route == ROUTE_LLM:
@@ -342,7 +342,7 @@ def _image_prompt(trace: RequestTrace) -> str:
 def _router_p(trace: RequestTrace) -> str:
     scores = trace.router_scores
     if scores is None:
-        return f"n/a(nimble {trace.router_skip})" if trace.router_skip else "n/a"
+        return f"n/a(router {trace.router_skip})" if trace.router_skip else "n/a"
     agent_ok = "ok" if scores.agent_confidence >= scores.gate else "fail"
     output_ok = "ok" if scores.output_confidence >= scores.gate else "fail"
     think = f"think p={scores.think_p:.2f} (on>={scores.think_on:.2f} off<={scores.think_off:.2f})"

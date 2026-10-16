@@ -16,15 +16,26 @@ What is checked, per id (no API key is ever sent; these are public):
 - NVIDIA FLUX ids are not in that catalog, so their build.nvidia.com page
   (the profile's ``page_slug``) is read for ``"isDeprecated":true`` or a
   ``deprecationNotice``.
-- OpenRouter ids: ``GET /api/v1/models/{id}/endpoints``. No endpoints, or an
-  ``expiration_date`` on the model or an endpoint, is a warning.
-  ``openrouter/free`` is a router with no endpoints of its own and is not
-  checked; neither are Colab ids (pinned on the VM) or image ids without a
-  page.
+- OpenRouter ids: ``GET /api/v1/models/{id}/endpoints``, plus the id's
+  entry in ``GET /api/v1/models``, fetched once per run for every id:
+  OpenRouter publishes ``expiration_date`` only in that list (live
+  2026-10-16: 2026-12-31 for the dots-3 ``:free`` preview, and no such key
+  in its endpoints answer). No endpoints (reported ahead of any date) is
+  not ok; an expiration date (in the list, on the model or on an endpoint)
+  reads ``expiring``. A list that cannot be read fails an OpenRouter check
+  that would otherwise read ok, so it keeps its last state rather than lose
+  an expiry; no endpoints, or a date in the endpoints answer, is still
+  reported. ``openrouter/free`` is a router with no endpoints of its own and
+  is not checked; neither are Colab ids (the VM's fixed list) or image ids
+  without a page.
 
 Results stay in memory for ``/health/detail``. A change of state is logged
-at ERROR (the first check logs only what is not ok). A check that cannot run
-(network error, 5xx) keeps the last known state and records the error.
+(the first check logs only what is not ok): to ``ok`` or ``expiring`` at
+INFO, to any other state at ERROR. An expiration date alone is no alert,
+since the model still answers (dots-3's 2026-12-31 is a backup's, and the
+operator wants no reminder); the ERROR comes when it is actually gone (no
+endpoints, not in the catalog). A check that cannot run (network error,
+5xx) keeps the last known state and records the error.
 """
 
 from __future__ import annotations
@@ -32,7 +43,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any
@@ -46,6 +57,7 @@ from src.utils.logger import logger
 NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models/{model}"
 BUILD_PAGE_URL = "https://build.nvidia.com/{slug}"
 OPENROUTER_ENDPOINTS_URL = "https://openrouter.ai/api/v1/models/{model}/endpoints"
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 # Seconds for one check; they run concurrently, well inside the task budget.
 CHECK_TIMEOUT_SECONDS = 10.0
@@ -192,10 +204,19 @@ class ModelLifecycle:
             follow_redirects=True,
             headers={"Accept": "application/json, text/html;q=0.9"},
         ) as client:
+            # One model list for every OpenRouter id of the run.
+            catalog = (
+                asyncio.ensure_future(_openrouter_catalog(client))
+                if any(target.kind == ENDPOINTS for target in self._targets)
+                else None
+            )
             outcomes = await asyncio.gather(
-                *(self._check(client, target) for target in self._targets),
+                *(self._check(client, target, catalog) for target in self._targets),
                 return_exceptions=True,
             )
+            if catalog is not None:
+                # Settled even when no check got as far as reading it.
+                await asyncio.gather(catalog, return_exceptions=True)
         now = self._clock()
         for target, outcome in zip(self._targets, outcomes, strict=True):
             self._apply(target, outcome, now)
@@ -208,12 +229,18 @@ class ModelLifecycle:
 
     # ── Checks ───────────────────────────────────────────────
 
-    async def _check(self, client: httpx.AsyncClient, target: LifecycleTarget) -> LifecycleResult:
+    async def _check(
+        self,
+        client: httpx.AsyncClient,
+        target: LifecycleTarget,
+        catalog: Awaitable[dict[str, dict]] | None,
+    ) -> LifecycleResult:
         if target.kind == CATALOG:
             return await _check_nvidia_catalog(client, target.model)
         if target.kind == PAGE:
             return await _check_build_page(client, target.page_slug)
-        return await _check_openrouter_endpoints(client, target.model)
+        assert catalog is not None  # run() fetches it whenever an id needs it
+        return await _check_openrouter_endpoints(client, target.model, catalog)
 
     def _apply(self, target: LifecycleTarget, outcome: LifecycleResult | BaseException, now: float) -> None:
         label = target.label
@@ -235,7 +262,10 @@ class ModelLifecycle:
 
         before = previous.state if previous is not None else None
         if before != result.state and not (before in (None, UNKNOWN) and result.state == OK):
-            logger.error(
+            # A model that still answers (ok, or only an expiry date) is
+            # information, not an alert.
+            log = logger.info if result.state in (OK, EXPIRING) else logger.error
+            log(
                 f"Model lifecycle: {label} is {result.state} (was {before or 'unchecked'}): "
                 f"{result.detail}"
             )
@@ -268,7 +298,23 @@ async def _check_build_page(client: httpx.AsyncClient, slug: str) -> LifecycleRe
     return LifecycleResult(OK, f"build.nvidia.com/{slug} carries no deprecation notice")
 
 
-async def _check_openrouter_endpoints(client: httpx.AsyncClient, model: str) -> LifecycleResult:
+async def _openrouter_catalog(client: httpx.AsyncClient) -> dict[str, dict]:
+    """Id → entry of OpenRouter's public model list."""
+    response = await client.get(OPENROUTER_MODELS_URL)
+    if response.status_code != 200:
+        raise _CheckFailed(f"HTTP {response.status_code} from the OpenRouter model list")
+    try:
+        data = response.json().get("data")
+    except (ValueError, AttributeError) as exc:
+        raise _CheckFailed("the OpenRouter model list is not a JSON object") from exc
+    if not isinstance(data, list):
+        raise _CheckFailed("the OpenRouter model list has no data list")
+    return {str(item["id"]): item for item in data if isinstance(item, dict) and item.get("id")}
+
+
+async def _check_openrouter_endpoints(
+    client: httpx.AsyncClient, model: str, catalog: Awaitable[dict[str, dict]]
+) -> LifecycleResult:
     response = await client.get(OPENROUTER_ENDPOINTS_URL.format(model=model))
     if response.status_code == 404:
         return LifecycleResult(NOT_IN_CATALOG, "HTTP 404: not in the OpenRouter catalog")
@@ -281,15 +327,25 @@ async def _check_openrouter_endpoints(client: httpx.AsyncClient, model: str) -> 
     if not isinstance(data, dict):
         raise _CheckFailed("OpenRouter answered without a data object")
     endpoints = [item for item in data.get("endpoints") or [] if isinstance(item, dict)]
-    expirations = sorted(
-        str(value)
-        for value in (data.get("expiration_date"), *(item.get("expiration_date") for item in endpoints))
-        if value
-    )
-    if expirations:
-        return LifecycleResult(EXPIRING, f"OpenRouter lists an expiration date: {expirations[0]}", expirations[0])
+    own_dates = [data.get("expiration_date"), *(item.get("expiration_date") for item in endpoints)]
+    try:
+        listed = (await catalog).get(model) or {}
+    except Exception:
+        # The list only adds an expiry. What this answer shows by itself (no
+        # endpoint left, or a date of its own) still stands; only a would-be
+        # ok fails the check, since the list might have held a date.
+        if endpoints and not any(own_dates):
+            raise
+        listed = {}
+    expirations = sorted(str(value) for value in (listed.get("expiration_date"), *own_dates) if value)
+    eol = expirations[0] if expirations else None
     if not endpoints:
-        return LifecycleResult(NO_ENDPOINTS, "OpenRouter lists no endpoint serving it")
+        # Before the expiry: a preview's list entry carries its date all
+        # along, and a withdrawn one (qwen3.8 :free from 2026-10-13) must not
+        # keep reading as merely expiring.
+        return LifecycleResult(NO_ENDPOINTS, "OpenRouter lists no endpoint serving it", eol)
+    if eol:
+        return LifecycleResult(EXPIRING, f"OpenRouter lists an expiration date: {eol}", eol)
     providers = ", ".join(sorted({str(item.get("provider_name") or "?") for item in endpoints}))
     return LifecycleResult(OK, f"{len(endpoints)} endpoint(s): {providers}"[:_DETAIL_LIMIT])
 

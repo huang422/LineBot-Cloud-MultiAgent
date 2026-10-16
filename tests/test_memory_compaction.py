@@ -21,11 +21,18 @@ from src.services import memory_service as memory_service_module
 from src.services.memory_backends import InMemoryBackend, MemoryBackendError
 from src.services.memory_service import (
     EPISODE_SNIPPET_CHARS,
+    SUMMARY_MAX_CHARS,
     MemoryService,
     _append_snippet,
+    _join_items,
+    _trimmed_items,
+    apply_summary_update,
     episode_excerpt,
     episode_passage_text,
     episode_snippet,
+    strip_summary_meta,
+    summary_items,
+    summary_messages,
 )
 from src.services.model_health import ModelHealth
 
@@ -796,12 +803,417 @@ class FailedCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("MEMORY_SUMMARY_MAX_TOKENS=384", warnings[0])
 
 
+class SummaryUpdateTests(unittest.TestCase):
+    """The summary request asks for the change only, and the code applies it
+    (2026-10-16: asked for the whole summary, Super copied the old one and
+    appended until a 794-character one no longer fitted max_tokens)."""
+
+    OLD = "甲喜歡爬山；乙在學鋼琴；丙計畫年底去京都。"
+
+    def test_the_request_numbers_the_old_items_without_meta_sentences(self) -> None:
+        messages = summary_messages(
+            "甲喜歡爬山；乙在學鋼琴。以上內容皆為已確認事實，予以保留。目前無衝突內容需要移除。",
+            "User: 嗨",
+        )
+
+        request = messages[1]["content"]
+        self.assertIn("：\n[1] 甲喜歡爬山；\n[2] 乙在學鋼琴。\n\n更新要求：", request)
+        self.assertNotIn("予以保留", request)
+        self.assertNotIn("無衝突", request)
+        self.assertTrue(request.endswith("最近對話：\nUser: 嗨"))
+
+    def test_an_update_keeps_what_it_does_not_remove_and_adds_each_new_item_once(self) -> None:
+        answer = "移除：2\n- 乙改學吉他\n- 甲喜歡爬山\n- 丁養了一隻柴犬。"
+
+        self.assertEqual(
+            apply_summary_update(self.OLD, answer),
+            "甲喜歡爬山；丙計畫年底去京都。乙改學吉他；丁養了一隻柴犬。",
+        )
+        self.assertEqual(apply_summary_update(self.OLD, "移除：無"), self.OLD)
+        self.assertEqual(apply_summary_update("", "移除：無"), "")
+
+    def test_an_answer_without_the_removal_line(self) -> None:
+        # Bullets only, or under a heading: new items, nothing removed.
+        for answer in ("- 丁養了柴犬\n- 戊喜歡貓", "新項目：\n- 丁養了柴犬\n- 戊喜歡貓", "**新增**：丁養了柴犬\n- 戊喜歡貓"):
+            with self.subTest(answer=answer):
+                self.assertEqual(
+                    apply_summary_update(self.OLD, answer),
+                    "甲喜歡爬山；乙在學鋼琴；丙計畫年底去京都。丁養了柴犬；戊喜歡貓。",
+                )
+        # Anything else is a whole summary from a tier that ignored the
+        # format: it may replace a blank summary; else it must repeat at
+        # least half the old items word for word, and only adds its other
+        # items (2026-10-16 review: the old items it left out were lost)...
+        self.assertEqual(apply_summary_update("", "使用者喜歡露營。"), "使用者喜歡露營。")
+        self.assertEqual(apply_summary_update(self.OLD, "甲喜歡爬山；乙在學鋼琴；丁養了柴犬。"), self.OLD + "丁養了柴犬。")
+        self.assertEqual(apply_summary_update(self.OLD, "甲喜歡爬山；\n乙在學鋼琴；\n丁養了柴犬"), self.OLD + "丁養了柴犬。")
+        # ...never a partial one (2026-10-16 review: "丁養了柴犬。" became
+        # the whole memory). One that only says nothing changed keeps the
+        # old summary, like "移除：無"; an empty one is blank, which
+        # MemoryService rejects.
+        for answer in ("使用者喜歡露營。", "丁養了柴犬。", "甲喜歡爬山；丁養了柴犬。"):
+            with self.subTest(answer=answer):
+                self.assertIsNone(apply_summary_update(self.OLD, answer))
+        for answer in ("無", "無需更新。", "最近對話沒有新的長期資訊。"):
+            with self.subTest(answer=answer):
+                self.assertEqual(apply_summary_update(self.OLD, answer), self.OLD)
+        self.assertEqual(apply_summary_update(self.OLD, " \n"), "")
+        self.assertEqual(apply_summary_update("", "最近對話沒有新的長期資訊。"), "")
+
+    def test_a_removal_line_in_another_form_is_still_one(self) -> None:
+        """Regression (2026-10-16 review): "移除項目：無", "**移除**：無" and
+        the like made the answer a whole summary, or an item."""
+        for line in ("移除項目：無", "移除編號：無", "要移除：無", "移除 無", "**移除**：無", "1. 移除：無", "### 移除：無"):
+            with self.subTest(line=line):
+                self.assertEqual(apply_summary_update(self.OLD, f"{line}\n- 對花生過敏"), self.OLD + "對花生過敏。")
+        self.assertEqual(
+            apply_summary_update(self.OLD, "移除編號：3\n- 對花生過敏"), "甲喜歡爬山；乙在學鋼琴；對花生過敏。"
+        )
+
+    def test_only_the_numbers_the_removal_line_lists_are_removed(self) -> None:
+        """Regression (2026-10-16 review): every digit on the line counted,
+        so "移除：無，第2項仍有效" removed item 2."""
+        for value, summary in (
+            ("無，第2項仍有效", self.OLD),
+            ("無（共 5 項皆仍有效）", self.OLD),
+            ("none (2 is still true)", self.OLD),
+            ("[3] 丙已出發（於 2 號）", "甲喜歡爬山；乙在學鋼琴。"),
+            ("第1、3項", "乙在學鋼琴。"),
+            ("2 和 3（已過期）", "甲喜歡爬山。"),
+            # A run of digits is no item number (int() refuses 4301 digits).
+            ("9" * 5000, self.OLD),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(apply_summary_update(self.OLD, f"移除：{value}"), summary)
+
+    def test_headings_fences_and_nothing_new_are_not_items(self) -> None:
+        """Regression (2026-10-16 review): "新增：無", "- 無" and a code
+        fence were stored as items and kept on every later pass."""
+        for answer in (
+            "移除：無\n新增：無",
+            "移除：無\n- 無",
+            "移除：無\n- （無新增項目）",
+            "移除：無\n最近對話沒有新的長期資訊。",
+            "```\n移除：無\n```",
+            "**移除**：無\n**新增**：\n- （無）",
+        ):
+            with self.subTest(answer=answer):
+                self.assertEqual(apply_summary_update(self.OLD, answer), self.OLD)
+        # Regression (2026-10-16 review): a label line, a closing remark and
+        # the numbers under a bare "移除：" were stored as items.
+        for answer in (
+            "```text\n移除：無\n新增：\n- 丁養了柴犬\n```",
+            "新增項目如下：\n- 丁養了柴犬",
+            "以下為新增項目：\n丁養了柴犬",
+            "移除：無\n- 丁養了柴犬\n（其餘項目保留）",
+            "移除：無\n- 丁養了柴犬\n其餘舊項目皆保留。",
+        ):
+            with self.subTest(answer=answer):
+                self.assertEqual(apply_summary_update(self.OLD, answer), self.OLD + "丁養了柴犬。")
+        for answer in ("**移除**：\n- 2", "移除：\n2", "移除的項目：\n\n- 2", "移除：\n- [2]\n- 丁養了柴犬"):
+            with self.subTest(answer=answer):
+                self.assertEqual(
+                    apply_summary_update(self.OLD, answer).removesuffix("丁養了柴犬。"), "甲喜歡爬山；丙計畫年底去京都。"
+                )
+        # An item that only starts like a heading, or a removal line, is one.
+        self.assertEqual(
+            apply_summary_update(self.OLD, "移除：無\n- 新增一隻貓：叫小黑"), self.OLD + "新增一隻貓：叫小黑。"
+        )
+        self.assertEqual(
+            apply_summary_update(self.OLD, "- 移除了舊路由器：已換新"), self.OLD + "移除了舊路由器：已換新。"
+        )
+
+    def test_an_old_item_echoed_with_its_number_or_a_comma_is_not_added_again(self) -> None:
+        """Regression (2026-10-16 review): "- [2] 乙改學吉他" was stored with
+        its "[2]", and "[1] 甲喜歡爬山；" or "甲喜歡爬山，" was added again."""
+        self.assertEqual(
+            apply_summary_update(self.OLD, "移除：2\n- [2] 乙改學吉他\n[1] 甲喜歡爬山；\n- 甲喜歡爬山，"),
+            "甲喜歡爬山；丙計畫年底去京都。乙改學吉他。",
+        )
+        self.assertEqual(apply_summary_update(self.OLD, "移除：無\n- 丁養了柴犬，"), self.OLD + "丁養了柴犬。")
+
+    def test_notes_about_the_update_are_dropped_and_lookalike_facts_stay(self) -> None:
+        self.assertEqual(
+            strip_summary_meta(
+                "以下是更新後的長期記憶摘要：甲喜歡爬山；天氣查詢屬即時資訊，不納入長期記憶；"
+                "以上內容皆為已確認事實，予以保留。目前無衝突內容需要移除。"
+            ),
+            "甲喜歡爬山。",
+        )
+        self.assertEqual(
+            apply_summary_update(self.OLD, "移除：無\n- 今天問了股價，屬一次性查詢，不納入長期記憶。"),
+            self.OLD,
+        )
+        facts = "乙表示行程無需修改；丙的晨跑習慣維持不變；丁說和室友沒有衝突。"
+        self.assertEqual(strip_summary_meta(facts), facts)
+
+    def test_a_left_out_note_takes_only_what_it_is_about(self) -> None:
+        """Regression (2026-10-16 review): the whole sentence went, with
+        the lasting facts before the note."""
+        cases = {
+            # The note has its own subject: only its clause goes.
+            "使用者關注台積電，股價查詢屬即時資訊不納入長期記憶。喜歡貓。": "使用者關注台積電。喜歡貓。",
+            "使用者喜歡貓，股價屬即時資訊不納入長期記憶，住台北。": "使用者喜歡貓，住台北。",
+            # It leads a later clause: the clauses before are what it is about.
+            "天氣查詢屬即時資訊，不納入長期記憶；甲喜歡爬山。": "甲喜歡爬山。",
+            "某日的收盤價，此為即時資訊，不構成長期關注的投資主題，故不納入長期記憶摘要；甲喜歡爬山。": "甲喜歡爬山。",
+            # ...and the clauses after it stay (2026-10-16 review: they went too).
+            "天氣查詢屬即時資訊，不納入長期記憶，乙住在台北。": "乙住在台北。",
+            # A fact that only reads like one stays.
+            "使用者不屬於長期關注美股的投資人；喜歡貓。": "使用者不屬於長期關注美股的投資人；喜歡貓。",
+        }
+        for text, cleaned in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(strip_summary_meta(text), cleaned)
+
+    def test_trimming_keeps_the_best_ranked_items_that_fit_in_their_order(self) -> None:
+        items = summary_items("甲喜歡爬山；乙在學鋼琴；丙計畫年底去京都賞楓，預算五萬元；丁今天問了股價。")
+        self.assertEqual([len(item) for item in items], [6, 6, 17, 8])
+
+        # 3 and 1 fit in 25; 2 would not, nor would 4 (unranked).
+        self.assertEqual(
+            _join_items(_trimmed_items(items, "3,1,2", 25)), "甲喜歡爬山；丙計畫年底去京都賞楓，預算五萬元。"
+        )
+        # An item that does not fit is skipped, not the end of the ranking.
+        self.assertEqual(_join_items(_trimmed_items(items, "3, 1", 10)), "甲喜歡爬山。")
+        self.assertEqual(_join_items(_trimmed_items(items, "保留：[3] > [1]。", 10)), "甲喜歡爬山。")
+
+    def test_only_the_cap_decides_what_a_trim_loses(self) -> None:
+        """Regression (2026-10-16 review): items the ranking left out went
+        even when they fitted, and any digit in a prose answer was a rank."""
+        items = summary_items("".join(_fact(f"事實{n}", 101) for n in range(1, 5)) + _fact("事實5", 51))
+
+        # 1 and 3 first, then 2 and 5 (unranked) where they still fit.
+        kept = _join_items(_trimmed_items(items, "1,3", 400))
+        self.assertEqual([f"事實{n}" in kept for n in range(1, 6)], [True, True, True, False, True])
+        self.assertEqual(len(kept), 354)
+        for answer in ("台積電股價 1,050 元", "保留：1、2。第 6 項為一次性資訊", "沒有"):
+            with self.subTest(answer=answer):
+                self.assertIsNone(_trimmed_items(items, answer, 400))
+
+
+def _fact(name: str, length: int) -> str:
+    """A synthetic summary item of exactly *length* characters."""
+    return name + "細" * (length - len(name) - 1) + "；"
+
+
+class SummaryCapTests(unittest.IsolatedAsyncioTestCase):
+    """A summary over SUMMARY_MAX_CHARS keeps the items a tier ranks highest."""
+
+    def _seeded(self, chain, summary: str) -> MemoryService:
+        service = _service(chain)
+        doc = service._default_document(source_type="user", chat_scope="user", chat_id="U1")
+        doc["summary_text"] = summary
+        service.backend_instance.store["user::U1"] = doc
+        return service
+
+    @staticmethod
+    def _answering(*, ranking: str, update: str, requests: list):
+        def generate(**kwargs):
+            messages = kwargs["messages"]
+            requests.append(messages[1]["content"])
+            trim = messages[0]["content"] == memory_service_module._SUMMARY_TRIM_SYSTEM_PROMPT
+            if trim and ranking == "fail":
+                raise ProviderError("m", 503, "busy")
+            return ProviderResponse(text=ranking if trim else update, model="m")
+
+        return _chain(side_effect=generate)
+
+    async def test_an_over_long_summary_is_trimmed_before_the_update(self) -> None:
+        """Regression (2026-10-16): Super copied a 794-character summary
+        whole, so every pass was cut off at max_tokens."""
+        old = "".join(_fact(f"事實{n}", 102) for n in range(1, 6))  # 510 characters
+        requests: list[str] = []
+        chain = self._answering(ranking="2,1,3,4,5", update="移除：無\n- 對花生過敏", requests=requests)
+        service = self._seeded(chain, old)
+
+        await _turn(service, "我對花生過敏", "了解")
+
+        ranking_request, update_request = requests
+        self.assertIn(f"上限 {SUMMARY_MAX_CHARS} 字，目前 5 項、共 510 字", ranking_request)
+        # 2, 1 and 3 fit in 400 characters; 4 and 5 are left out.
+        self.assertIn("[3] 事實3", update_request)
+        self.assertNotIn("事實4", update_request)
+        stored = _stored(service, "user::U1")
+        self.assertEqual(
+            stored["summary_text"],
+            _fact("事實1", 102) + _fact("事實2", 102) + _fact("事實3", 102)[:-1] + "。對花生過敏。",
+        )
+        self.assertEqual(stored["recent_messages"], [])
+
+    async def test_an_update_over_the_cap_keeps_its_new_items_and_the_best_ranked_old_ones(self) -> None:
+        """Regression (2026-10-16 review): the trim after the update ranked
+        a just-learned fact below an old item and dropped it."""
+        old = "".join(_fact(f"事實{n}", 102) for n in range(1, 4))  # 306 characters
+        new = "新" * 149
+        requests: list[str] = []
+        chain = self._answering(ranking="2,3,1", update=f"移除：無\n- {new}", requests=requests)
+        service = self._seeded(chain, old)
+
+        await _turn(service, "問", "答")
+
+        update_request, ranking_request = requests
+        # Only the old items are ranked, for what the new one leaves.
+        self.assertIn(f"上限 {SUMMARY_MAX_CHARS - 150} 字，目前 3 項、共 306 字", ranking_request)
+        self.assertNotIn("新新", ranking_request)
+        summary = _stored(service, "user::U1")["summary_text"]
+        self.assertEqual(summary, _fact("事實2", 102) + _fact("事實3", 102) + new + "。")
+        self.assertLessEqual(len(summary), SUMMARY_MAX_CHARS)
+
+    async def test_new_items_over_half_the_cap_are_ranked_with_the_old_ones(self) -> None:
+        old = "".join(_fact(f"事實{n}", 102) for n in range(1, 4))
+        new = ["新" * 59, "甲" * 59, "乙" * 59, "丙" * 59]  # 240 characters with their "；"
+        requests: list[str] = []
+        chain = self._answering(
+            ranking="4,5,6,7,1", update="移除：無\n" + "\n".join(f"- {item}" for item in new), requests=requests
+        )
+        service = self._seeded(chain, old)
+
+        await _turn(service, "問", "答")
+
+        self.assertIn("目前 7 項", requests[1])
+        summary = _stored(service, "user::U1")["summary_text"]
+        self.assertEqual(summary, _fact("事實1", 102) + "；".join(new) + "。")
+
+    async def test_an_item_longer_than_the_cap_is_trimmed_in_pieces(self) -> None:
+        """Regression (2026-10-16 review): a legacy one-sentence summary
+        never fitted, so the trim after an update kept only the new item."""
+        old = "，".join(f"子句{n:02d}" + "細" * 21 for n in range(18)) + "。"  # 18 clauses, 468 characters
+        requests: list[str] = []
+        chain = self._answering(ranking="1,3", update="移除：無\n- 新", requests=requests)
+        service = self._seeded(chain, old)
+
+        await _turn(service, "問", "答")
+
+        # The trim before the update ranked six pieces of three clauses.
+        self.assertIn("目前 6 項、共 468 字", requests[0])
+        # 1 and 3, then 2, 4 and 5 fit (390 characters); the new item follows.
+        summary = _stored(service, "user::U1")["summary_text"]
+        self.assertEqual(len(summary), 392)
+        self.assertTrue(summary.startswith("子句00"), summary[:20])
+        self.assertTrue(summary.endswith("子句14" + "細" * 21 + "。新。"), summary[-10:])
+
+    async def test_a_ranking_that_is_cut_off_or_prose_is_no_ranking(self) -> None:
+        old = "".join(_fact(f"事實{n}", 102) for n in range(1, 6))
+        for response in (
+            ProviderResponse(text="2,1", model="m", finish_reason="length"),
+            ProviderResponse(text="保留：1、2。第 6 項為一次性資訊", model="m"),
+        ):
+            with self.subTest(ranking=response.text):
+
+                def generate(response=response, **kwargs):
+                    if kwargs["messages"][0]["content"] == memory_service_module._SUMMARY_TRIM_SYSTEM_PROMPT:
+                        return response
+                    return ProviderResponse(text="移除：無", model="m")
+
+                service = self._seeded(_chain(side_effect=generate), old)
+                with patch.object(memory_service_module.logger, "warning"):
+                    await _turn(service, "問", "答")
+
+                # Kept whole: the next pass ranks it again.
+                self.assertEqual(_stored(service, "user::U1")["summary_text"], old[:-1] + "。")
+
+    async def test_a_summary_no_tier_ranks_is_kept_whole(self) -> None:
+        old = "".join(_fact(f"事實{n}", 102) for n in range(1, 6))
+        requests: list[str] = []
+        chain = self._answering(ranking="fail", update="移除：無\n- 對花生過敏", requests=requests)
+        service = self._seeded(chain, old)
+
+        with patch.object(memory_service_module.logger, "warning") as log_warning:
+            await _turn(service, "我對花生過敏", "了解")
+
+        # Nothing is lost: the next pass tries the ranking again.
+        self.assertEqual(_stored(service, "user::U1")["summary_text"], old[:-1] + "；對花生過敏。")
+        self.assertEqual(len(requests), 3)  # ranking, update, ranking
+        self.assertIn("[5] 事實5", requests[1])
+        trim_warnings = [c.args[0] for c in log_warning.call_args_list if "trim failed" in c.args[0]]
+        self.assertEqual(len(trim_warnings), 2)
+
+    async def test_a_first_summary_with_nothing_to_keep_is_empty(self) -> None:
+        service = _service(_chain("移除：無"))
+
+        await _turn(service, "哈哈", "😄")
+
+        stored = _stored(service, "user::U1")
+        self.assertEqual((stored["summary_text"], stored["recent_messages"]), ("", []))
+
+    async def test_an_answer_off_the_format_moves_on_to_the_next_tier(self) -> None:
+        """Regression (2026-10-16 review): an answer that ignored the format
+        replaced the whole memory, "丁養了柴犬。" included."""
+        partial = SimpleNamespace(generate=AsyncMock(return_value=ProviderResponse(text="丁養了柴犬。", model="a")))
+        update = SimpleNamespace(
+            generate=AsyncMock(return_value=ProviderResponse(text="移除：無\n- 丁養了柴犬", model="b"))
+        )
+        service = MemoryService(
+            _settings(),
+            summary_chain=FallbackChain(ModelHealth()),
+            summary_targets=[Tier(partial, "a"), Tier(update, "b")],
+            backend=InMemoryBackend(),
+            clock=_Clock(),
+        )
+        doc = service._default_document(source_type="user", chat_scope="user", chat_id="U1")
+        doc["summary_text"] = "甲喜歡爬山；乙在學鋼琴。"
+        service.backend_instance.store["user::U1"] = doc
+
+        with patch.object(memory_service_module.logger, "warning") as log_warning:
+            await _turn(service, "我養了柴犬", "好")
+
+        stored = _stored(service, "user::U1")
+        self.assertEqual((stored["summary_text"], stored["summary_model"]), ("甲喜歡爬山；乙在學鋼琴。丁養了柴犬。", "b"))
+        self.assertTrue(
+            any("a did not follow the update format" in c.args[0] for c in log_warning.call_args_list)
+        )
+
+    async def test_a_model_that_hung_is_not_waited_on_again_in_the_same_pass(self) -> None:
+        """Regression (2026-10-16 review): the trims and the update each
+        walked the tiers afresh, so a hung model was waited on three times
+        within one 180 s deadline."""
+
+        async def hang(*args, **kwargs):
+            await asyncio.sleep(10)
+
+        def answer(*args, **kwargs):
+            trim = kwargs["messages"][0]["content"] == memory_service_module._SUMMARY_TRIM_SYSTEM_PROMPT
+            return ProviderResponse(text="1,2,3" if trim else "移除：無\n- 對花生過敏", model="b")
+
+        hung = SimpleNamespace(generate=AsyncMock(side_effect=hang))
+        working = SimpleNamespace(generate=AsyncMock(side_effect=answer))
+        service = MemoryService(
+            _settings(),
+            # A 0.05 s tier is a fair try here (the default floor is 5 s).
+            summary_chain=FallbackChain(ModelHealth(), min_tier_seconds=0.01),
+            summary_targets=[Tier(hung, "a", timeout_s=0.05), Tier(working, "b")],
+            backend=InMemoryBackend(),
+            clock=_Clock(),
+        )
+        doc = service._default_document(source_type="user", chat_scope="user", chat_id="U1")
+        doc["summary_text"] = "".join(_fact(f"事實{n}", 102) for n in range(1, 6))
+        service.backend_instance.store["user::U1"] = doc
+
+        with patch.object(memory_service_module.logger, "warning"):
+            await _turn(service, "我對花生過敏", "了解")
+
+        self.assertEqual(hung.generate.await_count, 1)  # the trim before the update only
+        self.assertEqual(working.generate.await_count, 2)  # that trim, then the update
+        self.assertTrue(_stored(service, "user::U1")["summary_text"].endswith("對花生過敏。"))
+
+    async def test_an_update_that_removes_everything_is_rejected(self) -> None:
+        service = self._seeded(_chain("移除：1,2"), "甲喜歡爬山；乙在學鋼琴。")
+
+        await _turn(service, "問", "答")
+
+        stored = _stored(service, "user::U1")
+        self.assertEqual(stored["summary_text"], "甲喜歡爬山；乙在學鋼琴。")
+        self.assertEqual(_contents(service, "user::U1"), ["問", "答"])
+
+
 class EpisodeTests(unittest.IsolatedAsyncioTestCase):
     async def test_at_most_one_episode_an_hour_and_later_compactions_join_the_next(self) -> None:
         clock = _Clock()
         embedding = _FakeEmbedding()
         service = _service(
-            _chain("摘要一", "摘要二", "摘要三"),
+            # A later pass replaces the one old item (the update format).
+            _chain("摘要一", "移除：1\n- 摘要二", "移除：1\n- 摘要三"),
             clock=clock,
             embedding=embedding,
             compaction_debounce_seconds=0,
@@ -815,7 +1227,7 @@ class EpisodeTests(unittest.IsolatedAsyncioTestCase):
         clock.now = T0 + 600
         await _turn(service, "三", "四")
         stored = _stored(service, "user::U1")
-        self.assertEqual(stored["summary_text"], "摘要二")
+        self.assertEqual(stored["summary_text"], "摘要二。")
         self.assertEqual(len(episodes["user::U1"]), 1)
         self.assertEqual(stored["episode_pending_text"], "User: 三\nAssistant: 四")
         self.assertEqual(stored["last_episode_at"], T0)
@@ -825,12 +1237,12 @@ class EpisodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(episodes["user::U1"]), 2)
         second = episodes["user::U1"][1]
         self.assertEqual(second["snippet"], "User: 三\nAssistant: 四\nUser: 五\nAssistant: 六")
-        self.assertEqual(second["summary"], "摘要三")
+        self.assertEqual(second["summary"], "摘要三。")
         self.assertEqual(second["ts"], T0 + 3600)
         stored = _stored(service, "user::U1")
         self.assertEqual((stored["episode_pending_text"], stored["last_episode_at"]), ("", T0 + 3600))
         # Summary first (the embeddings API truncates the end), then the talk.
-        self.assertEqual(embedding.passages[-1], "摘要三\n\n" + second["snippet"])
+        self.assertEqual(embedding.passages[-1], "摘要三。\n\n" + second["snippet"])
         self.assertEqual(embedding.passages[-1], episode_passage_text(second))
         self.assertNotIn("messages", second)
 
@@ -848,7 +1260,7 @@ class EpisodeTests(unittest.IsolatedAsyncioTestCase):
 
         embedding.embed_passage = embed
         service = _service(
-            _chain("摘要一", "摘要二"), clock=clock, embedding=embedding, compaction_debounce_seconds=0
+            _chain("摘要一", "移除：1\n- 摘要二"), clock=clock, embedding=embedding, compaction_debounce_seconds=0
         )
 
         with patch.object(memory_service_module.logger, "warning") as log_warning:
@@ -868,7 +1280,7 @@ class EpisodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             episode["snippet"], "User: 我養了一隻貓叫小黑\nAssistant: 好可愛\nUser: 牠三歲\nAssistant: 了解"
         )
-        self.assertEqual((episode["summary"], episode["embedding_model"]), ("摘要二", "fake-embed"))
+        self.assertEqual((episode["summary"], episode["embedding_model"]), ("摘要二。", "fake-embed"))
         stored = _stored(service, "user::U1")
         self.assertEqual((stored["episode_pending_text"], stored["last_episode_at"]), ("", T0 + 60))
 
@@ -888,7 +1300,7 @@ class EpisodeTests(unittest.IsolatedAsyncioTestCase):
     async def test_pending_text_keeps_only_the_newest_characters_of_a_busy_hour(self) -> None:
         clock = _Clock()
         service = _service(
-            _chain(*(f"摘要{i}" for i in range(12))),
+            _chain("摘要0", *(f"移除：1\n- 摘要{i}" for i in range(1, 12))),
             clock=clock,
             embedding=_FakeEmbedding(),
             compaction_debounce_seconds=0,
@@ -907,7 +1319,7 @@ class EpisodeTests(unittest.IsolatedAsyncioTestCase):
         # The hour's first compactions were pushed out; the summary is all
         # that is left of them.
         self.assertNotIn("第0次", pending)
-        self.assertEqual(stored["summary_text"], "摘要10")
+        self.assertEqual(stored["summary_text"], "摘要10。")
 
     async def test_a_message_cannot_forge_another_speakers_line_in_the_summary_request(self) -> None:
         """Regression: user text keeps its newlines (sanitize_input), and the

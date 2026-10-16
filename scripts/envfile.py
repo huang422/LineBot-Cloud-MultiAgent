@@ -112,6 +112,12 @@ _MODEL_ROLES_KEY = "MODEL_ROLES"
 # on every live call, OpenRouter's Gemma :free tiers answered 429 to every
 # one). The ids still work, so check-v3 only notes a MODEL_ROLES naming one.
 _DROPPED_MODEL_FAMILIES = ("gemma",)
+# COLAB_ROUTER_CONFIDENCE's defaults before 2026-10-16 (0.75, then 0.90).
+# clef-flash scores real messages 0.39-0.43, so either gate hands every one
+# to the API router; the default is now 0.0 (argmax). A valid setting, so
+# check-v3 only notes it.
+_ROUTER_GATE_KEY = "COLAB_ROUTER_CONFIDENCE"
+_OLD_ROUTER_GATES = (0.75, 0.9)
 
 # ── Cloud Build upload guard ─────────────────────────────────
 # Paths (as printed by `gcloud meta list-files-for-upload`) that must never
@@ -395,6 +401,8 @@ class V3Report:
     # MODEL_ROLES names a model of a family the defaults dropped.
     # Informational, like ``removed``.
     dropped_model_roles: bool = False
+    # COLAB_ROUTER_CONFIDENCE keeps an old default. Informational too.
+    old_router_gate: bool = False
     # Quoted values python-dotenv cannot parse: the app skips these keys.
     malformed: tuple[str, ...] = ()
     # Lines that are no KEY=VALUE, by number (their text may be a secret).
@@ -454,9 +462,17 @@ def check_v3(
         dropped_model_roles=any(
             family in model.lower() for model in role_models or () for family in _DROPPED_MODEL_FAMILIES
         ),
+        old_router_gate=_number(normalized.get(_ROUTER_GATE_KEY, "")) in _OLD_ROUTER_GATES,
         malformed=tuple(sorted(malformed)),
         invalid_lines=tuple(invalid_lines),
     )
+
+
+def _number(value: str) -> float | None:
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 def _model_roles_ids(raw: str) -> list[str] | None:
@@ -541,6 +557,13 @@ def format_v3_report(report: V3Report, env_file: Path) -> list[str]:
             f"[v3-check] note: {_MODEL_ROLES_KEY} names a Gemma model, which the defaults "
             "dropped on 2026-10-01 (it hung on NVIDIA NIM and was rate limited on OpenRouter); "
             f"replace that tier by hand in {_display_path(env_file)} unless you mean to keep it"
+        )
+    if report.old_router_gate:
+        lines.append(
+            f"[v3-check] note: {_ROUTER_GATE_KEY} keeps an old default (0.75 or 0.90), so "
+            "clef-flash hands nearly every message to the API router (real ones score "
+            f"0.39-0.43); set it to 0.0, the default since 2026-10-16, in {_display_path(env_file)} "
+            "or delete it, unless you mean to keep it"
         )
     if report.ok:
         lines.append("[v3-check] ok: no retired model ids or legacy model keys")

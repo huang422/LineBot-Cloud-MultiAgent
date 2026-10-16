@@ -1,4 +1,4 @@
-"""The Colab tiers' chat client: Ollama 0.35's native ``POST /api/chat``.
+"""The Colab tiers' chat client: Ollama's native ``POST /api/chat``.
 
 Before any request, :meth:`OllamaChatProvider.generate` raises
 :class:`~src.providers.base.SkipTierError` (the chain moves on, nothing is

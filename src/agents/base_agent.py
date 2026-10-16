@@ -179,7 +179,10 @@ class BaseAgent(ABC):
 
         A Colab tier (``Tier.shares_time``) the thinking tiers already have
         is not tried again with thinking off: a slow session gets one half
-        of the time left, not a second share of the API tiers' half.
+        of the time left, not a second share of the API tiers' half. An API
+        model that timed out as a thinking tier stays in the list; the chain
+        skips it there when that was a fair try (a model that timed out is
+        not called again in the same walk, :mod:`src.providers.fallback_chain`).
         """
         thinking = not request.disable_thinking
         if self.vision_targets and has_image_context(request):

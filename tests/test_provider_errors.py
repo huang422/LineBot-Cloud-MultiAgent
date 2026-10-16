@@ -1,5 +1,7 @@
 """HTTP status -> provider error mapping, NVCF 202 polling and reply parsing.
 
+Also a 200 whose body is an ``error`` object, mapped by its ``code``.
+
 Every request here goes through ``httpx.MockTransport``; nothing is sent.
 """
 
@@ -11,6 +13,7 @@ from unittest.mock import patch
 
 import httpx
 
+from src.providers import openrouter_provider
 from src.providers.base import (
     AuthError,
     CreditsError,
@@ -26,6 +29,7 @@ from src.providers.base import (
     parse_openai_response,
     require_output,
 )
+from src.providers.fallback_chain import AllProvidersFailedError, FallbackChain, Tier
 from src.providers.nvidia_provider import NvidiaProvider
 from src.providers.openai_compat import (
     NVCF_STATUS_URL,
@@ -34,7 +38,7 @@ from src.providers.openai_compat import (
     post_chat_completion,
 )
 from src.providers.openrouter_provider import OpenRouterProvider
-from src.services.model_health import ModelHealth
+from src.services.model_health import COOLDOWN, ModelHealth
 
 _URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 _ULTRA = "nvidia/nemotron-3-ultra-550b-a55b"
@@ -44,6 +48,17 @@ _EOL_BODY = (
     "'qwen/qwen3.5-397b-a17b' has reached its end of life on 2026-07-27T00:00:00Z "
     'and is no longer available."}'
 )
+_OR_URL = "https://openrouter.ai/api/v1/chat/completions"
+_OR_ULTRA = "nvidia/nemotron-3-ultra-550b-a55b:free"
+# What OpenRouter Ultra :free answered with HTTP 200 on 2026-10-16.
+_INCIDENT_BODY = {
+    "id": "gen-1792113316-6IrPtyqon7MXPdBZ9Yt3",
+    "error": {
+        "message": "Upstream error from Nvidia: Service temporarily overloaded",
+        "code": 503,
+        "metadata": {"error_type": "provider_overloaded"},
+    },
+}
 
 
 def _chat(content: str | None = "ok", *, finish_reason: str | None = "stop", **message) -> dict:
@@ -68,19 +83,33 @@ class _Recorder:
         return response
 
 
-async def _post(*responses: httpx.Response | Exception, timeout: float = 5.0) -> tuple[dict, _Recorder]:
+async def _post(
+    *responses: httpx.Response | Exception,
+    timeout: float = 5.0,
+    provider: str = "nvidia",
+    model: str = _ULTRA,
+) -> tuple[dict, _Recorder]:
     recorder = _Recorder(*responses)
     async with httpx.AsyncClient(transport=httpx.MockTransport(recorder)) as client:
         data = await post_chat_completion(
             client,
-            _URL,
-            {"model": _ULTRA},
-            provider="nvidia",
-            model=_ULTRA,
+            _URL if provider == "nvidia" else _OR_URL,
+            {"model": model},
+            provider=provider,
+            model=model,
             timeout=timeout,
             poll_interval=0.0,
         )
     return data, recorder
+
+
+async def _body_error(error: dict, **body) -> ProviderError:
+    """The error an OpenRouter 200 whose body holds *error* raises."""
+    try:
+        await _post(httpx.Response(200, json={"error": error, **body}), provider="openrouter", model=_OR_ULTRA)
+    except ProviderError as exc:
+        return exc
+    raise AssertionError("no error raised")
 
 
 class ErrorHierarchyTests(unittest.TestCase):
@@ -247,6 +276,149 @@ class PostChatCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.status, 202)
         self.assertIn("req-3 still pending", ctx.exception.detail)
 
+    # ── A 200 whose body is an error object (OpenRouter after routing) ──
+
+    async def test_the_incident_body_is_the_503_it_names(self) -> None:
+        # 2026-10-16: read as an empty completion, it earned no strike.
+        with self.assertRaises(TransientError) as ctx:
+            await _post(httpx.Response(200, json=_INCIDENT_BODY), provider="openrouter", model=_OR_ULTRA)
+
+        error = ctx.exception
+        self.assertIs(type(error), TransientError)
+        self.assertEqual((error.status, error.provider, error.model), (503, "openrouter", _OR_ULTRA))
+        self.assertEqual(
+            json.loads(error.detail),
+            {"error": _INCIDENT_BODY["error"]},
+        )
+
+    async def test_a_body_429_from_one_upstream_cools_only_that_model(self) -> None:
+        # metadata.raw carries the "upstream" that tells it from the account
+        # cap; it leads the detail even behind a long field, past 500 chars.
+        error = await _body_error(
+            {
+                "message": "Provider returned error",
+                "code": 429,
+                "metadata": {
+                    "headers": {"X-Padding": "x" * 600},
+                    "raw": f"{_OR_ULTRA} is temporarily rate-limited upstream. Please retry shortly",
+                    "provider_name": "Nvidia",
+                },
+            }
+        )
+
+        self.assertIs(type(error), RateLimitError)
+        self.assertEqual((error.status, error.retry_after), (429, None))
+        self.assertEqual(len(error.detail), 500)
+        self.assertIn("rate-limited upstream", error.detail)
+        health = ModelHealth(clock=lambda: 1_000.0)
+        health.record_failure("openrouter", _OR_ULTRA, error)
+        self.assertFalse(health.is_available("openrouter", _OR_ULTRA))
+        self.assertTrue(health.is_available("openrouter", "dots-studio/dots-3-note-preview:free"))
+
+    async def test_a_body_429_for_the_accounts_free_cap_cools_every_free_id(self) -> None:
+        error = await _body_error(
+            {
+                "message": "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day",
+                "code": 429,
+                "metadata": {"headers": {"X-RateLimit-Limit": "50", "X-RateLimit-Remaining": "0"}},
+            }
+        )
+
+        self.assertIs(type(error), RateLimitError)
+        health = ModelHealth(clock=lambda: 1_000.0)
+        health.record_failure("openrouter", _OR_ULTRA, error)
+        self.assertFalse(health.is_available("openrouter", "dots-studio/dots-3-note-preview:free"))
+
+    async def test_body_codes_map_like_the_statuses(self) -> None:
+        cases = (
+            ({"code": 404, "message": "No endpoints found that support tool use. To learn more ..."}, PayloadError, 404),
+            ({"code": 404, "message": f"No endpoints found for {_OR_ULTRA}."}, ModelGoneError, 404),
+            ({"code": 410, "message": "The model has reached its end of life on 2026-07-27T00:00:00Z"}, ModelGoneError, 410),
+            ({"code": 400, "message": "Invalid request"}, PayloadError, 400),
+            ({"code": 401, "message": "User not found."}, AuthError, 401),
+            ({"code": 402, "message": "Insufficient credits"}, CreditsError, 402),
+            ({"code": 502, "message": "Upstream error"}, TransientError, 502),
+            ({"code": "503", "message": "a numeric string is still a status"}, TransientError, 503),
+        )
+        for error, error_class, status in cases:
+            with self.subTest(code=error["code"], message=error["message"][:30]):
+                raised = await _body_error(error)
+                self.assertIs(type(raised), error_class)
+                self.assertEqual(raised.status, status)
+                self.assertEqual(raised.provider, "openrouter")
+        gone = await _body_error(cases[2][0])
+        self.assertEqual(gone.eol, "2026-07-27T00:00:00Z")
+
+    async def test_a_body_error_without_a_usable_code_is_transient_200(self) -> None:
+        for error in (
+            {"message": "Internal error"},
+            {"message": "OpenAI style", "code": "rate_limit_exceeded"},
+            {"message": "null code", "code": None},
+            {"message": "not an error status", "code": 200},
+            {"message": "a bool is no status", "code": True},
+            # str.isdigit() passes it, int() does not.
+            {"message": "a superscript is no number", "code": "²"},
+            {"message": "past int()'s digit limit", "code": "5" * 5000},
+        ):
+            with self.subTest(error=error):
+                raised = await _body_error(error)
+                self.assertIs(type(raised), TransientError)
+                self.assertEqual(raised.status, 200)
+                self.assertIn(error["message"], raised.detail)
+
+    async def test_a_body_error_beside_partial_output_still_raises(self) -> None:
+        # OpenRouter's errors doc: a stream cut short ends with the error
+        # and finish_reason "error"; the partial text is no answer.
+        raised = await _body_error(
+            {"message": "Upstream stream ended", "code": 502},
+            choices=[{"message": {"role": "assistant", "content": "半句"}, "finish_reason": "error"}],
+        )
+
+        self.assertIs(type(raised), TransientError)
+        self.assertEqual(raised.status, 502)
+
+    async def test_an_error_on_the_choice_beside_partial_output_raises(self) -> None:
+        # OpenRouter's schema: NonStreamingChoice.error, no top-level error.
+        body = {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "台北今天的天氣"},
+                    "finish_reason": "error",
+                    "error": {"code": 502, "message": "Upstream stream ended"},
+                }
+            ]
+        }
+        with self.assertRaises(TransientError) as ctx:
+            await _post(httpx.Response(200, json=body), provider="openrouter", model=_OR_ULTRA)
+
+        self.assertEqual((ctx.exception.status, ctx.exception.provider), (502, "openrouter"))
+        self.assertIn("Upstream stream ended", ctx.exception.detail)
+
+        rate_limited = {"choices": [{**body["choices"][0], "error": {"code": 429, "message": "slow down"}}]}
+        with self.assertRaises(RateLimitError):
+            await _post(httpx.Response(200, json=rate_limited), provider="openrouter", model=_OR_ULTRA)
+
+    async def test_finish_reason_error_without_an_error_object_is_transient_200(self) -> None:
+        with self.assertRaises(TransientError) as ctx:
+            await _post(httpx.Response(200, json=_chat("半句", finish_reason="error")))
+
+        self.assertIs(type(ctx.exception), TransientError)
+        self.assertEqual(ctx.exception.status, 200)
+        self.assertIn('finish_reason "error"', ctx.exception.detail)
+
+    async def test_the_detail_keeps_the_body_text_readable(self) -> None:
+        raised = await _body_error({"message": "上游錯誤：服務暫時過載", "code": 503})
+
+        self.assertIn("上游錯誤：服務暫時過載", raised.detail)
+        self.assertTrue(raised.detail.startswith('{"error": {"message": '))
+
+    async def test_a_null_error_is_no_error(self) -> None:
+        body = {**_chat("你好"), "error": None}
+
+        data, _ = await _post(httpx.Response(200, json=body), provider="openrouter", model=_OR_ULTRA)
+
+        self.assertEqual(data, body)
+
 
 class ParseOpenAIResponseTests(unittest.TestCase):
     def test_finish_reason_usage_and_provider_are_kept(self) -> None:
@@ -350,6 +522,11 @@ def _openrouter(handler, health: ModelHealth | None = None) -> OpenRouterProvide
     return OpenRouterProvider("key", health or ModelHealth(), transport=httpx.MockTransport(handler))
 
 
+def _no_retry_pause():
+    """OpenRouter's one retry of an unavailable upstream, without the pause."""
+    return patch.object(openrouter_provider, "UPSTREAM_RETRY_PAUSE_SECONDS", 0.0)
+
+
 class ProviderErrorContractTests(unittest.IsolatedAsyncioTestCase):
     """Both providers surface the same errors through the shared POST."""
 
@@ -377,6 +554,54 @@ class ProviderErrorContractTests(unittest.IsolatedAsyncioTestCase):
                         await provider.close()
                     self.assertEqual(ctx.exception.provider, name)
                     self.assertEqual(ctx.exception.model, model)
+
+    async def test_an_error_in_a_200_body_is_that_error_not_an_empty_completion(self) -> None:
+        # 2026-10-16: OpenRouter Ultra :free answered the incident body with
+        # HTTP 200; the shared POST raises the 503 it names on either provider
+        # (OpenRouter's one retry of an overloaded upstream got it again).
+        for name, build, model in (("openrouter", _openrouter, _OR_ULTRA), ("nvidia", _nvidia, _ULTRA)):
+            with self.subTest(provider=name):
+                provider = build(lambda request: httpx.Response(200, json=_INCIDENT_BODY))
+                try:
+                    with self.assertRaises(TransientError) as ctx, _no_retry_pause():
+                        await provider.generate(model, [{"role": "user", "content": "hi"}])
+                finally:
+                    await provider.close()
+                self.assertNotIsInstance(ctx.exception, EmptyCompletionError)
+                self.assertEqual((ctx.exception.status, ctx.exception.provider), (503, name))
+                self.assertIn("Service temporarily overloaded", ctx.exception.detail)
+
+    async def test_two_error_bodies_in_a_row_cool_the_model_for_two_minutes(self) -> None:
+        now = [1_000.0]
+        health = ModelHealth(clock=lambda: now[0])
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json=_INCIDENT_BODY)
+
+        provider = _openrouter(handler, health)
+        chain = FallbackChain(health)
+        try:
+            for _ in range(2):
+                with self.assertRaises(AllProvidersFailedError) as ctx, _no_retry_pause():
+                    await chain.generate([Tier(provider, _OR_ULTRA)], [{"role": "user", "content": "hi"}])
+                self.assertIsInstance(ctx.exception.last_error, TransientError)
+
+            blocked = health.unavailable("openrouter", _OR_ULTRA)
+            self.assertEqual((blocked.kind, blocked.reason), (COOLDOWN, "2 transient failures in a row"))
+            # Later walks skip it without a request ...
+            with self.assertRaises(AllProvidersFailedError):
+                await chain.generate([Tier(provider, _OR_ULTRA)], [{"role": "user", "content": "hi"}])
+            # (each walk: the request and its one retry, a strike only for the pair)
+            self.assertEqual(len(requests), 4)
+            # ... for 120 s.
+            now[0] += 119
+            self.assertFalse(health.is_available("openrouter", _OR_ULTRA))
+            now[0] += 1
+            self.assertTrue(health.is_available("openrouter", _OR_ULTRA))
+        finally:
+            await provider.close()
 
     async def test_nvidia_polls_a_202_through_its_own_client(self) -> None:
         responses = iter(
@@ -426,6 +651,153 @@ class ProviderErrorContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.text, expected)
                 self.assertEqual(response.provider, "nvidia")
                 self.assertEqual(response.finish_reason, "stop")
+
+
+_OR_DOTS = "dots-studio/dots-3-note-preview:free"
+# What OpenRouter answered for dots-3 (one upstream, AtlasCloud) with HTTP
+# 502 on 2026-10-16, to a memory summary after 15 s and in a live gate run.
+_DROPPED_STREAM = {
+    "error": {
+        "message": "JSON error injected into SSE stream",
+        "code": 502,
+        "metadata": {"error_type": "provider_unavailable"},
+    }
+}
+
+
+class OpenRouterUpstreamRetryTests(unittest.IsolatedAsyncioTestCase):
+    """One more try when the model's upstream was unavailable, and only then."""
+
+    @staticmethod
+    def _answers(*responses: httpx.Response | Exception):
+        """A handler giving *responses* in order, and the requests it saw."""
+        pending = iter(responses)
+        sent: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.append(request)
+            answer = next(pending)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        return handler, sent
+
+    async def _generate(self, *responses, health: ModelHealth | None = None):
+        """The answer or the error, and the requests sent."""
+        handler, sent = self._answers(*responses)
+        provider = _openrouter(handler, health)
+        try:
+            with _no_retry_pause():
+                return await provider.generate(_OR_DOTS, [{"role": "user", "content": "hi"}]), sent
+        except ProviderError as exc:
+            return exc, sent
+        finally:
+            await provider.close()
+
+    async def test_a_dropped_upstream_stream_is_sent_once_more_and_answers(self) -> None:
+        health = ModelHealth()
+        handler, sent = self._answers(
+            httpx.Response(502, json=_DROPPED_STREAM), httpx.Response(200, json=_chat("收盤價 1,450 元"))
+        )
+        provider = _openrouter(handler, health)
+        try:
+            with _no_retry_pause(), self.assertLogs("linebot", level="WARNING") as logs:
+                result = await FallbackChain(health).generate(
+                    [Tier(provider, _OR_DOTS)], [{"role": "user", "content": "hi"}]
+                )
+        finally:
+            await provider.close()
+
+        self.assertEqual(result.text, "收盤價 1,450 元")
+        # The same request again.
+        self.assertEqual(json.loads(sent[0].content), json.loads(sent[1].content))
+        self.assertIn(f"OpenRouter: {_OR_DOTS} answered 502 (upstream unavailable); retrying once", logs.output[0])
+        status = health.get_status()
+        # Both requests count against the free daily budget; the answer
+        # leaves the model without a strike.
+        self.assertEqual(status["providers"]["openrouter"]["rpd_used"], 2)
+        self.assertIsNone(status["models"][f"openrouter:{_OR_DOTS}"]["last_error_at"])
+
+    async def test_the_same_failure_in_a_200_body_is_sent_once_more(self) -> None:
+        for body in (_DROPPED_STREAM, _INCIDENT_BODY):
+            with self.subTest(code=body["error"]["code"]):
+                result, sent = await self._generate(
+                    httpx.Response(200, json=body), httpx.Response(200, json=_chat("ok"))
+                )
+                self.assertEqual((result.text, len(sent)), ("ok", 2))
+
+    async def test_the_error_type_survives_a_long_upstream_body(self) -> None:
+        # The detail is cut to 500 characters; error_type goes before raw.
+        error = {**_DROPPED_STREAM["error"]}
+        error["metadata"] = {"raw": "x" * 600, "provider_name": "AtlasCloud", **error["metadata"]}
+
+        result, sent = await self._generate(
+            httpx.Response(200, json={"error": error}), httpx.Response(200, json=_chat("ok"))
+        )
+
+        self.assertEqual((result.text, len(sent)), ("ok", 2))
+
+    async def test_a_second_failure_is_the_error(self) -> None:
+        error, sent = await self._generate(
+            httpx.Response(502, json=_DROPPED_STREAM), httpx.Response(502, json=_DROPPED_STREAM)
+        )
+
+        self.assertIsInstance(error, TransientError)
+        self.assertEqual((error.status, len(sent)), (502, 2))
+        self.assertIn("provider_unavailable", error.detail)
+
+    async def test_other_failures_are_not_sent_again(self) -> None:
+        for answer, error_class in (
+            (httpx.Response(429, json={"error": {"message": "Rate limit exceeded: free-models-per-day"}}),
+             RateLimitError),
+            (httpx.Response(400, json={"error": {"message": "bad request", "code": 400}}), PayloadError),
+            (httpx.Response(404, json={"error": {"message": "No endpoints found for x"}}), ModelGoneError),
+            # A 5xx that does not say the upstream was unavailable.
+            (httpx.Response(502, text="<html>502 Bad Gateway</html>"), TransientError),
+            (httpx.Response(503, text="nope"), TransientError),
+            (httpx.Response(500, json=_DROPPED_STREAM), TransientError),
+            (httpx.ReadTimeout("read timed out"), TransientError),
+        ):
+            with self.subTest(answer=answer):
+                error, sent = await self._generate(answer)
+                self.assertIsInstance(error, error_class)
+                self.assertEqual(len(sent), 1)
+
+    async def test_no_retry_once_the_free_budget_is_spent(self) -> None:
+        health = ModelHealth(openrouter_free_daily_limit=1)
+
+        error, sent = await self._generate(httpx.Response(502, json=_DROPPED_STREAM), health=health)
+
+        self.assertEqual((error.status, len(sent)), (502, 1))
+        self.assertEqual(health.get_status()["providers"]["openrouter"]["rpd_used"], 1)
+
+    async def test_a_paid_model_is_still_refused_without_a_request(self) -> None:
+        handler, sent = self._answers()
+        provider = _openrouter(handler)
+        try:
+            with self.assertRaises(SkipTierError), self.assertLogs("linebot", level="WARNING"):
+                await provider.generate("qwen/qwen3.8-27b", [{"role": "user", "content": "hi"}])
+        finally:
+            await provider.close()
+        self.assertEqual(sent, [])
+
+    async def test_the_tier_limit_cancels_the_retry(self) -> None:
+        # The pause is real here: a tier with 0.2 s left ends during it, and
+        # the retry is never sent.
+        health = ModelHealth()
+        handler, sent = self._answers(httpx.Response(502, json=_DROPPED_STREAM))
+        provider = _openrouter(handler, health)
+        try:
+            with self.assertLogs("linebot", level="WARNING"), self.assertRaises(AllProvidersFailedError) as ctx:
+                await FallbackChain(health).generate(
+                    [Tier(provider, _OR_DOTS, timeout_s=0.2)], [{"role": "user", "content": "hi"}]
+                )
+        finally:
+            await provider.close()
+
+        self.assertIn("no answer within 0.2s", str(ctx.exception))
+        self.assertEqual(len(sent), 1)
 
 
 if __name__ == "__main__":

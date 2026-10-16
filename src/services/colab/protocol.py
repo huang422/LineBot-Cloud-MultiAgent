@@ -38,17 +38,23 @@ user info, port, path, query or fragment). The host is a quick tunnel
 tunnel), and every address it resolves to must be public
 (:func:`src.services.search.page_fetcher.is_public_address`).
 
+(``error`` on a ``ready`` says why the router is not serving, when it is
+not; the bot logs it, clipped.)
+
 **Readiness.** After a signed ``ready`` the bot probes the tunnel with
 ``Authorization: Bearer <proxy_token>`` within :data:`PROBE_TIMEOUT_SECONDS`:
-``GET /api/version`` is :data:`OLLAMA_VERSION`, ``GET /api/ps`` lists the
-chat model wholly in VRAM (``size_vram == size``), ``GET /api/tags`` lists
-it at its pinned digest (:func:`pinned_models`), and ``POST /api/show`` for
-the chat model lists the think values :data:`CHAT_THINK_VALUES`. Only then
-is the session READY. A router (:func:`router_models`) that is not listed
-or loaded, at another digest (a republished tag) or not wholly in VRAM
-does not keep it from READY: the session keeps the digests and sizes the
-probe saw, and :func:`unpinned` and :func:`off_gpu` keep the router out of
-it.
+``GET /api/version`` passes :func:`ollama_version_problem` (at least
+:data:`OLLAMA_MIN_VERSION`, and the release the launcher picked for the
+session when the state recorded one), ``GET /api/ps`` lists the chat model
+wholly in VRAM (``size_vram == size``), ``GET /api/tags`` lists it, and
+``POST /api/show`` for the chat model lists the think values
+:data:`CHAT_THINK_VALUES`. Only then is the session READY. No digest is
+compared: the models follow their tags (2026-10-16), and the probe's
+digests are kept for display beside the last verified ones
+(:func:`colab_models`). A router (:func:`router_models`) that is not listed
+or loaded, or not wholly in VRAM, does not keep the session from READY:
+the session keeps the sizes the probe saw, and :func:`off_gpu` keeps the
+router out of it.
 """
 
 from __future__ import annotations
@@ -62,6 +68,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from colab import VERSIONS_FILE, register
 from src.providers.model_profiles import OLLAMA_CHAT, PROFILES, SYSTEMONE, THINK_LEVELS
 
 SIGNATURE_HEADER = "X-Colab-Signature"
@@ -72,10 +79,14 @@ EVENT_FAILED = "failed"
 EVENT_STOPPING = "stopping"
 EVENTS: frozenset[str] = frozenset({EVENT_READY, EVENT_FAILED, EVENT_STOPPING})
 
-# Ollama 0.35.0 (a stable release since 2026-09-28) is the first with
-# /v1/systemone, the router's endpoint.
-OLLAMA_VERSION = "0.35.0"
-# What POST /api/show reports for qwen3.8 at 0.35.0 ("false" is JSON false).
+# The oldest Ollama a session may run, from colab/versions.json (the one
+# copy): clef-flash's config says "requires": "0.40.4", and the registry
+# answers HTTP 412 to an older client's pull. The launcher installs the
+# latest release at or above it (or versions.json's pinned fallback).
+OLLAMA_MIN_VERSION: str = register.load_versions(VERSIONS_FILE)["ollama"]["min_version"]
+# What POST /api/show reports for qwen3.8 ("false" is JSON false), at
+# 0.35.0 and at 0.40.5 alike: the guard against a release that changes
+# how it thinks.
 CHAT_THINK_VALUES: list[bool | str] = [False if level == "false" else level for level in THINK_LEVELS]
 PROBE_TIMEOUT_SECONDS = 10.0
 
@@ -87,26 +98,25 @@ _HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 _TIMESTAMP = re.compile(r"[0-9]{1,12}")
 
 
-def pinned_models() -> dict[str, str]:
-    """Colab model id → the Ollama digest the session must have pulled.
+def colab_models() -> dict[str, str]:
+    """Colab model id → its last verified Ollama digest (information only:
+    the models follow their tags, nothing compares it).
 
-    Read from the model profiles (``ModelProfile.digest``), the one copy
-    of the pins on the bot side.
+    Read from the model profiles (``ModelProfile.verified_digest``), the one
+    copy of the Colab models on the bot side.
     """
-    return {p.model: p.digest for p in PROFILES.values() if p.provider == "colab" and p.digest}
+    return {p.model: p.verified_digest for p in PROFILES.values() if p.provider == "colab"}
 
 
 def chat_models() -> list[str]:
-    """The pinned Colab models that chat (``/api/chat``), for the think check."""
-    pins = pinned_models()
-    return [p.model for p in PROFILES.values() if p.model in pins and p.protocol == OLLAMA_CHAT]
+    """The Colab models that chat (``/api/chat``), for the think check."""
+    return [p.model for p in PROFILES.values() if p.provider == "colab" and p.protocol == OLLAMA_CHAT]
 
 
 def router_models() -> list[str]:
-    """The pinned Colab models that route (``/v1/systemone``): the only ones
-    a session may be READY with at another digest than the pin."""
-    pins = pinned_models()
-    return [p.model for p in PROFILES.values() if p.model in pins and p.protocol == SYSTEMONE]
+    """The Colab models that route (``/v1/systemone``): the only ones a
+    session may be READY without (not pulled, not loaded, off the GPU)."""
+    return [p.model for p in PROFILES.values() if p.provider == "colab" and p.protocol == SYSTEMONE]
 
 
 def normalize_digest(value: object) -> str:
@@ -114,17 +124,39 @@ def normalize_digest(value: object) -> str:
     return str(value or "").strip().lower().removeprefix("sha256:")
 
 
-def unpinned(digests: Mapping[str, str]) -> dict[str, tuple[str, str]]:
-    """router → (pinned, actual) for each router *digests* gives another
-    digest, or none (actual ""): a session that recorded no digest for its
-    router is not trusted with it either."""
-    pins = pinned_models()
+def moved_tags(digests: Mapping[str, str]) -> dict[str, tuple[str, str]]:
+    """model → (verified, actual) for each Colab model *digests* (what a
+    probe saw in /api/tags) shows at another digest than its last verified
+    one: the tag moved since someone checked it. For display only."""
     found: dict[str, tuple[str, str]] = {}
-    for model in router_models():
+    for model, verified in colab_models().items():
         actual = normalize_digest(digests.get(model))
-        if actual != pins[model]:
-            found[model] = (pins[model], actual)
+        if actual and actual != verified:
+            found[model] = (verified, actual)
     return found
+
+
+def ollama_version_problem(found: object, launched: str = "") -> str:
+    """Why *found* (``/api/version``'s ``version``) is not an Ollama this
+    session may run, or "".
+
+    It must be at least :data:`OLLAMA_MIN_VERSION`, and exactly *launched*
+    (the release the launcher picked, :attr:`.state.ColabState.ollama_version`)
+    when the session recorded one: a state written before 2026-10-16 has
+    none, so only the minimum applies.
+    """
+    text = found if isinstance(found, str) else ""
+    if not register.version_at_least(text, OLLAMA_MIN_VERSION):
+        return f"Ollama {_clip_version(found)}, expected {OLLAMA_MIN_VERSION} or later"
+    if launched and text != launched:
+        return f"Ollama {_clip_version(found)}, expected {launched} (the release this session was launched with)"
+    return ""
+
+
+def _clip_version(value: object) -> str:
+    """*value* as at most 40 characters, for a message."""
+    text = str(value)
+    return text if len(text) <= 40 else text[:39] + "…"
 
 
 def model_size(value: object) -> int:

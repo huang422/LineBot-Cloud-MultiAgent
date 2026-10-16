@@ -30,7 +30,8 @@ the three reply prompts say the same. Storing each fact's source chat and
 filtering by it was considered and left out: it needs a profile schema
 change and still guesses what a user considers private.
 
-The Colab router, nimble on `/v1/systemone` (ADR-0010), follows the same
+The Colab router, clef-flash on `/v1/systemone` (ADR-0010; nimble until
+2026-10-16), follows the same
 rule with less: its state is the message clipped to 300 characters, whether
 an image is attached or quoted, whether a message is quoted, and the
 previous agent. No summary, profile facts or history reach it.

@@ -31,21 +31,29 @@ Bootstrap env file
 
 Readiness probe
     Once the VM says ``ready``, the bot checks through the tunnel (with the
-    bearer token): ``/api/version`` is the pinned Ollama, ``/api/ps`` lists
-    the chat model wholly in VRAM (``size_vram == size``), ``/api/tags``
-    lists it at its pinned digest, and ``/api/show`` of qwen3.8 reports the
-    pinned think values.
+    bearer token): ``/api/version`` is the Ollama this session installed,
+    ``/api/ps`` lists the chat model wholly in VRAM (``size_vram == size``),
+    ``/api/tags`` lists it, and ``/api/show`` of qwen3.8 reports the
+    expected think values.
     ``probe_problems`` is that check; the VM runs it on itself before it
     registers, and the DRYRUN stub upstream is built to pass it.
 
-Pinned digests and VRAM
-    Ollama pulls tags, and its registry serves no manifest by digest, so a
-    pin can only be checked after the pull. The chat model must be pulled,
-    loaded, exactly its pin and wholly in VRAM (``must_be_exact``). The
-    router need not be: a nimble that did not pull or load, was
-    republished, or that Ollama could not fit on the GPU beside qwen3.8
-    still boots; the ``ready`` event reports what it has, and the bot
-    routes that session through its API tiers instead.
+The Ollama release
+    The launcher picks it at each launch (the latest GitHub release when it
+    is at least ``ollama.min_version``, else the pinned fallback in
+    versions.json) and uploads a versions.json whose ``ollama`` entry is
+    that choice, so the VM installs, sha256-checks and expects exactly it.
+
+Model tags and VRAM
+    Ollama pulls tags, and the models follow them (since 2026-10-16): each
+    boot pulls whatever the tag points at, and ``verified_digest`` only
+    records the last digest someone checked by hand (colab/README.md); a
+    different one is logged, never refused. The chat model must be pulled,
+    loaded and wholly in VRAM (``required``). The router need not be: one
+    that did not pull or load, or that Ollama could not fit on the GPU
+    beside qwen3.8, still boots; the ``ready`` event reports what it has
+    (and in ``error`` why the router is missing), and the bot routes that
+    session through its API tiers instead.
 """
 
 from __future__ import annotations
@@ -91,6 +99,7 @@ BOOTSTRAP_ENV_KEYS: tuple[str, ...] = (
 SECRET_ENV_KEYS: frozenset[str] = frozenset({"COLAB_REG_KEY", "COLAB_PROXY_TOKEN", "TUNNEL_TOKEN"})
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_VERSION = re.compile(r"v?([0-9]{1,6})\.([0-9]{1,6})\.([0-9]{1,6})")
 _SIGNATURE = re.compile(r"^t=([0-9]{1,12}),v1=([0-9a-f]{64})$")
 
 # (method, url, body, headers, timeout) -> (status, body). HTTP error
@@ -302,7 +311,7 @@ def load_versions(path: Path) -> dict[str, Any]:
 
 
 def validate_versions(versions: Any) -> None:
-    """Raises ValueError naming the first malformed pin."""
+    """Raises ValueError naming the first malformed entry."""
     if not isinstance(versions, dict):
         raise ValueError("versions.json is not an object")
     for tool in ("ollama", "cloudflared"):
@@ -315,13 +324,22 @@ def validate_versions(versions: Any) -> None:
             raise ValueError(f"versions.json: {tool}.sha256 is not 64 hex characters")
         if not entry.get("version"):
             raise ValueError(f"versions.json: {tool}.version is missing")
+        # The VM stops a download at this many bytes and wants all of them.
+        size = entry.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            raise ValueError(f"versions.json: {tool}.size is not a positive byte count")
+    ollama = versions["ollama"]
+    if parse_version(ollama.get("min_version")) is None:
+        raise ValueError("versions.json: ollama.min_version is not a version like 0.40.4")
+    if not version_at_least(ollama["version"], ollama["min_version"]):
+        raise ValueError("versions.json: ollama.version is older than ollama.min_version")
     models = versions.get("models")
     if not isinstance(models, dict) or not models:
         raise ValueError("versions.json: models is missing")
     roles = []
     for name, pin in models.items():
-        if not isinstance(pin, dict) or not _HEX64.match(str(pin.get("digest", ""))):
-            raise ValueError(f"versions.json: models[{name}].digest is not 64 hex characters")
+        if not isinstance(pin, dict) or not _HEX64.match(str(pin.get("verified_digest", ""))):
+            raise ValueError(f"versions.json: models[{name}].verified_digest is not 64 hex characters")
         if pin.get("role") not in ("chat", "router"):
             raise ValueError(f"versions.json: models[{name}].role is not chat or router")
         thinking = pin.get("thinking")
@@ -332,16 +350,33 @@ def validate_versions(versions: Any) -> None:
         raise ValueError("versions.json: models needs exactly one chat and one router model")
 
 
+def parse_version(value: Any) -> tuple[int, int, int] | None:
+    """``"0.40.5"`` (or ``"v0.40.5"``) as ``(0, 40, 5)``; None for anything
+    else, a pre-release suffix included (``"0.41.0-rc1"``): only plain
+    releases are compared."""
+    match = _VERSION.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def version_at_least(version: Any, minimum: Any) -> bool:
+    """Whether *version* parses and is *minimum* or newer (False when either
+    does not parse)."""
+    have, want = parse_version(version), parse_version(minimum)
+    return have is not None and want is not None and have >= want
+
+
 def normalize_digest(value: Any) -> str:
     """A digest as bare lowercase hex (Ollama reports it without ``sha256:``)."""
     text = str(value or "").strip().lower()
     return text.removeprefix("sha256:")
 
 
-def must_be_exact(pin: Mapping[str, Any]) -> bool:
-    """Whether a model not pulled or loaded, at another digest than its
-    pin, or not wholly in VRAM stops the boot: every model but the router
-    (see "Pinned digests and VRAM" above)."""
+def required(pin: Mapping[str, Any]) -> bool:
+    """Whether a model not pulled, not loaded or not wholly in VRAM stops
+    the boot: every model but the router (see "Model tags and VRAM" above).
+    Its digest never does."""
     return pin["role"] != "router"
 
 
@@ -386,8 +421,10 @@ def probe_problems(
 
     *version*, *ps* and *tags* are the parsed ``/api/version``, ``/api/ps``
     and ``/api/tags`` bodies, *shows* maps a model to its ``/api/show`` body.
-    Every pinned model but the router must be loaded, pulled, at its pinned
-    digest and wholly in VRAM (``must_be_exact``).
+    The Ollama must be exactly the one *versions* names (this session's
+    install). Every model but the router must be loaded, pulled and wholly
+    in VRAM (``required``); no digest is compared (the models follow their
+    tags).
     """
     problems: list[str] = []
     want_version = versions["ollama"]["version"]
@@ -395,26 +432,19 @@ def probe_problems(
     if got_version != want_version:
         problems.append(f"Ollama version is {got_version!r}, not {want_version}")
     loaded = {m[key]: m for m in _models(ps) for key in ("name", "model") if isinstance(m.get(key), str)}
-    listed: dict[str, str] = {}
-    for m in _models(tags):
-        for key in ("name", "model"):
-            if m.get(key):
-                listed[m[key]] = normalize_digest(m.get("digest"))
+    listed = {m[key] for m in _models(tags) for key in ("name", "model") if m.get(key)}
     for model, pin in versions["models"].items():
         running = loaded.get(model)
-        exact = must_be_exact(pin)
-        if running is None:
-            if exact:
+        if required(pin):
+            if running is None:
                 problems.append(f"{model} is not loaded (/api/ps)")
-        elif not on_gpu(running) and exact:
-            in_vram, size = gpu_share(running)
-            problems.append(f"{model} is not fully on the GPU (/api/ps: {mib(in_vram)} of {mib(size)} MiB in VRAM)")
-        digest = listed.get(model)
-        if digest is None:
-            if exact:
+            elif not on_gpu(running):
+                in_vram, size = gpu_share(running)
+                problems.append(
+                    f"{model} is not fully on the GPU (/api/ps: {mib(in_vram)} of {mib(size)} MiB in VRAM)"
+                )
+            if model not in listed:
                 problems.append(f"{model} is not pulled (/api/tags)")
-        elif digest != pin["digest"] and exact:
-            problems.append(f"{model} digest is {digest[:12]}, not the pinned {pin['digest'][:12]}")
         want_thinking = pin.get("thinking")
         if want_thinking is not None:
             show = shows.get(model)

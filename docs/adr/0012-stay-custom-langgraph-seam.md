@@ -14,7 +14,7 @@ instead of the hand-written pipeline. What the flow is today:
   `process_event(event, deps)` (`src/pipeline/event_pipeline.py`, about 130
   lines): commands (`!new`, `!colab`, `!whoami`) answer at once; otherwise
   flush the group's passive buffer, rate-limit and load memory, route (fast
-  rules, then nimble on a READY Colab session, then the router role) while the
+  rules, then the Colab router on a READY Colab session, then the router role) while the
   sender's profile facts load, run one of four agents, `send_response`,
   `record_interaction`, `touch_user_profile`. One branch (the agent), a few
   early exits, and no cycle outside the chat agent's tool loop (at most 4
@@ -130,7 +130,7 @@ to serialise.
 | `ingest` | `process_input`, `apply_cleaned_text` | END when the event is not for the bot |
 | `command` | `is_new_chat_command`, `parse_command` + `run_command` | END once a command answered |
 | `prepare` | loading animation, `message_cache.cache_processed_request`, `_flush_passive_before_reply`, `enrich_request`, `get_request_block_message` | END when blocked (rate limit, empty message) |
-| `route` | `Orchestrator.route` (rules → nimble → router role), with `_load_profile_facts` and `_note_colab_demand` alongside | a conditional edge on `decision.agent` |
+| `route` | `Orchestrator.route` (rules → Colab router → router role), with `_load_profile_facts` and `_note_colab_demand` alongside | a conditional edge on `decision.agent` |
 | `chat`, `vision`, `web_search`, `image_gen` | `agent.process(request)`; each keeps `FallbackChain`, and chat's `ToolRunner` may become a subgraph with a tool node | `deliver` |
 | `deliver` | `send_response` (reply first, push only when the reply certainly failed) | END when not delivered |
 | `remember` | `record_interaction`, `touch_user_profile` | END |

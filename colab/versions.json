@@ -1,9 +1,10 @@
 {
   "ollama": {
-    "version": "0.35.0",
-    "url": "https://github.com/ollama/ollama/releases/download/v0.35.0/ollama-linux-amd64.tar.zst",
-    "sha256": "1c114a6b220c5efca2ef2b1e5f01d1e535e26f6cd6d1678c8489325d2835e525",
-    "size": 1427765407
+    "version": "0.40.5",
+    "url": "https://github.com/ollama/ollama/releases/download/v0.40.5/ollama-linux-amd64.tar.zst",
+    "sha256": "dc5eabc292f9949546c90a97c820f924b035e05243b0de13c7f366182562169c",
+    "size": 1438684604,
+    "min_version": "0.40.4"
   },
   "cloudflared": {
     "version": "2026.9.3",
@@ -14,13 +15,13 @@
   "models": {
     "qwen3.8:27b-mtp-q4_K_M": {
       "role": "chat",
-      "digest": "22130167c4c20e20c7b71454612966ca8e8171e9b3cc8ab6ce8aa6cbfec79643",
+      "verified_digest": "22130167c4c20e20c7b71454612966ca8e8171e9b3cc8ab6ce8aa6cbfec79643",
       "thinking": [false, "low", "medium", "xhigh"]
     },
-    "nimble:9b": {
+    "clef-flash:9b": {
       "role": "router",
-      "digest": "24e550a16a7081881be2f1f0d91e8cc13a597472735c04119f035a0a85c67e0c",
-      "num_ctx": 8194
+      "verified_digest": "73e026ff389b28464bb26f8978f3164851a76832f0d339032747e2c56f98ea29",
+      "num_ctx": 16384
     }
   },
   "gpu": {

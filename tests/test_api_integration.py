@@ -167,7 +167,15 @@ class ApiEndpointIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["memory"]["summary_timeout_seconds"], 180)
         self.assertEqual(payload["scheduler"], {"running": False, "jobs": []})
         self.assertNotIn("push", payload)
-        self.assertEqual(payload["roles"]["chat"][2]["model"], "qwen/qwen3.8-27b:free")
+        self.assertEqual(
+            [tier["model"] for tier in payload["roles"]["chat"][1:]],
+            [
+                "nvidia/nemotron-3-super-120b-a12b",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+                "dots-studio/dots-3-note-preview:free",
+                "nvidia/nemotron-3-ultra-550b-a55b:free",
+            ],
+        )
         # Off Cloud Run (no K_SERVICE) post-webhook work runs inline.
         self.assertEqual(payload["tasks_mode"], "inline")
 
@@ -547,6 +555,20 @@ class EventPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         memory.record_interaction.assert_not_called()
         memory.touch_user_profile.assert_not_called()
         deps.line.fetch_display_name.assert_not_called()
+
+    async def test_no_error_message_follows_a_delivered_answer(self) -> None:
+        # The reply token is spent, so an error message after the answer
+        # would go out by push: a second reply to one message.
+        deps, memory, _ = self._profile_deps(sent=True, load_profile_facts=AsyncMock(return_value=[]))
+        memory.record_interaction.side_effect = RuntimeError("bookkeeping failed")
+        event = {"type": "message", "replyToken": "r", "source": {"type": "user", "userId": "U1"}}
+
+        with patch.object(event_pipeline_module.logger, "error") as log_error:
+            await process_event(event, deps)
+
+        deps.send_response.assert_awaited_once()
+        deps.line.send_text.assert_not_called()
+        self.assertIn("Event processing error", log_error.call_args.args[0])
 
     async def test_the_agent_sees_the_facts_and_a_failed_load_does_not_stop_the_reply(self) -> None:
         event = {"type": "message", "replyToken": "r", "source": {"type": "user", "userId": "U1"}}

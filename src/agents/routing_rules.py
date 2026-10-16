@@ -332,6 +332,19 @@ _FOLLOW_UP_AMOUNT = (
     r"(?:一下|一次|一遍|一些|一點點?|一個|幾個|多一點|詳細一點|清楚一點|明白一點"
     r"|(?:一|幾)?個例子|例子|點|些|下|遍|次|個)?"
 )
+# Searching or checking the last answer again: 再/再次/重新 and one or two
+# of these verbs ("再搜尋一次", "重新查", "再搜尋確認一次吧"), or 確認一下 /
+# 確認一次 alone. 在 is a common typo for 再 here ("在查詢確認一下"; one
+# was searched as typed on 2026-10-16): it counts only with an amount
+# after the verb, since "在查" alone reads "(I am) checking", and the
+# message must still be nothing else ("在台北搜尋美食", "我在查資料" are not).
+_AGAIN_VERB = r"(?:搜尋|搜索|搜|查詢|查|找|確認|檢查|核對)"
+_AGAIN_AMOUNT = r"(?:一次|一下|一遍)"
+_SEARCH_AGAIN = (
+    rf"(?:請|幫我)?(?:(?:再次?|重新)(?:上網)?{_AGAIN_VERB}{{1,2}}{_AGAIN_AMOUNT}?"
+    rf"|在(?:上網)?{_AGAIN_VERB}{{1,2}}{_AGAIN_AMOUNT}"
+    rf"|確認{_AGAIN_AMOUNT})"
+)
 FOLLOW_UP_INDICATORS = re.compile(
     r"^(?:"
     # 那高雄呢 / 那如果下雨呢 / 那呢
@@ -341,6 +354,7 @@ FOLLOW_UP_INDICATORS = re.compile(
     rf"|繼續(?:說|講|寫|介紹|解釋|回答|下去)?{_FOLLOW_UP_PARTICLE}{_FOLLOW_UP_END}"
     r"|再(?:多說|多講|說明|說|講|解釋|補充|整理|介紹|找|查|舉|給我?|來|多|詳細|深入|具體|仔細|清楚)"
     rf"{_FOLLOW_UP_AMOUNT}{_FOLLOW_UP_PARTICLE}{_FOLLOW_UP_END}"
+    rf"|{_SEARCH_AGAIN}{_FOLLOW_UP_PARTICLE}{_FOLLOW_UP_END}"
     rf"|更多(?:資訊|細節|例子|內容|資料)?{_FOLLOW_UP_PARTICLE}{_FOLLOW_UP_END}"
     rf"|(?:詳細|多說|多講|說多|講多|深入|具體)一點點?{_FOLLOW_UP_PARTICLE}{_FOLLOW_UP_END}"
     r"|(?:舉(?:個|一個|幾個)?例(?:子)?|例如|比如說?|補充說明|延伸說明|是?什麼意思)"

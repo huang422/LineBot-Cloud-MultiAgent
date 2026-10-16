@@ -176,10 +176,10 @@ class HealthEndpointTests(unittest.TestCase):
         )
         self.health.record_failure(
             "openrouter",
-            "qwen/qwen3.8-27b:free",
-            ProviderError("qwen/qwen3.8-27b:free", 502, "upstream timeout", "openrouter"),
+            "dots-studio/dots-3-note-preview:free",
+            ProviderError("dots-studio/dots-3-note-preview:free", 502, "upstream timeout", "openrouter"),
         )
-        self.health.record_request("openrouter", "qwen/qwen3.8-27b:free")
+        self.health.record_request("openrouter", "dots-studio/dots-3-note-preview:free")
         self.lifecycle._results["nvidia:nvidia/nemotron-3-super-120b-a12b"] = LifecycleResult("ok", "listed")
 
         with self._client() as client:
@@ -189,10 +189,10 @@ class HealthEndpointTests(unittest.TestCase):
         body = response.json()
         self.assertEqual((body["status"], body["ready_for_webhook"], body["version"]), ("healthy", True, "dev"))
         self.assertEqual(body["config_warnings"], ["NVIDIA_MODEL in .env is no longer read"])
-        colab, ultra, qwen = body["roles"]["chat"][:3]
+        colab, _super, ultra, dots = body["roles"]["chat"][:4]
         self.assertEqual((colab["enabled"], colab["disabled_reason"]), (False, "colab tier not enabled"))
         self.assertEqual((ultra["health"], ultra["dead"], ultra["eol"]), ("dead", True, "2027-01-01T00:00:00Z"))
-        self.assertIn("upstream timeout", qwen["last_error"])
+        self.assertIn("upstream timeout", dots["last_error"])
         self.assertEqual(body["roles"]["router"][1]["lifecycle"]["state"], "ok")
         self.assertEqual(body["budgets"]["openrouter"]["rpd_used"], 1)
         self.assertEqual(body["lifecycle"]["results"]["nvidia:nvidia/nemotron-3-super-120b-a12b"]["state"], "ok")

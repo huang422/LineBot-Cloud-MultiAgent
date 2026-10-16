@@ -65,8 +65,8 @@ from src.services.colab.state import (
 from src.services.model_health import ModelHealth
 from src.services.model_lifecycle import ModelLifecycle
 from tests.colab_fakes import (
-    NIMBLE,
     QWEN,
+    ROUTER,
     SECRET,
     TUNNEL,
     Clock,
@@ -170,27 +170,30 @@ class RunCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("CU 餘額：88.2", reply)
         self.assertIn("今日用量：3.1 / 30 CU", reply)
         self.assertNotIn(TUNNEL, reply)
-        self.assertNotIn(NIMBLE, reply)
+        self.assertNotIn(ROUTER, reply)
 
-        pins = protocol.pinned_models()
-        republished = ready_state(
-            digests={QWEN: pins[QWEN], NIMBLE: "adfcdbb4070d303fb43fc11fc06a14269ec2bc7136a55369e86d412b86ba2831"}
+        # A moved tag is news, not a reason to sit out (the models follow
+        # their tags); no digest recorded is no reason either.
+        verified = protocol.colab_models()
+        moved = ready_state(
+            digests={QWEN: verified[QWEN], ROUTER: "adfcdbb4070d303fb43fc11fc06a14269ec2bc7136a55369e86d412b86ba2831"}
         )
-        reply, colab, _ = await self._run("!colab status", state=republished)
-        self.assertIn(f"{NIMBLE}：digest adfcdbb4070d 不是釘住的版本，這次不用它路由（改用 API）", reply)
+        reply, colab, _ = await self._run("!colab status", state=moved)
+        self.assertIn(f"{ROUTER}：tag 已更新（digest adfcdbb4070d，驗證過的是 73e026ff389b）", reply)
+        self.assertNotIn("這次不用它路由", reply)
 
-        reply, colab, _ = await self._run("!colab status", state=ready_state(digests={QWEN: pins[QWEN]}))
-        self.assertIn(f"{NIMBLE}：沒有記錄到 digest，這次不用它路由（改用 API）", reply)
+        reply, colab, _ = await self._run("!colab status", state=ready_state(digests={QWEN: verified[QWEN]}))
+        self.assertNotIn(ROUTER, reply)
 
-        spilled = ready_state(vram={QWEN: on_gpu(QWEN), NIMBLE: on_gpu(NIMBLE, 6 << 30)})
+        spilled = ready_state(vram={QWEN: on_gpu(QWEN), ROUTER: on_gpu(ROUTER, 6 << 30)})
         reply, colab, _ = await self._run("!colab status", state=spilled)
-        self.assertIn(f"{NIMBLE}：沒有完全載入 GPU（VRAM 6144 / 10110 MiB），這次不用它路由（改用 API）", reply)
-        self.assertEqual(reply.count(NIMBLE), 1)
+        self.assertIn(f"{ROUTER}：沒有完全載入 GPU（VRAM 6144 / 10110 MiB），這次不用它路由（改用 API）", reply)
+        self.assertEqual(reply.count(ROUTER), 1)
 
         # Not loaded when the probe looked, or evicted since (a health check
         # found it gone): the endpoint's view, not only the stored one.
         reply, colab, _ = await self._run("!colab status", state=ready_state(vram={QWEN: on_gpu(QWEN)}))
-        self.assertIn(f"{NIMBLE}：沒有載入（/api/ps 找不到），這次不用它路由（改用 API）", reply)
+        self.assertIn(f"{ROUTER}：沒有載入（/api/ps 找不到），這次不用它路由（改用 API）", reply)
         clock = Clock(1_790_000_000.0)
         evicted = FakeTunnel(**{"GET /api/ps": (200, {"models": [{"name": QWEN, **on_gpu(QWEN)}]})})
         colab, _ = make_endpoint(ready_state(clock()), evicted, clock=clock)
@@ -198,7 +201,7 @@ class RunCommandTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("linebot", "WARNING"):
             self.assertTrue(await colab.check_health())
         reply, *_ = await self._run("!colab status", colab=colab)
-        self.assertIn(f"{NIMBLE}：沒有載入（/api/ps 找不到），這次不用它路由（改用 API）", reply)
+        self.assertIn(f"{ROUTER}：沒有載入（/api/ps 找不到），這次不用它路由（改用 API）", reply)
 
         reply, colab, _ = await self._run("!colab restart")
         self.assertEqual((reply, colab.store.writes), (COLAB_USAGE, 0))
@@ -352,7 +355,7 @@ class SettingsTests(unittest.TestCase):
                 settings.colab_daily_cu_cap,
                 settings.admin_user_ids,
             ),
-            (False, True, 0.75, 0.85, 0.15, 900, 39600, 10.0, 30.0, frozenset()),
+            (False, True, 0.0, 0.85, 0.15, 900, 39600, 10.0, 30.0, frozenset()),
         )
         self.assertEqual(
             (
@@ -437,7 +440,6 @@ class SettingsTests(unittest.TestCase):
     def test_value_checks(self) -> None:
         for field, value in (
             ("colab_router_confidence", 1.0),
-            ("colab_router_confidence", 0.49),
             ("colab_router_confidence", -0.1),
             ("colab_router_think_on", 0.49),
             ("colab_router_think_on", 1.0),
@@ -460,12 +462,16 @@ class SettingsTests(unittest.TestCase):
 
     def test_router_gates_keep_their_ranges_and_on_above_off(self) -> None:
         edges = Settings(
-            _env_file=None, colab_router_confidence=0.5, colab_router_think_on=0.99, colab_router_think_off=0.01
+            _env_file=None, colab_router_confidence=0.0, colab_router_think_on=0.99, colab_router_think_off=0.01
         )
         self.assertEqual(
-            RouterGates.from_settings(edges), RouterGates(confidence=0.5, think_on=0.99, think_off=0.01)
+            RouterGates.from_settings(edges), RouterGates(confidence=0.0, think_on=0.99, think_off=0.01)
         )
         Settings(_env_file=None, colab_router_confidence=0.99, colab_router_think_on=0.51, colab_router_think_off=0.5)
+        # The confidence gate may sit under 0.5 (0 is argmax); THINK_ON may not.
+        self.assertEqual(Settings(_env_file=None, colab_router_confidence=0.49).colab_router_confidence, 0.49)
+        with self.assertRaisesRegex(ValidationError, "colab_router_think_on must be between 0.5 and 0.99"):
+            Settings(_env_file=None, colab_router_think_on=0.49)
         with self.assertRaisesRegex(ValidationError, "COLAB_ROUTER_THINK_ON must be above COLAB_ROUTER_THINK_OFF"):
             Settings(_env_file=None, colab_router_think_on=0.5, colab_router_think_off=0.5)
 
@@ -527,7 +533,7 @@ class CompositionTests(unittest.IsolatedAsyncioTestCase):
         router = container.orchestrator
         self.assertIsInstance(router.system_one, SystemOneRouter)
         self.assertTrue(router.system_one_first)
-        self.assertEqual((router.system_one.model, router.system_one.timeout_s), (NIMBLE, 6))
+        self.assertEqual((router.system_one.model, router.system_one.timeout_s), (ROUTER, 6))
         self.assertEqual(router.system_one.gates, RouterGates.from_settings(settings))
         # The Colab router answers on /v1/systemone, never through the JSON chain.
         self.assertNotIn("colab", {tier.provider_name for tier in router.targets})
@@ -549,7 +555,7 @@ class CompositionTests(unittest.IsolatedAsyncioTestCase):
         colab, _ = make_endpoint()
         container = build_container(_colab_settings(colab_router_enabled=False), colab=colab)
 
-        rows = [row for row in container.role_table.rows("router") if row.spec.model == NIMBLE]
+        rows = [row for row in container.role_table.rows("router") if row.spec.model == ROUTER]
         self.assertEqual([(row.enabled, row.disabled_reason) for row in rows], [(False, "COLAB_ROUTER_ENABLED=false")])
         self.assertIsNone(container.orchestrator.system_one)
         self.assertEqual(split_router_tiers(container.role_table)[1:], (None, False))
@@ -559,9 +565,9 @@ class CompositionTests(unittest.IsolatedAsyncioTestCase):
         settings = Settings(_env_file=None, openrouter_api_key="k")
         container = build_container(settings, extra_providers={"colab": _Api(), "nvidia": _Api()})
         tiers, system_one, first = split_router_tiers(container.role_table)
-        self.assertEqual((system_one.model, first), (NIMBLE, True))
+        self.assertEqual((system_one.model, first), (ROUTER, True))
         self.assertIsNone(container.orchestrator.system_one)
-        self.assertNotIn(NIMBLE, [tier.model for tier in container.orchestrator.targets])
+        self.assertNotIn(ROUTER, [tier.model for tier in container.orchestrator.targets])
         await container.aclose()
 
     async def test_unmet_requirements_leave_the_tier_off_with_the_reason(self) -> None:

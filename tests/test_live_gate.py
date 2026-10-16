@@ -239,7 +239,7 @@ class HelperTests(unittest.TestCase):
             live_gate.EMBED,
             live_gate.FLUX_KLEIN,
             live_gate.FLUX_DEV,
-            live_gate.OR_QWEN,
+            live_gate.OR_DOTS,
             live_gate.OR_ULTRA,
             live_gate.OR_SUPER,
         ):
@@ -284,7 +284,7 @@ class HelperTests(unittest.TestCase):
 
         row = live_gate.first_api_tier(table, "chat")
 
-        self.assertEqual(row.label, f"openrouter:{live_gate.OR_QWEN}")
+        self.assertEqual(row.label, f"openrouter:{live_gate.OR_DOTS}")
         with self.assertRaisesRegex(live_gate.GateError, "no enabled non-Colab tier.*NVIDIA_API_KEY not set"):
             live_gate.first_api_tier(table, "embed")
 
@@ -317,8 +317,10 @@ class HelperTests(unittest.TestCase):
         settings = Settings(_env_file=None)
         self.assertEqual(live_gate.tier_timeout(settings, "vision", "nvidia", live_gate.OMNI), 15)
         self.assertEqual(live_gate.tier_timeout(settings, "vision", "nvidia", live_gate.MUSE), 35)
-        self.assertEqual(live_gate.tier_timeout(settings, "vision", "openrouter", live_gate.OR_QWEN), 15)
-        self.assertEqual(live_gate.tier_timeout(settings, "router", "nvidia", live_gate.ULTRA), 12)
+        self.assertEqual(live_gate.tier_timeout(settings, "vision", "openrouter", live_gate.OR_DOTS), 20)
+        self.assertEqual(live_gate.tier_timeout(settings, "chat", "nvidia", live_gate.SUPER), 45)
+        self.assertEqual(live_gate.tier_timeout(settings, "chat", "nvidia", live_gate.ULTRA), 25)
+        self.assertEqual(live_gate.tier_timeout(settings, "router", "nvidia", live_gate.ULTRA), 6)
         self.assertIsNone(live_gate.tier_timeout(settings, "chat", "nvidia", live_gate.MUSE))
         broken = Settings(_env_file=None, model_roles="{not json")
         self.assertIsNone(live_gate.tier_timeout(broken, "vision", "nvidia", live_gate.MUSE))
@@ -402,6 +404,23 @@ class NvidiaCheckTests(unittest.TestCase):
         self.assertIn("15:04", followup["messages"][-1]["content"])
         self.assertIn("uses tool result: yes", evidence)
         self.assertIn("4 tool schemas accepted", evidence)
+
+    def test_super_tools_runs_the_bot_tool_loop_on_the_first_chat_api_tier(self) -> None:
+        def responder(request: httpx.Request, payload: dict) -> httpx.Response:
+            if payload["messages"][-1]["role"] == "tool":
+                return httpx.Response(200, json=_chat("現在台北時間是 15:04。"))
+            return httpx.Response(200, json=_chat("", tool_calls=[_TOOL_CALL], finish_reason="tool_calls"))
+
+        ctx, recorder = _context(responder)
+
+        evidence = live_gate.check_super_tools(ctx)
+
+        first, followup = recorder.payloads()
+        self.assertEqual([first["model"], followup["model"]], [live_gate.SUPER, live_gate.SUPER])
+        self.assertEqual(len(first["tools"]), 4)
+        self.assertEqual(first["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(followup["messages"][-1]["tool_call_id"], "call_1")
+        self.assertIn("uses tool result: yes", evidence)
 
     def test_ultra_tools_fails_when_the_model_never_calls_the_tool(self) -> None:
         ctx, _ = _context(lambda request, payload: httpx.Response(200, json=_chat("我不知道現在幾點。")))
@@ -815,7 +834,7 @@ class NvidiaCheckTests(unittest.TestCase):
 
 
 class OpenRouterCheckTests(unittest.TestCase):
-    def test_qwen_passes_when_effort_none_yields_no_reasoning_tokens(self) -> None:
+    def test_dots_passes_when_effort_none_yields_no_reasoning_tokens(self) -> None:
         ctx, recorder = _context(
             lambda request, payload: httpx.Response(
                 200,
@@ -826,17 +845,17 @@ class OpenRouterCheckTests(unittest.TestCase):
             )
         )
 
-        evidence = live_gate.check_openrouter_qwen_no_reasoning(ctx)
+        evidence = live_gate.check_openrouter_dots_no_reasoning(ctx)
 
         payload = recorder.payloads()[0]
-        self.assertEqual(payload["model"], live_gate.OR_QWEN)
+        self.assertEqual(payload["model"], live_gate.OR_DOTS)
         self.assertEqual(payload["reasoning"], {"effort": "none"})
         self.assertEqual(payload["max_tokens"], 2048)
         self.assertEqual(recorder.requests[0].headers["Authorization"], f"Bearer {_OPENROUTER_KEY}")
         self.assertIn("HTTP-Referer", recorder.requests[0].headers)
         self.assertIn("reasoning_tokens=0", evidence)
 
-    def test_qwen_failure_also_reports_the_enabled_false_alternative(self) -> None:
+    def test_dots_failure_also_reports_the_enabled_false_alternative(self) -> None:
         def responder(request: httpx.Request, payload: dict) -> httpx.Response:
             tokens = 0 if payload["reasoning"] == {"enabled": False} else 150
             return httpx.Response(
@@ -849,9 +868,9 @@ class OpenRouterCheckTests(unittest.TestCase):
         with self.assertRaisesRegex(
             live_gate.GateError, r"reasoning_tokens=150.*enabled:false -> reasoning_tokens=0"
         ):
-            live_gate.check_openrouter_qwen_no_reasoning(ctx)
+            live_gate.check_openrouter_dots_no_reasoning(ctx)
 
-    def test_qwen_thinking_sends_the_bot_reasoning_request(self) -> None:
+    def test_dots_thinking_sends_the_bot_reasoning_request(self) -> None:
         ctx, recorder = _context(
             lambda request, payload: httpx.Response(
                 200,
@@ -863,10 +882,10 @@ class OpenRouterCheckTests(unittest.TestCase):
             )
         )
 
-        evidence = live_gate.check_openrouter_qwen_thinking(ctx)
+        evidence = live_gate.check_openrouter_dots_thinking(ctx)
 
         payload = recorder.payloads()[0]
-        # The thinking role's effort, one qwen3.8-27b:free supports (xhigh/medium/low).
+        # The thinking role's effort, which dots-3 :free took live (2026-10-16).
         self.assertEqual(payload["reasoning"], {"effort": "medium"})
         self.assertNotIn("include_reasoning", payload)
         self.assertEqual(payload["max_tokens"], 4096 + 2048)
@@ -874,7 +893,7 @@ class OpenRouterCheckTests(unittest.TestCase):
         self.assertIn("reasoning_tokens=321", evidence)
         self.assertIn("expected answer: yes", evidence)
 
-    def test_qwen_thinking_uses_the_configured_budget(self) -> None:
+    def test_dots_thinking_uses_the_configured_budget(self) -> None:
         ctx, recorder = _context(
             lambda request, payload: httpx.Response(
                 200,
@@ -883,11 +902,11 @@ class OpenRouterCheckTests(unittest.TestCase):
             settings=Settings(_env_file=None, nvidia_thinking_budget=1024),
         )
 
-        live_gate.check_openrouter_qwen_thinking(ctx)
+        live_gate.check_openrouter_dots_thinking(ctx)
 
         self.assertEqual(recorder.payloads()[0]["max_tokens"], 1024 + 2048)
 
-    def test_qwen_thinking_fails_without_reasoning_or_on_a_rejected_effort(self) -> None:
+    def test_dots_thinking_fails_without_reasoning_or_on_a_rejected_effort(self) -> None:
         ctx, _ = _context(
             lambda request, payload: httpx.Response(
                 200,
@@ -895,13 +914,13 @@ class OpenRouterCheckTests(unittest.TestCase):
             )
         )
         with self.assertRaisesRegex(live_gate.GateError, "no reasoning despite thinking on"):
-            live_gate.check_openrouter_qwen_thinking(ctx)
+            live_gate.check_openrouter_dots_thinking(ctx)
 
         ctx, _ = _context(
             lambda request, payload: httpx.Response(400, text="effort 'high' is not supported")
         )
         with self.assertRaisesRegex(live_gate.GateError, "^HTTP 400: effort"):
-            live_gate.check_openrouter_qwen_thinking(ctx)
+            live_gate.check_openrouter_dots_thinking(ctx)
 
     def test_ultra_free_chat_and_thinking_send_their_efforts(self) -> None:
         ctx, recorder = _context(
@@ -945,7 +964,7 @@ class OpenRouterCheckTests(unittest.TestCase):
         ctx, _ = _context(lambda request, payload: httpx.Response(429, json=body))
 
         with self.assertRaisesRegex(live_gate.GateError, r"^HTTP 429 \(rate limited upstream"):
-            live_gate.check_openrouter_qwen_no_reasoning(ctx)
+            live_gate.check_openrouter_dots_no_reasoning(ctx)
 
         ctx, _ = _context(
             lambda request, payload: httpx.Response(429, text="Rate limit exceeded: free-models-per-day")
@@ -953,15 +972,15 @@ class OpenRouterCheckTests(unittest.TestCase):
         with self.assertRaisesRegex(
             live_gate.GateError, r"^HTTP 429 \(rate limited: OpenRouter's free-models-per-day cap\)$"
         ):
-            live_gate.check_openrouter_qwen_no_reasoning(ctx)
+            live_gate.check_openrouter_dots_no_reasoning(ctx)
 
         ctx, _ = _context(
             lambda request, payload: httpx.Response(429, text="Rate limit exceeded: free-models-per-min")
         )
         with self.assertRaisesRegex(live_gate.GateError, r"^HTTP 429 \(rate limited\)$"):
-            live_gate.check_openrouter_qwen_no_reasoning(ctx)
+            live_gate.check_openrouter_dots_no_reasoning(ctx)
 
-    def test_qwen_tools_runs_the_bot_tool_loop_on_openrouter(self) -> None:
+    def test_dots_tools_runs_the_bot_tool_loop_on_openrouter(self) -> None:
         def responder(request: httpx.Request, payload: dict) -> httpx.Response:
             if payload["messages"][-1]["role"] == "tool":
                 return httpx.Response(200, json=_chat("台北現在 15:04。"))
@@ -969,10 +988,10 @@ class OpenRouterCheckTests(unittest.TestCase):
 
         ctx, recorder = _context(responder)
 
-        evidence = live_gate.check_openrouter_qwen_tools(ctx)
+        evidence = live_gate.check_openrouter_dots_tools(ctx)
 
         first, followup = recorder.payloads()
-        self.assertEqual(first["model"], live_gate.OR_QWEN)
+        self.assertEqual(first["model"], live_gate.OR_DOTS)
         self.assertEqual(first["reasoning"], {"effort": "none"})
         self.assertEqual(followup["messages"][-1]["role"], "tool")
         self.assertIn("uses tool result: yes", evidence)
@@ -982,7 +1001,7 @@ class OpenRouterCheckTests(unittest.TestCase):
         ctx, recorder = _context(lambda request, payload: httpx.Response(429, text=cap))
 
         tools, later = live_gate.run_checks(
-            ctx, [_check("openrouter.qwen.tools"), _check("openrouter.ultra.no_reasoning")]
+            ctx, [_check("openrouter.dots.tools"), _check("openrouter.ultra.no_reasoning")]
         )
 
         self.assertFalse(tools.passed or tools.skipped)
@@ -991,21 +1010,21 @@ class OpenRouterCheckTests(unittest.TestCase):
         self.assertEqual(later.evidence, live_gate.DAILY_CAP_NOTE)
         self.assertEqual(len(recorder.requests), 1)
 
-    def test_qwen_vision_sends_the_vision_agent_messages_with_effort_none(self) -> None:
+    def test_dots_vision_sends_the_vision_agent_messages_with_effort_none(self) -> None:
         ctx, recorder = _context(lambda request, payload: httpx.Response(200, json=_chat("紅色的圓形")))
 
-        evidence = live_gate.check_openrouter_qwen_vision(ctx)
+        evidence = live_gate.check_openrouter_dots_vision(ctx)
 
         payload = recorder.payloads()[0]
-        self.assertEqual(payload["model"], live_gate.OR_QWEN)
-        # qwen3.8 reasons at xhigh unless told otherwise; the vision tier says none.
+        self.assertEqual(payload["model"], live_gate.OR_DOTS)
+        # dots-3 reasons unless told otherwise; the vision tier says none.
         self.assertEqual(payload["reasoning"], {"effort": "none"})
         self.assertTrue(_image_part(payload)["image_url"]["url"].startswith("data:image/png;base64,"))
         self.assertIn("mentions red: yes", evidence)
 
         ctx, _ = _context(lambda request, payload: httpx.Response(200, json=_chat("A blue square.")))
         with self.assertRaisesRegex(live_gate.GateError, "mentions red: no"):
-            live_gate.check_openrouter_qwen_vision(ctx)
+            live_gate.check_openrouter_dots_vision(ctx)
 
 
 class RoleCheckTests(unittest.TestCase):
@@ -1036,19 +1055,22 @@ class RoleCheckTests(unittest.TestCase):
         self.assertTrue(all(result.passed for result in results), [r.evidence for r in results])
         evidence = {result.check_id: result.evidence for result in results}
         self.assertTrue(evidence["roles.router"].startswith(f"nvidia:{live_gate.SUPER}: agent=web_search"))
-        self.assertTrue(evidence["roles.chat"].startswith(f"nvidia:{live_gate.ULTRA}"))
-        self.assertTrue(evidence["roles.thinking"].startswith(f"nvidia:{live_gate.ULTRA}"))
+        self.assertTrue(evidence["roles.chat"].startswith(f"nvidia:{live_gate.SUPER}"))
+        self.assertTrue(evidence["roles.thinking"].startswith(f"nvidia:{live_gate.SUPER}"))
         self.assertTrue(evidence["roles.vision"].startswith(f"nvidia:{live_gate.OMNI}"))
         self.assertTrue(evidence["roles.utility"].startswith(f"nvidia:{live_gate.SUPER}"))
         self.assertEqual(evidence["roles.embed"], f"nvidia:{live_gate.EMBED}: vector dim=1024")
         self.assertEqual(evidence["roles.image"], f"nvidia:{live_gate.FLUX_KLEIN}: image returned")
         chat_payloads = [
-            payload for payload in recorder.payloads() if payload.get("model") == live_gate.ULTRA
+            payload
+            for payload in recorder.payloads()
+            if payload.get("model") == live_gate.SUPER and not payload.get("response_format")
         ]
-        # chat with thinking off, then the thinking role with it on.
+        # Super answers three roles besides the router: chat with thinking
+        # off, the thinking role with it on, utility with it off.
         self.assertEqual(
             [payload["chat_template_kwargs"]["enable_thinking"] for payload in chat_payloads],
-            [False, True],
+            [False, True, False],
         )
         router = next(payload for payload in recorder.payloads() if payload.get("response_format"))
         self.assertEqual(router["response_format"]["type"], "json_schema")
@@ -1062,8 +1084,8 @@ class RoleCheckTests(unittest.TestCase):
         [result] = live_gate.run_checks(ctx, [_check("roles.chat")])
 
         self.assertTrue(result.passed, result.evidence)
-        self.assertTrue(result.evidence.startswith(f"openrouter:{live_gate.OR_QWEN}"))
-        self.assertEqual(recorder.payloads()[0]["model"], live_gate.OR_QWEN)
+        self.assertTrue(result.evidence.startswith(f"openrouter:{live_gate.OR_DOTS}"))
+        self.assertEqual(recorder.payloads()[0]["model"], live_gate.OR_DOTS)
 
     def test_role_checks_resolve_their_api_for_the_cap_and_the_pacing(self) -> None:
         with_keys, _ = _context(_tier_reply)
@@ -1119,7 +1141,7 @@ class RoleCheckTests(unittest.TestCase):
         self.assertTrue(result.evidence.startswith("HTTP 410"), result.evidence)
 
 
-_COLAB_CHECKS = ["colab.probe", "colab.qwen.chat", "colab.qwen.vision", "colab.nimble.router"]
+_COLAB_CHECKS = ["colab.probe", "colab.qwen.chat", "colab.qwen.vision", "colab.router"]
 _COLAB_ON = {
     "colab_enabled": True,
     "firestore_enabled": True,
@@ -1229,9 +1251,11 @@ class ColabPathTests(unittest.TestCase):
         self.assertEqual([result.check_id for result in results], _COLAB_CHECKS)
         self.assertTrue(all(result.passed for result in results), [r.evidence for r in results])
         probe, chat, vision, router = (result.evidence for result in results)
-        self.assertIn(f"Ollama {live_gate.protocol.OLLAMA_VERSION}", probe)
+        self.assertIn(f"Ollama {colab_fakes.OLLAMA}", probe)
         self.assertIn(
-            f"loaded wholly in VRAM ({colab_fakes.QWEN} 24128 MiB, {colab_fakes.NIMBLE} 10110 MiB)", probe
+            f"loaded wholly in VRAM ({colab_fakes.QWEN} 24128 MiB, {colab_fakes.ROUTER} 10110 MiB), "
+            "at the verified digests",
+            probe,
         )
         self.assertIn("think=low", chat)
         self.assertIn("CJK", chat)
@@ -1258,7 +1282,7 @@ class ColabPathTests(unittest.TestCase):
         [image] = [m["images"][0] for m in chats[1]["messages"] if m.get("images")]
         self.assertFalse(image.startswith("data:"))
         [routed] = [json.loads(r.content) for r in recorder.requests if r.url.path == "/v1/systemone"]
-        self.assertEqual(routed["model"], colab_fakes.NIMBLE)
+        self.assertEqual(routed["model"], colab_fakes.ROUTER)
         self.assertEqual(routed["state"]["message"], live_gate.ROUTER_USER_MESSAGE)
 
     def test_a_tunnel_url_that_breaks_the_rule_is_never_called(self) -> None:
@@ -1273,14 +1297,15 @@ class ColabPathTests(unittest.TestCase):
 
     def test_failures_are_reported_and_redacted(self) -> None:
         bearer = colab_fakes.bearer()
-        wrong_tags = (200, {"models": [{"name": colab_fakes.QWEN, "model": colab_fakes.QWEN, "digest": "0" * 64}]})
+        only_chat = (200, {"models": [{"name": colab_fakes.QWEN, "model": colab_fakes.QWEN, "digest": "0" * 64}]})
         refused = (401, {"error": f"bad bearer {bearer} for {colab_fakes.TUNNEL_HOST}"})
 
-        results, _, _ = _colab_run(_tunnel(**{"GET /api/tags": wrong_tags, "POST /api/chat": refused}), colab_fakes.ready_state())
+        results, _, _ = _colab_run(_tunnel(**{"GET /api/tags": only_chat, "POST /api/chat": refused}), colab_fakes.ready_state())
 
         probe, chat, vision, _ = results
         self.assertFalse(probe.passed)
-        self.assertIn("digest", probe.evidence.lower())
+        # The router missing from /api/tags; qwen3.8's other digest is no problem.
+        self.assertEqual(probe.evidence, f"not listed: {colab_fakes.ROUTER}")
         for result in (chat, vision):
             self.assertFalse(result.passed)
             self.assertTrue(result.evidence.startswith("HTTP 401"), result.evidence)
@@ -1288,17 +1313,26 @@ class ColabPathTests(unittest.TestCase):
             self.assertNotIn(colab_fakes.TUNNEL_HOST, result.evidence)
             self.assertIn("***", result.evidence)
 
-    def test_an_unsure_colab_router_passes_and_says_the_api_router_decides(self) -> None:
+    def test_an_unsure_colab_router_passes_and_says_who_decides(self) -> None:
         unsure = (200, colab_fakes.systemone_answer(agent="chat", agent_confidence=0.41))
+        refused = (200, colab_fakes.systemone_answer(agent="image_gen", output="text"))
+        cases = (
+            # The default gate (0.0) takes the top choice however unsure.
+            (unsure, {}, "agent=chat (expected web_search) (0.41)", "; decides chat;"),
+            (unsure, {"colab_router_confidence": 0.9}, "(0.41)", "; below the 0.9 gate, the API router decides;"),
+            # image_gen without image output: an invariant, not the gate.
+            (refused, {}, "agent=image_gen (expected web_search) (0.90)", "; the API router decides;"),
+        )
+        for answer, settings, scored, verdict in cases:
+            with self.subTest(verdict=verdict):
+                results, _, _ = _colab_run(_tunnel(**{"POST /v1/systemone": answer}), colab_fakes.ready_state(), **settings)
 
-        results, _, _ = _colab_run(_tunnel(**{"POST /v1/systemone": unsure}), colab_fakes.ready_state())
+                router = results[-1]
+                self.assertTrue(router.passed, router.evidence)
+                self.assertIn(scored, router.evidence)
+                self.assertIn(verdict, router.evidence)
 
-        router = results[-1]
-        self.assertTrue(router.passed, router.evidence)
-        self.assertIn("agent=chat (expected web_search) (0.41)", router.evidence)
-        self.assertIn("below the 0.75 gate, the API router decides", router.evidence)
-
-    def test_only_the_routing_call_counts_against_nimbles_limit(self) -> None:
+    def test_only_the_routing_call_counts_against_the_routers_limit(self) -> None:
         clock = _FakeClock()
         real_bot_roles = live_gate.bot_roles
 
@@ -1312,34 +1346,62 @@ class ColabPathTests(unittest.TestCase):
             clock.now += 7.0
             return httpx.Response(200, json=colab_fakes.systemone_answer(agent="web_search"))
 
-        nimble_ids = ["colab.nimble.router", f"tier.router.1.colab:{live_gate.COLAB_NIMBLE}"]
+        router_ids = ["colab.router", f"tier.router.1.colab:{live_gate.COLAB_ROUTER}"]
         for route, passes in ((_tunnel(), True), (_tunnel(**{"POST /v1/systemone": slow_route}), False)):
             settings = Settings(_env_file=None, **_COLAB_ON)
             ctx, _ = _context(route, settings=settings)
             ctx.colab_loader = _Loader(colab_fakes.ready_state())
             ctx.clock = clock
             with patch.object(live_gate, "bot_roles", slow_setup):
-                results = live_gate.run_checks(ctx, live_gate.select_checks("all", nimble_ids, settings))
-            self.assertEqual([result.check_id for result in results], nimble_ids)
+                results = live_gate.run_checks(ctx, live_gate.select_checks("all", router_ids, settings))
+            self.assertEqual([result.check_id for result in results], router_ids)
             for result in results:
                 with self.subTest(check=result.check_id, passes=passes):
                     self.assertEqual(result.passed, passes, result.evidence)
                     if not passes:
-                        self.assertIn(f"answered in 7.0s, past {live_gate.COLAB_NIMBLE}'s 6s limit", result.evidence)
+                        self.assertIn(f"answered in 7.0s, past {live_gate.COLAB_ROUTER}'s 6s limit", result.evidence)
 
     def test_a_malformed_colab_router_answer_fails(self) -> None:
-        broken = (200, {"model": colab_fakes.NIMBLE, "answers": {"agent": {"choice": "dance", "confidence": 1}}})
+        broken = (200, {"model": colab_fakes.ROUTER, "answers": {"agent": {"choice": "dance", "confidence": 1}}})
 
         results, _, _ = _colab_run(_tunnel(**{"POST /v1/systemone": broken}), colab_fakes.ready_state())
 
         self.assertFalse(results[-1].passed)
         self.assertIn("malformed agent answer", results[-1].evidence)
 
+    def test_moved_tags_pass_the_probe_and_are_named(self) -> None:
+        moved = "adfcdbb4070d303fb43fc11fc06a14269ec2bc7136a55369e86d412b86ba2831"
+        tags = (
+            200,
+            {
+                "models": [
+                    {"name": model, "model": model, "digest": moved if model == colab_fakes.ROUTER else digest}
+                    for model, digest in live_gate.protocol.colab_models().items()
+                ]
+            },
+        )
+
+        results, _, _ = _colab_run(_tunnel(**{"GET /api/tags": tags}), colab_fakes.ready_state())
+
+        self.assertTrue(results[0].passed, results[0].evidence)
+        self.assertIn(f"tags moved since verified: {colab_fakes.ROUTER} adfcdbb4070d", results[0].evidence)
+
+    def test_the_probe_wants_the_release_the_session_was_launched_with(self) -> None:
+        state = colab_fakes.ready_state(ollama_version="0.41.2")
+
+        results, _, _ = _colab_run(_tunnel(), state)
+
+        self.assertFalse(results[0].passed)
+        self.assertIn(
+            f"Ollama {colab_fakes.OLLAMA}, expected 0.41.2 (the release this session was launched with)",
+            results[0].evidence,
+        )
+
     def test_a_router_not_wholly_in_vram_fails_the_probe(self) -> None:
-        pins = live_gate.protocol.pinned_models()
+        pins = live_gate.protocol.colab_models()
         running = {
             "models": [
-                {"name": model, "model": model, **colab_fakes.on_gpu(model, 5 << 30 if model == colab_fakes.NIMBLE else None)}
+                {"name": model, "model": model, **colab_fakes.on_gpu(model, 5 << 30 if model == colab_fakes.ROUTER else None)}
                 for model in pins
             ]
         }
@@ -1347,7 +1409,7 @@ class ColabPathTests(unittest.TestCase):
         results, _, _ = _colab_run(_tunnel(**{"GET /api/ps": (200, running)}), colab_fakes.ready_state())
 
         self.assertFalse(results[0].passed)
-        self.assertIn(f"{colab_fakes.NIMBLE} not fully on the GPU (5120 of 10110 MiB in VRAM)", results[0].evidence)
+        self.assertIn(f"{colab_fakes.ROUTER} not fully on the GPU (5120 of 10110 MiB in VRAM)", results[0].evidence)
 
     def test_a_dry_run_session_runs_only_the_probe(self) -> None:
         results, recorder, _ = _colab_run(_tunnel(), colab_fakes.ready_state(), colab_dry_run=True)
@@ -1437,7 +1499,7 @@ class RunnerTests(unittest.TestCase):
         code, _, err, recorder = self._run_main(
             f"OPENROUTER_API_KEY={_OPENROUTER_KEY}\nNVIDIA_THINKING_BUDGET=1024\n"
             'MODEL_ROLES=\'{"chat": [{"provider": "nvidia", "model": "example/pinned-model"}]}\'\n',
-            ["--only", "openrouter.qwen.thinking"],
+            ["--only", "openrouter.dots.thinking"],
             lambda request, payload: httpx.Response(
                 200, json=_chat("2", usage={"completion_tokens_details": {"reasoning_tokens": 5}})
             ),
@@ -1524,7 +1586,7 @@ class RunnerTests(unittest.TestCase):
 _JPEG = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 4096).decode()
 _TIER_ANSWERS = {
     "vision": "圖片中央是一個紅色的圓形。",
-    "utility": "使用者正在學鋼琴（每週六上課），並計畫年底前去京都賞楓，預算約五萬元。",
+    "utility": "移除：無\n- 使用者正在學鋼琴，每週六上課\n- 計畫年底前去京都賞楓，預算約五萬元",
     "thinking": "兩管同時打開需要 2 小時。",
     "chat": "台北 101 是台北信義區的地標摩天大樓。",
 }
@@ -1604,7 +1666,7 @@ class TierCheckTests(unittest.TestCase):
         self.assertEqual(
             [check.check_id for check in checks[:4]],
             [
-                f"tier.router.1.colab:{live_gate.COLAB_NIMBLE}",
+                f"tier.router.1.colab:{live_gate.COLAB_ROUTER}",
                 f"tier.router.2.nvidia:{live_gate.SUPER}",
                 f"tier.router.3.nvidia:{live_gate.ULTRA}",
                 f"tier.router.4.openrouter:{live_gate.OR_SUPER}",
@@ -1619,7 +1681,8 @@ class TierCheckTests(unittest.TestCase):
             [
                 f"tier.utility.1.nvidia:{live_gate.SUPER}",
                 f"tier.utility.2.nvidia:{live_gate.ULTRA}",
-                f"tier.utility.3.openrouter:{live_gate.OR_ULTRA}",
+                f"tier.utility.3.openrouter:{live_gate.OR_DOTS}",
+                f"tier.utility.4.openrouter:{live_gate.OR_ULTRA}",
             ],
         )
         # The env file's table, not the code defaults: MODEL_ROLES and the
@@ -1627,12 +1690,12 @@ class TierCheckTests(unittest.TestCase):
         settings = Settings(
             _env_file=None,
             model_path_preference="api",
-            model_roles=json.dumps({"utility": [{"provider": "openrouter", "model": live_gate.OR_QWEN, "effort": "none"}]}),
+            model_roles=json.dumps({"utility": [{"provider": "openrouter", "model": live_gate.OR_DOTS, "effort": "none"}]}),
         )
         tiers = [check.check_id for check in live_gate.select_checks("tiers", [], settings)]
         self.assertEqual(tiers, _tier_ids(settings))
-        self.assertIn(f"tier.utility.1.openrouter:{live_gate.OR_QWEN}", tiers)
-        self.assertIn(f"tier.chat.4.colab:{live_gate.COLAB_QWEN}", tiers)
+        self.assertIn(f"tier.utility.1.openrouter:{live_gate.OR_DOTS}", tiers)
+        self.assertIn(f"tier.chat.5.colab:{live_gate.COLAB_QWEN}", tiers)
 
     def test_an_invalid_role_table_is_one_failing_check(self) -> None:
         settings = Settings(_env_file=None, model_roles="{not json")
@@ -1656,20 +1719,23 @@ class TierCheckTests(unittest.TestCase):
                     self.assertEqual(result.evidence, "COLAB_ENABLED is off")
                 else:
                     self.assertTrue(result.passed, result.evidence)
-        # Exactly one request per API tier: 11 NVIDIA, 7 OpenRouter.
+        # Exactly one request per API tier: 13 NVIDIA, 8 OpenRouter.
         hosts = [request.url.host for request in recorder.requests]
-        self.assertEqual(hosts.count("openrouter.ai"), 7)
+        self.assertEqual(hosts.count("openrouter.ai"), 8)
         self.assertEqual(
-            hosts.count("integrate.api.nvidia.com") + hosts.count("ai.api.nvidia.com"), 11
+            hosts.count("integrate.api.nvidia.com") + hosts.count("ai.api.nvidia.com"), 13
         )
         evidence = {check_id: result.evidence for check_id, result in results.items()}
         for tier in (f"2.nvidia:{live_gate.SUPER}", f"3.nvidia:{live_gate.ULTRA}", f"4.openrouter:{live_gate.OR_SUPER}"):
             self.assertEqual(evidence[f"tier.router.{tier}"], "agent=web_search, output=text, thinking=off")
-        self.assertEqual(evidence[f"tier.chat.2.nvidia:{live_gate.ULTRA}"], "21 chars, CJK 83%, traditional: yes")
-        self.assertIn("expected answer: yes", evidence[f"tier.thinking.2.nvidia:{live_gate.ULTRA}"])
+        self.assertEqual(evidence[f"tier.chat.2.nvidia:{live_gate.SUPER}"], "21 chars, CJK 83%, traditional: yes")
+        self.assertEqual(evidence[f"tier.chat.3.nvidia:{live_gate.ULTRA}"], "21 chars, CJK 83%, traditional: yes")
+        self.assertIn("expected answer: yes", evidence[f"tier.thinking.2.nvidia:{live_gate.SUPER}"])
+        self.assertIn("expected answer: yes", evidence[f"tier.thinking.3.nvidia:{live_gate.ULTRA}"])
         self.assertTrue(evidence[f"tier.vision.2.nvidia:{live_gate.OMNI}"].startswith("red circle:"))
         self.assertTrue(evidence[f"tier.vision.3.nvidia:{live_gate.MUSE}"].startswith("red circle:"))
-        self.assertIn("traditional: yes", evidence[f"tier.utility.3.openrouter:{live_gate.OR_ULTRA}"])
+        self.assertIn("traditional: yes", evidence[f"tier.utility.3.openrouter:{live_gate.OR_DOTS}"])
+        self.assertIn("traditional: yes", evidence[f"tier.utility.4.openrouter:{live_gate.OR_ULTRA}"])
         self.assertEqual(evidence[f"tier.embed.1.nvidia:{live_gate.EMBED}"], "dim=1024 = EMBEDDING_DIMENSIONS")
         self.assertEqual(evidence[f"tier.image.2.nvidia:{live_gate.FLUX_DEV}"], "image/jpeg, 4 KB")
 
@@ -1688,12 +1754,20 @@ class TierCheckTests(unittest.TestCase):
         )
         [chat] = sent("chat", live_gate.ULTRA)
         self.assertEqual(chat["chat_template_kwargs"], {"enable_thinking": False})
-        # Thinking as the tier says, with the budget it gets.
+        # Super's chat tier: thinking off, the model card's sampling.
+        [super_chat] = sent("chat", live_gate.SUPER)
+        self.assertEqual(super_chat["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual((super_chat["temperature"], super_chat["top_p"]), (1.0, 0.95))
+        # Thinking as the tier says, with the budget it gets: Super takes it
+        # as a reasoning_budget too, Ultra does not.
+        [super_thinking] = sent("thinking", live_gate.SUPER)
+        self.assertEqual(super_thinking["chat_template_kwargs"], {"enable_thinking": True})
+        self.assertEqual((super_thinking["reasoning_budget"], super_thinking["max_tokens"]), (4096, 2048 + 4096))
         [thinking] = sent("thinking", live_gate.ULTRA)
         self.assertEqual(thinking["chat_template_kwargs"], {"enable_thinking": True, "medium_effort": True})
         self.assertNotIn("reasoning_budget", thinking)
         self.assertEqual(thinking["max_tokens"], 2048 + 4096)
-        for model in (live_gate.OR_QWEN, live_gate.OR_ULTRA):
+        for model in (live_gate.OR_DOTS, live_gate.OR_ULTRA):
             [deep] = sent("thinking", model)
             self.assertEqual(deep["reasoning"], {"effort": "medium"})
         [omni] = sent("vision", live_gate.OMNI)
@@ -1703,8 +1777,8 @@ class TierCheckTests(unittest.TestCase):
         [muse] = sent("vision", live_gate.MUSE)
         self.assertEqual(muse["reasoning_effort"], "none")
         self.assertIsNotNone(_image_part(muse))
-        [qwen_vision] = sent("vision", live_gate.OR_QWEN)
-        self.assertEqual(qwen_vision["reasoning"], {"effort": "none"})
+        [dots_vision] = sent("vision", live_gate.OR_DOTS)
+        self.assertEqual(dots_vision["reasoning"], {"effort": "none"})
         [summary] = sent("utility", live_gate.SUPER)
         self.assertEqual((summary["temperature"], summary["max_tokens"]), (0.2, 768))
         self.assertEqual(summary["chat_template_kwargs"], {"enable_thinking": False})
@@ -1723,7 +1797,7 @@ class TierCheckTests(unittest.TestCase):
         ctx.clock, ctx.sleep = clock, clock.sleep
         live_gate.run_checks(ctx, live_gate.select_checks("tiers"))
 
-        self.assertEqual(len(sent), 18)
+        self.assertEqual(len(sent), 21)
         self.assertTrue(clock.sleeps)
         for provider, interval in (("nvidia", 60 / 40), ("openrouter", 60 / 20)):
             times = [at for name, at in sent if name == provider]
@@ -1743,10 +1817,10 @@ class TierCheckTests(unittest.TestCase):
             return _tier_reply(request, payload)
 
         ctx, recorder = _context(responder)
-        checks = [_check("openrouter.qwen.no_reasoning"), *live_gate.select_checks("tiers")]
+        checks = [_check("openrouter.dots.no_reasoning"), *live_gate.select_checks("tiers")]
         results = {result.check_id: result for result in live_gate.run_checks(ctx, checks)}
 
-        first = results["openrouter.qwen.no_reasoning"]
+        first = results["openrouter.dots.no_reasoning"]
         self.assertFalse(first.passed or first.skipped)
         self.assertEqual(first.evidence, "HTTP 429 (rate limited: OpenRouter's free-models-per-day cap)")
         # One request met the cap; every OpenRouter tier after it SKIPs unsent.
@@ -1768,7 +1842,7 @@ class TierCheckTests(unittest.TestCase):
         self.assertIn("free-models-per-day", router.evidence)
         self.assertFalse(router.passed or router.skipped)
         self.assertEqual([r.url.host for r in recorder.requests].count("openrouter.ai"), 1)
-        self.assertTrue(results[f"tier.chat.3.openrouter:{live_gate.OR_QWEN}"].skipped)
+        self.assertTrue(results[f"tier.chat.4.openrouter:{live_gate.OR_DOTS}"].skipped)
 
     def test_force_tier_skips_and_a_missing_key_fails_without_a_request(self) -> None:
         results, recorder, _ = _tier_run(_tier_reply, settings=Settings(_env_file=None, force_tier="openrouter"))
@@ -1830,10 +1904,14 @@ class TierCheckTests(unittest.TestCase):
     def test_each_role_fails_on_a_bad_answer(self) -> None:
         cases = {
             f"tier.router.3.nvidia:{live_gate.ULTRA}": (_chat("我覺得應該查一下網路"), "no routing decision in the reply"),
-            f"tier.chat.2.nvidia:{live_gate.ULTRA}": (_chat("Taipei 101 is a skyscraper in Taipei."), "answer is not zh-TW"),
-            f"tier.thinking.2.nvidia:{live_gate.ULTRA}": (_chat("需要 2 小時。"), "no reasoning despite thinking on"),
+            f"tier.chat.2.nvidia:{live_gate.SUPER}": (_chat("Taipei 101 is a skyscraper in Taipei."), "answer is not zh-TW"),
+            f"tier.thinking.2.nvidia:{live_gate.SUPER}": (_chat("需要 2 小時。"), "no reasoning despite thinking on"),
             f"tier.vision.2.nvidia:{live_gate.OMNI}": (_chat("一個藍色的正方形。"), "red: no, circle: no"),
             f"tier.utility.1.nvidia:{live_gate.SUPER}": (_chat("使用者在學", finish_reason="length"), "cut off at max_tokens"),
+            # A whole summary that loses the old items: MemoryService rejects it.
+            f"tier.utility.2.nvidia:{live_gate.ULTRA}": (_chat("使用者正在學鋼琴。"), "not an update in the summary format"),
+            f"tier.utility.3.openrouter:{live_gate.OR_DOTS}": (_chat("移除：1\n- 使用者正在學鋼琴"), "dropped 1 old item(s)"),
+            f"tier.utility.4.openrouter:{live_gate.OR_ULTRA}": (_chat("移除：無"), "and added 0"),
             f"tier.embed.1.nvidia:{live_gate.EMBED}": ({"data": [{"index": 0, "embedding": [0.1] * 512}]}, "no vector from the app (api dim=512, EMBEDDING_DIMENSIONS=1024)"),
             # The provider raises ContentFilteredError for it (D5).
             f"tier.image.1.nvidia:{live_gate.FLUX_KLEIN}": ({"artifacts": [{"finishReason": "CONTENT_FILTERED"}]}, "content filtered"),
@@ -1860,10 +1938,15 @@ class TierCheckTests(unittest.TestCase):
     def test_the_utility_tiers_get_the_memory_services_own_request(self) -> None:
         messages = live_gate._utility_messages()
 
-        self.assertEqual(messages, memory_service.summary_messages("", live_gate.UTILITY_DIALOGUE))
+        self.assertEqual(
+            messages, memory_service.summary_messages(live_gate.UTILITY_SUMMARY, live_gate.UTILITY_DIALOGUE)
+        )
         request = messages[1]["content"]
-        # What the bot sends for a first summary, its update rules included.
-        self.assertIn("現有長期記憶摘要（預設保留，除非新對話明確推翻、過期或確認不再重要）：\n(empty)\n\n", request)
+        # What the bot sends to update a summary, its update rules included.
+        self.assertIn(
+            "現有長期記憶摘要（預設保留，除非新對話明確推翻、過期或確認不再重要）：\n[1] 使用者住在台北；\n[2] 喜歡喝無糖綠茶。\n\n",
+            request,
+        )
         self.assertIn("更新要求：\n1. 保留舊摘要中仍有效的資訊。", request)
         self.assertTrue(request.endswith(f"最近對話：\n{live_gate.UTILITY_DIALOGUE}"))
 

@@ -23,11 +23,16 @@ non-public address
 
 Events: ``ready`` (with a passing probe) moves ASSIGNING/BOOTING/READY to
 READY, unless ``!colab off`` came first: then the session drains and the VM
-gets 409 (it reports ``failed`` and releases itself). A router that is
-not listed or loaded, at another digest than its pin (a republished tag)
-or not wholly in VRAM passes the probe; the session keeps the digests and sizes the probe saw, and the
-router skips it (:meth:`ColabEndpoint.unpinned`,
-:meth:`ColabEndpoint.off_gpu`). ``failed`` moves an
+gets 409 (it reports ``failed`` and releases itself). The probe wants the
+Ollama release the launcher picked (``ColabState.ollama_version``); no
+digest is compared, the models follow their tags. A router that is not
+listed or loaded, or not wholly in VRAM passes the probe; the session
+keeps the digests and sizes the probe saw, and the router skips it
+(:meth:`ColabEndpoint.off_gpu`). READY is logged at INFO with the actual
+Ollama version and each model's digest (noting a tag that moved since it
+was verified), and a router the session lacks gets one ERROR with the
+reason: what the probe saw and the ``error`` the VM sent with ``ready``
+(why the pull or load failed). ``failed`` moves an
 active session to DRAINING and, from ASSIGNING or BOOTING, counts a boot
 failure (three in a row disable the tier); ``stopping`` (the VM's watchdog
 is about to release itself) moves it to DRAINING. On a session already
@@ -49,7 +54,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from src.services.colab import protocol
-from src.services.colab.endpoint import ColabEndpoint
+from src.services.colab.endpoint import ColabEndpoint, ProbeReport
 from src.services.colab.state import (
     ASSIGNING,
     BOOTING,
@@ -175,7 +180,7 @@ class ColabRegistrar:
             return _refuse(422, f"tunnel_url refused: {exc}")
         tunnel_url = protocol.tunnel_base_url(host)
 
-        report = await self._endpoint.readiness(tunnel_url, nbh)
+        report = await self._endpoint.readiness(tunnel_url, nbh, ollama_version=state.ollama_version)
         problems = report.problems
         if problems:
             detail = clip("; ".join(problems))
@@ -185,8 +190,8 @@ class ColabRegistrar:
 
         reported = {
             "versions": _reported(payload.get("versions")),
-            # What the probe saw rather than what the VM says: a router at
-            # another digest or partly on the CPU stays out of this session.
+            # What the probe saw rather than what the VM says: a router not
+            # loaded or partly on the CPU stays out of this session.
             "digests": dict(report.digests),
             "vram": dict(report.vram),
             "gpu": _reported(payload.get("gpu")),
@@ -221,7 +226,11 @@ class ColabRegistrar:
                 self._endpoint.mark_unhealthy("!colab off")
             return _refuse(409, f"session is {updated.status}")
         self._endpoint.record_success()
-        logger.info(f"Colab session READY ({protocol.OLLAMA_VERSION}, gpu={reported['gpu'].get('name', '?')})")
+        logger.info(
+            f"Colab session READY (Ollama {report.ollama_version or '?'}, gpu={reported['gpu'].get('name', '?')})"
+        )
+        _log_digests(report.digests)
+        _log_missing_routers(report, clip(str(payload.get("error") or "")))
         return RegistrationResult(200, {"ok": True, "status": READY})
 
     async def _stop(self, event: str, payload: dict[str, Any], state: ColabState, now: float) -> RegistrationResult:
@@ -290,6 +299,46 @@ class ColabRegistrar:
             await self._endpoint.store.update(change)
         except ColabStateError as exc:
             logger.warning(f"Colab register: could not note the refusal: {exc}")
+
+
+def _log_digests(digests: dict[str, str]) -> None:
+    """One INFO line per model: the digest its tag gave this session, and
+    whether the tag moved since that digest was verified (the models follow
+    their tags, so this is news, not a problem)."""
+    verified = protocol.colab_models()
+    for model, digest in sorted(digests.items()):
+        known = verified.get(model, "")
+        note = "the verified one" if digest == known else f"tag moved since it was verified ({known[:12] or 'none'})"
+        logger.info(f"Colab session READY: {model} at digest {clip(digest, 80) or '(none)'}, {note}")
+
+
+def _log_missing_routers(report: ProbeReport, vm_error: str) -> None:
+    """The one ERROR for a session READY without its router: which one, what
+    the probe saw (not pulled, not loaded, or the MiB it got in VRAM) and
+    why the VM says (its ready event's ``error``), since the VM's own log
+    never reaches Cloud Logging. Later health checks then drop it quietly
+    (:meth:`ColabEndpoint._drop_routers_off_gpu`)."""
+    missing = protocol.off_gpu(report.vram)
+    if not missing:
+        return
+    found = []
+    for model, (in_vram, size) in sorted(missing.items()):
+        if size:
+            found.append(f"{model} not wholly in VRAM ({protocol.mib(in_vram)} of {protocol.mib(size)} MiB)")
+        elif model not in report.digests:
+            found.append(f"{model} not pulled (/api/tags does not list it)")
+        else:
+            found.append(f"{model} not loaded (/api/ps does not list it)")
+    # The README section for the cause: VRAM when the router is there but
+    # partly off the GPU, else the troubleshooting table (a pull refused
+    # with HTTP 412, a load that failed or was undone for qwen3.8).
+    section = "VRAM" if all(size for _, size in missing.values()) else "疑難排解"
+    logger.error(
+        "Colab session READY without its router: "
+        + "; ".join(found)
+        + (f"; the VM says: {vm_error}" if vm_error else "")
+        + f"; the API router decides this session (colab/README.md, {section})"
+    )
 
 
 def _drained_for_off(state: ColabState, now: float) -> ColabState:

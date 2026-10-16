@@ -802,7 +802,7 @@ class UploadContractTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
         (self.dir / "bootstrap.py").write_bytes(b"print('boot')\n")
-        (self.dir / "versions.json").write_bytes(b'{"ollama": "0.35.0"}')
+        (self.dir / "versions.json").write_bytes(b'{"ollama": "0.40.5"}')
         self.plane = ColabControlPlane(self.dir / "adc.json")
         self.runtime = assignment(url=self.server.url)
 

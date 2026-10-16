@@ -2,7 +2,8 @@
 
 **Status**: Accepted (amended in v3 Phase 5b: commit by message id, time
 order, debounce, chat generation; then replies stamped with their
-question's time, retry holds, tier-by-tier summaries)
+question's time, retry holds, tier-by-tier summaries; 2026-10-16: the
+summary is asked for as a change and held to 400 characters)
 
 ## Context
 
@@ -91,6 +92,64 @@ answer, or a blank one, moves on to the next tier, and a pass with none left
 fails. A `MEMORY_SUMMARY_MAX_TOKENS` below 768 (v2's 384) is warned about at
 startup.
 
+The tier is asked for **the change, not the summary** (2026-10-16). The
+request lists the old summary's items (its sentences and `；` clauses) by
+number; the answer's first line names the items to remove (`移除：2,5`, or
+`移除：無`) and each further line is a new item. The code keeps the other
+old items word for word and adds the new ones it does not already have.
+The removal line is also read as `移除項目：`, `**移除**：`, `1. 移除：` or
+`移除 無`, and only the numbers its value starts with count (`移除：無，第2項
+仍有效` removes nothing); a bare `移除：` takes the lines of numbers under
+it. Markdown, code fences, the `[2] ` an old item was listed with,
+headings (`新增：`, any line ending in `：`) and lines that only say there
+is nothing new (`- 無`, `（無新增項目）`) are not items. An
+answer without the removal line whose lines are all bullets, or that has
+such a heading, is new items too, and one that only says nothing changed
+(`無需更新`) keeps the old summary, like `移除：無`. Any other answer is a
+whole summary from a tier that ignored the format: it replaces a blank
+summary; else it must repeat at least half the old items word for word,
+and only its other items are added, after all the old ones. A partial one
+(`丁養了柴犬。`) would lose the old items, so that tier is rejected like
+one cut off at `max_tokens` and the next one tries.
+The summary is held to `SUMMARY_MAX_CHARS` (400 characters): one over it,
+the old one before the request or the new one after it, is trimmed. A
+utility tier ranks its items (item numbers, best first); the code keeps
+them in rank order while they fit, then the unranked ones that still fit,
+in their original order, so only the cap decides what is lost. A ranking
+that is not just numbers, or was cut off at its `max_tokens`, is no
+ranking. After the update, the items it added are kept when they take at
+most half the cap and only the old ones are ranked, for what is left: a
+fact just learned is not dropped by the same pass. An item longer than
+what is left (an old one-paragraph summary) is ranked in pieces cut at its
+commas. When no tier ranks the items the summary stays whole and the next
+pass tries again. Sentences a model wrote about the update itself
+("以上內容…予以保留", "（其餘項目保留）", "目前無衝突內容需要移除") are
+dropped from both, and so are notes about something left out ("天氣查詢屬
+即時資訊，不納入長期記憶"): with the clauses before it when the note leads
+a later clause (they are what was left out; the clauses after it stay),
+only its own clause when it has its own subject ("使用者關注台積電，股價查
+詢屬即時資訊不納入長期記憶" keeps "使用者關注台積電"). A summary left blank is rejected
+unless the old one was blank too (nothing worth keeping yet). The trims and
+the update share the pass's one deadline and its record of models that
+timed out, so a model that hung in one of them is not waited on again.
+
+Why: on 2026-10-16 one group's compaction failed on every pass. Asked for
+the whole summary, NIM Super (thinking off, the first utility tier) copied
+the old one word for word whatever length the prompt named (the old "about
+300 characters", or the current length, a cap and an order to condense),
+and appended 150-560 characters of new detail; asked only to condense, it
+dropped a few items and stopped near 560 characters. At about a token per
+character of Chinese (0.95), the summaries had grown pass by pass to 794
+characters, which Super could no longer copy within
+`MEMORY_SUMMARY_MAX_TOKENS` (768) with anything appended: each pass was cut
+off and rejected, then Ultra hung and dots-3 answered a 200 whose error
+object had code 502. Asked for the change, Super answered that summary in
+2-10 s with 70-320 tokens and ranked its items in under a second; 10
+passes of 10 finished at 344-390 characters, at or under the cap, and a
+review's 3 more at 388-395. `MEMORY_SUMMARY_MAX_TOKENS` keeps 768: the answer no longer
+repeats the summary, and the trim before the request keeps even a tier
+that copies the old items anyway inside it.
+
 ## Consequences
 
 - The window routinely sits above `memory_recent_message_limit` between the
@@ -112,7 +171,20 @@ startup.
   clean: no old summary, no episode of the deleted one
   (`NewDuringCompactionTests` in the same file).
 - Busy groups pay for at most one summary per chat per debounce period
-  instead of one per flush.
+  instead of one per flush. A summary over the cap adds a ranking call
+  before the request, after it, or both; each walks the utility tiers like
+  the update, under the same 180 s deadline. With Super answering a
+  ranking takes about a second; a model that hangs costs its tier timeout
+  once per pass, not once per walk.
+- Old items are never reworded unless the tier removes one and writes it
+  again, so the summary reads as a list of facts in the order they were
+  learned. A long item (a transcribed list can take 250 characters) leaves
+  room for few others: the first pass over the 794-character summary of
+  2026-10-16 (613 after its meta sentences) keeps 2 of its 6 items. A new
+  item survives its own pass and competes with the old ones from the next.
+- A tier that ignores the format now fails the pass instead of replacing
+  the memory; the live gate's utility check sends a non-empty summary and
+  fails such a tier.
 - Each commit also decides the chat's episode: at most one per
   `EPISODE_MIN_INTERVAL_SECONDS` (3600). Commits in between append their
   conversation to `episode_pending_text`, which the next episode archives.

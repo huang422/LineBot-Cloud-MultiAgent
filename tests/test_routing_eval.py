@@ -287,7 +287,7 @@ class RequestTests(unittest.TestCase):
             ev.parse_candidates("rules, colab,nvidia,openrouter:nvidia/nemotron-3-super-120b-a12b:free"),
             [("rules", ""), ("colab", ""), ("nvidia", ""), ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free")],
         )
-        for bad in ("rules,rules", "colab:nimble:9b", "gpt", ""):
+        for bad in ("rules,rules", "colab:clef-flash:9b", "gpt", ""):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 ev.parse_candidates(bad)
 
@@ -338,13 +338,17 @@ class SweepTests(unittest.TestCase):
         result = ev.recommend(confidence, noul, current, 0.95)
 
         gates = result["gates"]
-        # 0.30 would do on this data, but COLAB_ROUTER_CONFIDENCE starts at 0.5.
-        self.assertEqual(gates.confidence, 0.5)
+        # 0.27 lets 73 rows through with three wrong: 95.9%.
+        self.assertEqual(gates.confidence, 0.27)
         self.assertEqual(gates.think_on, 0.68)
         self.assertEqual(gates.think_off, 0.31)
         self.assertTrue(all(result["meets_target"].values()))
         self.assertTrue(ev.settings_accept(gates))
-        self.assertFalse(ev.settings_accept(RouterGates(confidence=0.3, think_on=0.85, think_off=0.15)))
+        self.assertFalse(ev.settings_accept(RouterGates(confidence=1.0, think_on=0.85, think_off=0.15)))
+        self.assertFalse(ev.settings_accept(RouterGates(confidence=0.27, think_on=0.3, think_off=0.15)))
+        # A router right on every row gets 0.0, the top choice always (argmax).
+        always_right = [(value / 100, True) for value in range(100)]
+        self.assertEqual(ev.recommend(always_right, noul, current, 0.95)["gates"].confidence, 0.0)
 
     def test_a_gate_nothing_qualifies_for_gets_its_strictest_value(self) -> None:
         current = RouterGates(confidence=0.75, think_on=0.85, think_off=0.15)
@@ -558,7 +562,7 @@ _COLAB_SETTINGS = {
 
 
 def _session(**changes) -> ColabState:
-    pins = protocol.pinned_models()
+    pins = protocol.colab_models()
     sizes = {"size": 10 << 30, "size_vram": 10 << 30}
     values = {"digests": dict(pins), "vram": {model: dict(sizes) for model in pins}}
     values.update(changes)
@@ -761,10 +765,10 @@ class ColabCandidateTests(unittest.TestCase):
         self.assertEqual(outcomes["weather"]["scores"]["agent_probabilities"]["web_search"], 0.9)
         self.assertEqual(outcomes["weather"]["scores"]["noul"], 0.05)
         self.assertEqual((outcomes["chat"]["agent"], outcomes["image"]["agent"]), ("chat", "vision"))
-        # At the default gates only the sure weather answer is used.
+        # The default confidence gate (0.0, argmax) uses the unsure answers too.
         section = colab["colab"]
         self.assertEqual(section["current"]["gates"]["COLAB_ROUTER_CONFIDENCE"], Settings(_env_file=None).colab_router_confidence)
-        self.assertEqual((section["current"]["summary"]["decided"], section["ungated"]["decided"]), (1, 3))
+        self.assertEqual((section["current"]["summary"]["decided"], section["ungated"]["decided"]), (3, 3))
         self.assertEqual(len(section["curves"]["COLAB_ROUTER_CONFIDENCE"]), len(ev.GRID))
         self.assertIn("## Colab router gates", markdown)
         self.assertIn("COLAB_ROUTER_THINK_OFF", markdown)
@@ -839,10 +843,20 @@ class ColabCandidateTests(unittest.TestCase):
         self.assertIn("no READY Colab session", colab["reason"])
         self.assertEqual(tunnel.requests, [])
 
+    def test_a_moved_router_tag_is_evaluated_like_any_other(self) -> None:
+        # The models follow their tags: the digest is never a reason to skip.
+        pins = protocol.colab_models()
+        for digests in ({**pins, _ROUTER: "0" * 64}, {}):
+            with self.subTest(digests=digests):
+                _, report, _, tunnel, _, _ = self._run(_session(digests=digests))
+
+                colab = next(candidate for candidate in report["candidates"] if candidate["name"] == "colab")
+                self.assertNotEqual(colab["status"], "skipped", colab.get("reason"))
+                self.assertTrue(tunnel.requests)
+
     def test_a_router_the_bot_would_not_use_is_skipped_with_the_reason(self) -> None:
-        pins = protocol.pinned_models()
+        pins = protocol.colab_models()
         cases = {
-            "not the pinned": _session(digests={**pins, _ROUTER: "0" * 64}),
             "not wholly in VRAM": _session(vram={model: {"size": 10, "size_vram": 5} for model in pins}),
             "was not loaded": _session(vram={model: {"size": 10, "size_vram": 10} for model in pins if model != _ROUTER}),
         }

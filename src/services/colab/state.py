@@ -99,12 +99,17 @@ class ColabState:
     last_heartbeat_at: float | None = None
     # How far the VM's bootstrap got (from its registrations).
     boot_step: str = ""
+    # The Ollama release the launcher picked for this session (the latest,
+    # or versions.json's fallback): probes and health checks want exactly
+    # it. "" for a session launched before 2026-10-16 (then only the
+    # minimum, protocol.OLLAMA_MIN_VERSION, applies).
+    ollama_version: str = ""
     # What the VM reported: {"ollama", "cloudflared"} and {"name",
     # "vram_mib", "driver", ...} (protocol.py). What the readiness probe
-    # saw: {model: digest} in /api/tags and {model: {"size", "size_vram"}}
-    # in /api/ps; a router missing from them, off its pin or not wholly
-    # in VRAM is kept out of the session (protocol.unpinned,
-    # protocol.off_gpu).
+    # saw: {model: digest} in /api/tags (shown beside the last verified
+    # digests, never judged) and {model: {"size", "size_vram"}} in /api/ps;
+    # a router missing from /api/ps or not wholly in VRAM is kept out of
+    # the session (protocol.off_gpu).
     versions: dict[str, str] = field(default_factory=dict)
     digests: dict[str, str] = field(default_factory=dict)
     vram: dict[str, Any] = field(default_factory=dict)

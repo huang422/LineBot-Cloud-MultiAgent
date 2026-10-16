@@ -275,6 +275,7 @@ def _no_session() -> dict[str, Any]:
         "last_health_at": None,
         "last_heartbeat_at": None,
         "boot_step": "",
+        "ollama_version": "",
         "versions": {},
         "digests": {},
         "vram": {},
@@ -789,6 +790,9 @@ def after_launch(
             session_id=outcome.session_id,
             boot_step="launched",
             last_heartbeat_at=now,
+            # The release the uploaded versions.json names: the probe and
+            # every health check want exactly it.
+            ollama_version=outcome.ollama_version,
         )
     elif outcome is None and s.assigned_at is not None and now - s.assigned_at < RECLAIM_GRACE_SECONDS:
         # Colab may not list a runtime this young yet: the tick launches it
@@ -980,7 +984,7 @@ class ColabController:
         except (LaunchError, ControlPlaneError) as exc:
             outcome = exc
         if isinstance(outcome, LaunchResult):
-            logger.info(f"Colab launch: bootstrap started (pid {outcome.pid})")
+            logger.info(f"Colab launch: bootstrap started (pid {outcome.pid}, Ollama {outcome.ollama_version or '?'})")
         elif outcome is not None:
             logger.warning(f"Colab launch failed: {type(outcome).__name__}: {outcome}")
         now = self._clock()

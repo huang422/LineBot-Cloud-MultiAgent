@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 import unittest
 from typing import Any
@@ -29,6 +30,7 @@ from src.providers.fallback_chain import (
     Tier,
 )
 from src.services.model_health import ModelHealth
+from src.utils import request_trace
 
 _TEXT = [{"role": "user", "content": "hello"}]
 _IMAGE = [
@@ -769,6 +771,202 @@ class HealthRecordingTests(unittest.IsolatedAsyncioTestCase):
 
         await chain.generate(tiers, _TEXT, deadline=time.monotonic() + 0.2)
         self.assertEqual((len(hung_colab.calls), len(api.calls)), (2, 3))
+
+
+class SameWalkTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """A model that timed out after a fair try is not called again in the walk."""
+
+    async def _walk(self, chain: FallbackChain, tiers: list[Tier], **kwargs: Any):
+        """``(answer text or the error, outcomes, summary line)`` of one walk."""
+        trace = request_trace.RequestTrace(request_id="r1")
+        token = request_trace.activate(trace)
+        try:
+            with request_trace.phase(request_trace.ANSWER):
+                try:
+                    result: Any = (await chain.generate(tiers, _TEXT, **kwargs)).text
+                except AllProvidersFailedError as exc:
+                    result = exc
+        finally:
+            request_trace.deactivate(token)
+        [walk] = trace.walks
+        return result, [attempt.outcome for attempt in walk.attempts], request_trace.summary_line(trace)
+
+    async def test_a_model_that_timed_out_is_skipped_by_its_later_tiers(self) -> None:
+        # A thinking request: the thinking tier on Ultra hung its whole 0.05 s,
+        # so the chat tier on Ultra (thinking off) is skipped, as on
+        # 2026-10-16 it was not (request a05be403 waited on Ultra twice).
+        # A plain timeout marks the model the same way.
+        for thinking in (True, False):
+            with self.subTest(first_tier_thinking=thinking):
+                health = ModelHealth()
+                hung = FakeProvider("nvidia", ("sleep", 5))
+                dots = FakeProvider("openrouter", "dots answer")
+                tiers = [
+                    Tier(hung, "ultra", timeout_s=0.05, options={"thinking": thinking}),
+                    Tier(hung, "ultra", timeout_s=0.05, options={"thinking": False}),
+                    Tier(dots, "dots:free", options={"thinking": False}),
+                ]
+
+                with self.assertLogs("linebot", "INFO") as logs:
+                    text, outcomes, line = await self._walk(FallbackChain(health, min_tier_seconds=0.01), tiers)
+
+                self.assertEqual(text, "dots answer")
+                self.assertEqual(len(hung.calls), 1)
+                self.assertEqual(outcomes, ["timeout", "skip(timed out earlier)", "ok"])
+                self.assertRegex(
+                    line, r"tiers=\[nvidia:ultra timeout \d+\.\ds,skip\(timed out earlier\), openrouter:dots:free ok "
+                )
+                self.assertIn("Skipping nvidia:ultra (timed out earlier)", "\n".join(logs.output))
+                # ModelHealth is untouched: a thinking timeout earns no strike,
+                # a plain one its one strike (two in a row cool it down).
+                status = health.get_status(include_errors=True)["models"].get("nvidia:ultra")
+                if thinking:
+                    self.assertIsNone(status)
+                else:
+                    self.assertIn("no answer within 0.05s", status["last_error"])
+                self.assertTrue(health.is_available("nvidia", "ultra"))
+
+    async def test_a_sliver_or_a_try_shorter_than_the_later_tier_does_not_skip_it(self) -> None:
+        # (min_tier_seconds, deadline in s or None, thinking tier timeout_s):
+        # the thinking half (0.15 s of 0.3) is a sliver under 0.2 s; over
+        # 0.01 s it is a try, but shorter than the later tier's 60 s (as
+        # dots-3 got 15 s of the half in a05be403, then answered with thinking
+        # off); a tier's own timeout_s under min_tier_seconds is no try either.
+        for min_tier_seconds, deadline, timeout_s in ((0.2, 0.3, 60.0), (0.01, 0.3, 60.0), (0.2, None, 0.05)):
+            with self.subTest(min_tier_seconds=min_tier_seconds, deadline=deadline, timeout_s=timeout_s):
+                thinker = FakeProvider("nvidia", ("sleep", 5), "plain answer")
+                tiers = [
+                    Tier(thinker, "ultra", timeout_s=timeout_s, options={"thinking": True}),
+                    Tier(thinker, "ultra", options={"thinking": False}),
+                ]
+
+                text, outcomes, _ = await self._walk(
+                    FallbackChain(ModelHealth(), min_tier_seconds=min_tier_seconds),
+                    tiers,
+                    deadline=None if deadline is None else time.monotonic() + deadline,
+                )
+
+                self.assertEqual(text, "plain answer")
+                self.assertEqual(outcomes, ["timeout", "ok"])
+                self.assertEqual([call["disable_thinking"] for call in thinker.calls], [False, True])
+
+    async def test_a_try_the_thinking_half_cut_short_skips_a_later_tier_that_gives_hardly_longer(self) -> None:
+        # The half (0.25 s of 0.5) cuts the 0.4 s thinking tier short, as it
+        # cuts NIM Ultra's 30 s thinking tier to 25 s or less when a search
+        # stage took 60 s or more. A chat tier on the model that would give it
+        # no longer (0.2 s, as Ultra's 25 s) or less than min_tier_seconds
+        # (0.1 s) longer is skipped; one that gives it clearly longer still
+        # runs (dots-3's 40 s after 15 s of the half in a05be403).
+        for later_timeout_s, expected in (
+            (0.2, ("dots answer", ["timeout", "skip(timed out earlier)", "ok"], 1)),
+            (0.3, ("dots answer", ["timeout", "skip(timed out earlier)", "ok"], 1)),
+            (0.4, ("plain answer", ["timeout", "ok"], 2)),
+        ):
+            with self.subTest(later_timeout_s=later_timeout_s):
+                nim = FakeProvider("nvidia", ("sleep", 5), "plain answer")
+                dots = FakeProvider("openrouter", "dots answer")
+                tiers = [
+                    Tier(nim, "ultra", timeout_s=0.4, options={"thinking": True}),
+                    Tier(nim, "ultra", timeout_s=later_timeout_s, options={"thinking": False}),
+                    Tier(dots, "dots:free", options={"thinking": False}),
+                ]
+
+                text, outcomes, _ = await self._walk(
+                    FallbackChain(ModelHealth(), min_tier_seconds=0.1), tiers, deadline=time.monotonic() + 0.5
+                )
+
+                self.assertEqual((text, outcomes, len(nim.calls)), expected)
+
+    async def test_walks_that_share_timed_out_skip_the_model_in_each(self) -> None:
+        # A tool loop's rounds: the second round does not wait on Ultra again.
+        ultra = FakeProvider("nvidia", ("sleep", 5), "ultra answer")
+        dots = FakeProvider("openrouter", "dots answer")
+        chain = FallbackChain(ModelHealth(), min_tier_seconds=0.01)
+        tiers = [
+            Tier(ultra, "ultra", timeout_s=0.05, options={"thinking": False}),
+            Tier(dots, "dots:free", options={"thinking": False}),
+        ]
+        timed_out: fallback_chain.TimedOutModels = {}
+
+        first = await self._walk(chain, tiers, timed_out=timed_out)
+        second = await self._walk(chain, tiers, timed_out=timed_out)
+
+        self.assertEqual(first[:2], ("dots answer", ["timeout", "ok"]))
+        self.assertEqual(second[:2], ("dots answer", ["skip(timed out earlier)", "ok"]))
+        self.assertEqual(len(ultra.calls), 1)
+        self.assertEqual(timed_out, {("nvidia", "ultra"): math.inf})
+
+    async def test_the_next_walk_calls_the_model_again(self) -> None:
+        health = ModelHealth()
+        ultra = FakeProvider("nvidia", ("sleep", 5), "ultra answer")
+        dots = FakeProvider("openrouter", "dots answer")
+        chain = FallbackChain(health, min_tier_seconds=0.01)
+        tiers = [
+            Tier(ultra, "ultra", timeout_s=0.05, options={"thinking": True}),
+            Tier(ultra, "ultra", timeout_s=0.05, options={"thinking": False}),
+            Tier(dots, "dots:free", options={"thinking": False}),
+        ]
+
+        first = await self._walk(chain, tiers)
+        second = await self._walk(chain, tiers)
+
+        self.assertEqual(first[:2], ("dots answer", ["timeout", "skip(timed out earlier)", "ok"]))
+        self.assertEqual(second[:2], ("ultra answer", ["ok"]))
+        self.assertEqual([call["disable_thinking"] for call in ultra.calls], [False, False])
+
+    async def test_an_error_other_than_a_timeout_does_not_mark_the_model(self) -> None:
+        # ModelHealth decides: the first 503 is one strike, so the chat tier
+        # still calls Ultra; the second cools it down for the next request.
+        health = ModelHealth()
+        busy = FakeProvider("nvidia", TransientError("ultra", 503, "busy", "nvidia"))
+        dots = FakeProvider("openrouter", "dots answer")
+        tiers = [
+            Tier(busy, "ultra", options={"thinking": True}),
+            Tier(busy, "ultra", options={"thinking": False}),
+            Tier(dots, "dots:free", options={"thinking": False}),
+        ]
+
+        text, outcomes, _ = await self._walk(FallbackChain(health, min_tier_seconds=0.01), tiers)
+
+        self.assertEqual(text, "dots answer")
+        self.assertEqual(outcomes, ["error(TransientError 503)", "error(TransientError 503)", "ok"])
+        self.assertEqual(len(busy.calls), 2)
+        self.assertFalse(health.is_available("nvidia", "ultra"))
+
+    async def test_the_same_model_id_on_another_provider_is_still_called(self) -> None:
+        # NIM Ultra hanging says nothing about Ultra :free behind OpenRouter
+        # (they share an id here to show the provider is part of the key).
+        nim = FakeProvider("nvidia", ("sleep", 5))
+        openrouter = FakeProvider("openrouter", "openrouter answer")
+        tiers = [
+            Tier(nim, "ultra", timeout_s=0.05, options={"thinking": True}),
+            Tier(openrouter, "ultra", options={"thinking": False}),
+        ]
+
+        text, outcomes, _ = await self._walk(FallbackChain(ModelHealth(), min_tier_seconds=0.01), tiers)
+
+        self.assertEqual(text, "openrouter answer")
+        self.assertEqual(outcomes, ["timeout", "ok"])
+
+    async def test_a_thinking_tier_with_only_timed_out_models_after_it_gets_all_the_time(self) -> None:
+        # Super thinking needs 0.3 s of a 0.5 s window; the only tier after
+        # it is Ultra, which already timed out, so Super is not held to the
+        # thinking half (0.25 s) that would leave Ultra nothing to use.
+        ultra = FakeProvider("nvidia", ("sleep", 5))
+        super_ = FakeProvider("nvidia", ("sleep", 0.3))
+        tiers = [
+            Tier(ultra, "ultra", timeout_s=0.05, options={"thinking": True}),
+            Tier(super_, "super", options={"thinking": True}),
+            Tier(ultra, "ultra", options={"thinking": False}),
+        ]
+
+        text, outcomes, _ = await self._walk(
+            FallbackChain(ModelHealth(), min_tier_seconds=0.01), tiers, deadline=time.monotonic() + 0.5
+        )
+
+        self.assertEqual(text, "late")
+        self.assertEqual(outcomes, ["timeout", "ok"])
+        self.assertEqual(len(ultra.calls), 1)
 
 
 class ForwardingTests(unittest.IsolatedAsyncioTestCase):

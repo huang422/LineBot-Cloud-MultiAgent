@@ -83,20 +83,22 @@ rows the rules abstain on, the only ones a model router sees. The Colab
 router also abstains when it picks image_gen without image output
 (SystemOneRouter's invariant).
 
-The Colab gates: a decision needs both choice confidences (normalised
-entropy) at or above COLAB_ROUTER_CONFIDENCE; needs_thinking turns
-thinking on at or above COLAB_ROUTER_THINK_ON and off at or below
-COLAB_ROUTER_THINK_OFF, the rulebook's heuristic deciding in between. The
-sweep (on ``--sweep-rows``, default the router's traffic) gives gated
-precision, its 95% Wilson lower bound and coverage for each threshold on a
-0.01 grid and recommends, among the values Settings accepts, the one with
-the most coverage whose gated precision reaches ``--target-precision``
-(default 0.95) on at least MIN_SUPPORT rows. The confidence gate is
-chosen first; the two thinking gates are then swept on the rows it lets
-through, the only ones whose noul the bot reads. Each side of
-needs_thinking is held to the target on its own: THINK_ON by the rows it
-turns on, THINK_OFF by the rows it turns off. A few hundred rows leave
-wide bounds: the values are provisional until the dataset grows.
+The Colab gates: a decision needs both choice confidences ((p_max - 1/N) /
+(1 - 1/N), what Ollama 0.40.4+ reports for clef-flash) at or above
+COLAB_ROUTER_CONFIDENCE (the default 0.0 takes every top choice: argmax);
+needs_thinking turns thinking on at or above COLAB_ROUTER_THINK_ON and off
+at or below COLAB_ROUTER_THINK_OFF, the rulebook's heuristic deciding in
+between. The sweep (on ``--sweep-rows``, default the router's traffic)
+gives gated precision, its 95% Wilson lower bound and coverage for each
+threshold on a 0.01 grid from 0.0 and recommends, among the values
+Settings accepts (the confidence gate 0.0–0.99), the one with the most
+coverage whose gated precision reaches ``--target-precision`` (default
+0.95) on at least MIN_SUPPORT rows; for the confidence gate that may be
+0.0. The confidence gate is chosen first; the two thinking gates are then
+swept on the rows it lets through, the only ones whose noul the bot reads.
+Each side of needs_thinking is held to the target on its own: THINK_ON by
+the rows it turns on, THINK_OFF by the rows it turns off. A few hundred
+rows leave wide bounds: the values are provisional until the dataset grows.
 
 A candidate that stops leaves the rest of its rows not run: it is
 ``partial``, and the run exits 1 and recommends no Colab gates from it
@@ -929,13 +931,6 @@ async def _still_serving(endpoint: Any, model: str) -> str:
 
 def _session_off_reason(endpoint: Any, model: str) -> str:
     """Why the session would never call its router, or ""."""
-    mismatch = endpoint.unpinned().get(model)
-    if mismatch is not None:
-        pinned, actual = mismatch
-        return (
-            f"the session's {model} has digest {actual or '(none recorded)'}, not the pinned {pinned}, "
-            "so the bot does not use it; see live_gate.py --path colab"
-        )
     spilled = endpoint.off_gpu().get(model)
     if spilled is not None:
         where = "was not wholly in VRAM" if spilled[1] else "was not loaded"

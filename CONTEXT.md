@@ -28,8 +28,8 @@ LINE webhook
       → !new / !colab / !whoami   commands answer here (no rate limit, no model)
       → flush_passive         group/room: earlier untriggered messages first
       → enrich_request        rate limit + memory context
-      → Orchestrator.route    fast regex rules, else nimble (Colab READY, confident),
-                              else LLM classification (MODEL_PATH_PREFERENCE=api: nimble last)
+      → Orchestrator.route    fast regex rules, else clef-flash (Colab READY),
+                              else LLM classification (MODEL_PATH_PREFERENCE=api: clef-flash last)
         + load_profile_facts  the sender's stored facts (10-minute cache), read meanwhile
         + note_demand         Colab demand (colab preference; ≤ 1 write/minute, ≤ 3 s),
                               joined only after the reply went out
@@ -80,10 +80,10 @@ handler inline rather than drop it. See ADR-0006.
 | Search planning | `src/services/search/query.py` | `SearchQueryPlanner`: the web search's query, topic and time range; rewrites follow-ups on the utility tiers |
 | Search backends | `src/services/search/backend.py`, `tavily.py`, `types.py` | `ChainedSearchBackend`: Tavily (key or keyless) → an empty `degraded` answer; the seam another backend plugs into; shared by the web search agent and the `web_search` tool (ADR-0009) |
 | Page reading | `src/services/search/page_fetcher.py`, `extract.py`, `rerank.py` | SSRF-safe fetch (public addresses only, pinned connection, checked redirects, byte cap); trafilatura in its own threads, a simple extractor as fallback; optional embedding rerank |
-| Providers | `src/providers/` | NVIDIA (`nvidia_provider.py`, chat and image generation) + OpenRouter (`openrouter_provider.py`, `:free` ids only unless allowed) + Colab (`ollama_provider.py`, Ollama's native `/api/chat`) behind `FallbackChain` (`fallback_chain.py`), which walks model tiers; shared errors and parser in `base.py`, HTTP status mapping in `openai_compat.py`, role alternation for strict chat templates in `messages.py` |
-| Colab router | `src/providers/systemone.py` | `SystemOneRouter`: nimble on `/v1/systemone`, three scored questions in Nimble's schema style, `RouterGates` (COLAB_ROUTER_CONFIDENCE / THINK_ON / THINK_OFF, provisional until the routing eval); None whenever unsure, not READY, or the session's router is off its pin or not wholly in VRAM |
-| Colab tier | `src/services/colab/` | `protocol` (key derivation, signature, tunnel rule, pins), `state` (the Firestore session document, optimistic writes), `endpoint` (READY, busy gates, breaker, tunnel client, probe), `registration` (`/internal/colab/register`), `admin` (`!colab`, `!whoami`), `control_plane` (the colab_cli library facade: assign, list, unassign, ccu-info, cells, uploads; budgets, error classes, token scrubbing), `controller` (pure lifecycle decisions + the cron tick and `colab` tasks), `launcher` (upload, silent env file, detached bootstrap); ADR-0010 |
-| Colab VM | `colab/` | what the launcher uploads to the runtime: `bootstrap` (GPU check, pinned Ollama and cloudflared, model pulls with digest checks, warm-up qwen3.8 first and VRAM record, tunnel, signed `ready`/`failed`), `auth_proxy` (bearer, path allowlist, Host rewrite, idle watchdog that releases the runtime), `register` (the bot's protocol mirrored in the standard library), pins in `versions.json` and the proxy's hash-pinned `proxy-requirements.lock`; runbook in `colab/README.md` |
+| Providers | `src/providers/` | NVIDIA (`nvidia_provider.py`, chat and image generation) + OpenRouter (`openrouter_provider.py`, `:free` ids only unless allowed; one retry after 1 s of a 502 / 503 that says the upstream was unavailable or overloaded) + Colab (`ollama_provider.py`, Ollama's native `/api/chat`) behind `FallbackChain` (`fallback_chain.py`), which walks model tiers; shared errors and parser in `base.py`, HTTP status mapping in `openai_compat.py` (also for a 200 whose body is an `error` object, mapped by its `code`: OpenRouter's upstream failures after routing), role alternation for strict chat templates in `messages.py` |
+| Colab router | `src/providers/systemone.py` | `SystemOneRouter`: clef-flash on `/v1/systemone`, three questions decided jointly in one prompt that speaks of "the state" (every `<` opening a tag and every `|>` in the message broken first, so no special token forms), `RouterGates` (COLAB_ROUTER_CONFIDENCE on (p_max − 1/N)/(1 − 1/N), default 0.0 = always the top choice (argmax); THINK_ON / THINK_OFF; provisional until the routing eval); None below a non-zero confidence gate, not READY, or the session's router is not loaded or not wholly in VRAM (its digest never matters) |
+| Colab tier | `src/services/colab/` | `protocol` (key derivation, signature, tunnel rule, the minimum Ollama, the Colab models and their last verified digests), `state` (the Firestore session document, optimistic writes), `endpoint` (READY, busy gates, breaker, tunnel client, probe), `registration` (`/internal/colab/register`), `admin` (`!colab`, `!whoami`), `control_plane` (the colab_cli library facade: assign, list, unassign, ccu-info, cells, uploads; budgets, error classes, token scrubbing), `controller` (pure lifecycle decisions + the cron tick and `colab` tasks), `launcher` (picks the Ollama release, upload, silent env file, detached bootstrap); ADR-0010 |
+| Colab VM | `colab/` | what the launcher uploads to the runtime: `bootstrap` (GPU check, the size- and sha256-checked Ollama the launcher picked and the pinned cloudflared, model pulls that follow their tags (digests only logged), warm-up qwen3.8 first and VRAM record, tunnel, signed `ready` (with why the router is missing) / `failed`), `auth_proxy` (bearer, path allowlist, Host rewrite, idle watchdog that releases the runtime), `register` (the bot's protocol mirrored in the standard library), `versions.json` (the Ollama fallback and minimum, cloudflared, the models and their verified digests) and the proxy's hash-pinned `proxy-requirements.lock`; runbook in `colab/README.md` |
 | Ops scripts | `scripts/` | `deploy_cloud_run.sh` (the one deploy command), `provision_gcp.sh` (one-time GCP setup, dry run unless `--apply`), `mint_colab_adc.sh` (a person mints the Colab token into `linebot-colab-adc`), `smoke_test_cloud.py` (the deploy's post-deploy check of `/health` and a signed `/webhook` with no events), `envfile.py` (`.env` parsing, `check-v3` / `migrate-v3`, `to-dotenv`, the upload leak guard), `live_gate.py` (live checks through the bot's own clients; `--path tiers` calls every tier of the configured role table once; `--path colab` needs a READY session), `migrate_embeddings.py` (re-embeds Firestore episodes after a model change), `evals/` (`routing_eval.py` on the labelled `routing_zh_tw.jsonl`; re-tunes `COLAB_ROUTER_*`) |
 | Build and dependencies | `pyproject.toml`, `uv.lock`, `Dockerfile`, `cloudbuild.yaml` | runtime dependencies and the `dev` group in `pyproject.toml`, resolved by `uv lock` into `uv.lock` (every file sha256-pinned); the image and Cloud Build's test step install from that lock on the same digest-pinned `python:3.12-slim`; ruff and pytest settings live in `pyproject.toml` too |
 | Ignore lists | `.gcloudignore`, `.dockerignore`, `.gitignore` | what never reaches Cloud Build or the image (`.env*`, credentials, backups); the deploy also refuses an upload that would carry one |
@@ -91,7 +91,7 @@ handler inline rather than drop it. See ADR-0006.
 | Tests | `tests/` | the offline suite (see Testing); `fake_gcloud.py`, `colab_fakes.py` and `script_rehearsal.py` are its fakes |
 | Model profiles | `src/providers/model_profiles.py` | exact-id facts per model: protocol, modalities, thinking and JSON modes, limits, model-card sampling; the payload builders and the role table read them |
 | Model health | `src/services/model_health.py` | per-model cooldowns and dead models, per-provider request budgets (chat, image and embedding calls); only an account-level OpenRouter 429 cools the whole provider |
-| Model lifecycle | `src/services/model_lifecycle.py` | daily end-of-life check against the public catalogs (`eol` task); results for `/health/detail` |
+| Model lifecycle | `src/services/model_lifecycle.py` | daily end-of-life check against the public catalogs (`eol` task; an OpenRouter id's `expiration_date` comes from `GET /api/v1/models`, read once per run); results for `/health/detail`; a change to an unusable state (retired, deprecated, not in a catalog, no endpoints) is logged at ERROR, to `expiring` (a date alone; the model still answers) or `ok` at INFO, no alert |
 | Memory | `src/services/memory_service.py` | recent window (time-ordered, ids) + long-term summary + episodes + cached user profile |
 | Embeddings | `src/services/embedding_service.py` | the embed role's client: 2048-dim vectors cut to `EMBEDDING_DIMENSIONS` and re-normalised (ADR-0011) |
 | Write batching | `src/services/passive_buffer.py` | per-chat coalescing; reports ready / due keys, never schedules; restores a failed flush |
@@ -138,7 +138,8 @@ These are load-bearing and easy to break by accident:
    `COMPACTION_DEBOUNCE_SECONDS` waits for a later message unless its window
    reached half the cap, and gets at most one episode per
    `EPISODE_MIN_INTERVAL_SECONDS`. A pass that failed (a summary cut off at
-   `max_tokens` moves on to the next utility tier first) or whose task never
+   `max_tokens`, or an answer off the update format that would lose old
+   items, moves on to the next utility tier first) or whose task never
    started holds the chat for 15 minutes, one minute once its window reached
    half the cap. See ADR-0003.
 
@@ -198,7 +199,16 @@ These are load-bearing and easy to break by accident:
    half of it, so the non-thinking tiers after them keep the other half; an
    image that needs thinking lets the vision tiers not set to thinking off
    (only Colab: the API vision tiers never think) think first, then runs
-   them all with thinking off. An image prompt, whichever agent answers,
+   them all with thinking off. Within one walk (in chat, the whole tool
+   loop and the plain retry after it), a model that timed out after at
+   least `MIN_TIER_SECONDS` is not called again by a later tier (same
+   provider and id; `skip(timed out earlier)`) when it had its tier's whole
+   time limit, or when the later tier would give it less than
+   `MIN_TIER_SECONDS` more: a thinking request whose thinking tier hung does
+   not wait on that model again with thinking off, while a tier the
+   thinking half cut well short (dots-3's 15 s in a05be403) still gets its
+   thinking-off try. The next request calls the model again. An image
+   prompt, whichever agent answers,
    carries at most `IMAGE_CONTEXT_CHARS` (3000) characters of history,
    summary and profile facts, so it stays near 4k tokens (muse-glimmer
    took about 40 s at 6.2k). Chat's tool loop gives its first
@@ -237,8 +247,9 @@ These are load-bearing and easy to break by accident:
     (`Tier.shares_time`; a thinking pass keeps its half), and a request
     that needs thinking tries it only once (the tiers that follow with
     thinking off leave out a Colab tier the thinking pass already had), so
-    the API tiers always keep time to answer. nimble routes only when confident; otherwise the API
-    router decides at once. See ADR-0010.
+    the API tiers always keep time to answer. The Colab router takes its top choice; a non-zero
+    COLAB_ROUTER_CONFIDENCE, or an invariant, hands the message to the API
+    router at once. See ADR-0010.
 
 12. **What LINE shows is plain text.** LINE renders no Markdown, so
     `send_response` strips markup from every outgoing text (reply, image
@@ -306,11 +317,12 @@ These are load-bearing and easy to break by accident:
     derived from `COLAB_SHARED_SECRET` and the session id. A registration
     needs a fresh, unused signature for the current session; its tunnel
     URL must be `https://` plus a quick-tunnel host or `COLAB_TUNNEL_HOST`,
-    resolve to public addresses only, and pass the readiness probe (Ollama
-    version, the chat model wholly in VRAM at its pinned digest, think
-    values) before the session is READY. A router digest other than its pin
-    (or none recorded), or a router not wholly in VRAM, only turns Colab
-    routing off for that session.
+    resolve to public addresses only, and pass the readiness probe (the
+    Ollama release the launcher picked, at least the minimum; the chat
+    model loaded, listed and wholly in VRAM; its think values) before the
+    session is READY. No digest is judged: the models follow their tags.
+    A router not loaded or not wholly in VRAM only turns Colab routing off
+    for that session, with one ERROR at READY saying why.
     All Colab traffic uses the page fetcher's pinned public-only transport.
 
 18. **Colab's control plane stays off the request path, and its credential

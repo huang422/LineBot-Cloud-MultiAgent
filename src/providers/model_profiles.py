@@ -15,7 +15,7 @@ deliberately low one, see :mod:`src.runtime.model_roles`).
 An NVIDIA or OpenRouter id without a profile still works:
 :func:`generic_profile` stands in with the provider's plain protocol, and
 the role table reports it as a config warning instead of dropping the tier.
-Colab serves only the models its VM pins, all profiled here.
+Colab serves only the models colab/versions.json lists, all profiled here.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ NIM_NEMOTRON3 = "nim_nemotron3"
 NIM_REASONING_EFFORT = "nim_reasoning_effort"
 OPENROUTER = "openrouter"  # OpenAI chat + a "reasoning" object
 OLLAMA_CHAT = "ollama_chat"  # Ollama native /api/chat ("think")
-SYSTEMONE = "systemone"  # Ollama /v1/systemone multiple-choice scoring
+SYSTEMONE = "systemone"  # Ollama /v1/systemone decision scoring
 NIM_EMBED = "nim_embed"
 NIM_FLUX2_KLEIN = "nim_flux2_klein"
 NIM_FLUX1_DEV = "nim_flux1_dev"
@@ -63,12 +63,12 @@ JSON_OBJECT = "json_object"
 PROMPT = "prompt"
 JSON_MODES: frozenset[str] = frozenset({JSON_SCHEMA, JSON_OBJECT, PROMPT})
 
-# Ollama's think values for qwen3.8 (0.35.0). "false" is sent as JSON false.
+# Ollama's think values for qwen3.8 (0.35.0 through 0.40.5). "false" is
+# sent as JSON false.
 THINK_LEVELS: tuple[str, ...] = ("false", "low", "medium", "xhigh")
 
 TEXT: frozenset[str] = frozenset({"text"})
 TEXT_IMAGE: frozenset[str] = frozenset({"text", "image"})
-TEXT_IMAGE_VIDEO: frozenset[str] = frozenset({"text", "image", "video"})
 
 # NIM rejects temperature 0 (its schemas use exclusiveMinimum 0).
 NIM_MIN_TEMPERATURE = 0.01
@@ -97,7 +97,7 @@ class ModelProfile:
     # Can be asked to think at all.
     can_think: bool = True
     # Thinks when a request says nothing, so "off" must be sent explicitly
-    # (OpenRouter qwen3.8 thinks at xhigh unless told effort "none").
+    # (OpenRouter dots-3 :free reasons unless told effort "none").
     thinking_default: bool = False
     # Takes NIM's top-level reasoning_budget while thinking.
     reasoning_budget: bool = False
@@ -119,12 +119,11 @@ class ModelProfile:
     # build.nvidia.com page slug for the daily end-of-life check (FLUX is
     # not in /v1/models, so its page is the only signal).
     page_slug: str = ""
-    # Colab: the Ollama manifest digest the session must have pulled
-    # (/api/tags); neither Ollama nor its registry fetches by digest, so it
-    # is checked after pulling the tag. The chat model's must match for the
-    # session to be READY; a router with another one is only skipped for
-    # that session (ADR-0010).
-    digest: str = ""
+    # Colab: the last Ollama manifest digest (/api/tags) someone checked by
+    # hand (colab/README.md). Information only: the models follow their
+    # tags since 2026-10-16, so a session at another digest is logged
+    # ("tag moved since it was verified"), never refused (ADR-0010).
+    verified_digest: str = ""
     # False for the stand-in :func:`generic_profile` returns.
     known: bool = True
 
@@ -223,15 +222,24 @@ _PROFILES: tuple[ModelProfile, ...] = (
         page_slug="black-forest-labs/flux_1-dev",
     ),
     # ── OpenRouter free ids (per-endpoint facts from /models/{id}/endpoints) ──
-    # Not served by NVIDIA, so they survive an NIM outage.
+    # Not served by NVIDIA (upstream AtlasCloud), so it survives an NIM
+    # outage. It took the place of qwen/qwen3.8-27b:free, which OpenRouter
+    # withdrew (no endpoints since 2026-10-13; HTTP 404 "This model is
+    # unavailable for free"). Live probe 2026-10-16: a tool call in 2.0 s;
+    # the red-circle data URI with effort "none" in 1.7 s, 0 reasoning
+    # tokens, answered in Traditional Chinese; without a reasoning object it
+    # reasons (280 tokens), and effort "medium" works. Its tool_choice takes
+    # only "none" and "auto", the two the tool loop sends; response_format
+    # and structured_outputs both work. A preview: GET /api/v1/models lists
+    # expiration_date 2026-12-31, which the daily lifecycle check reports as
+    # expiring.
     ModelProfile(
         "openrouter",
-        "qwen/qwen3.8-27b:free",
+        "dots-studio/dots-3-note-preview:free",
         OPENROUTER,
-        modalities=TEXT_IMAGE_VIDEO,
-        thinking_default=True,  # at xhigh
-        efforts=("low", "medium", "xhigh"),
-        json_modes=frozenset({JSON_SCHEMA, PROMPT}),
+        modalities=TEXT_IMAGE,
+        thinking_default=True,
+        json_modes=frozenset({JSON_SCHEMA, JSON_OBJECT, PROMPT}),
     ),
     # Served by NVIDIA itself: they fail together with NIM. Ultra :free is
     # text only and takes no response_format.
@@ -252,9 +260,9 @@ _PROFILES: tuple[ModelProfile, ...] = (
     ),
     # Picks a free model at random, some of which reason by default.
     ModelProfile("openrouter", "openrouter/free", OPENROUTER, modalities=TEXT_IMAGE, can_think=False, thinking_default=True),
-    # ── Colab Ollama 0.35 ──
+    # ── Colab Ollama (0.40.4 or later, the launcher's pick) ──
     # The -mtp tag has qwen3.8:27b's weights with multi-token prediction on
-    # and a single-platform digest, so the pin below is stable.
+    # and a single-platform manifest (still a plain one for 0.40.5 clients).
     ModelProfile(
         "colab",
         "qwen3.8:27b-mtp-q4_K_M",
@@ -263,20 +271,24 @@ _PROFILES: tuple[ModelProfile, ...] = (
         thinking_default=True,  # "medium" when think is omitted
         think_levels=THINK_LEVELS,
         json_modes=frozenset({JSON_SCHEMA, PROMPT}),
-        digest="22130167c4c20e20c7b71454612966ca8e8171e9b3cc8ab6ce8aa6cbfec79643",
+        verified_digest="22130167c4c20e20c7b71454612966ca8e8171e9b3cc8ab6ce8aa6cbfec79643",
     ),
-    # The router (ADR-0010): nimble:9b = 9b-q8_0 = latest, the 2026-09-30
-    # manifest (Q8_0, 9,527,501,312-byte GGUF, Nimble's own SYSTEM layer,
-    # {"num_ctx":8194}, Apache-2.0). Bespoke republishes it often: re-pin
-    # here and in colab/versions.json together.
+    # The router (ADR-0010, since 2026-10-16): Cloudflare's clef-flash, a
+    # decision model fine-tuned from Qwen3.5-9B (Apache-2.0). It replaced
+    # nimble:9b, whose 2026-10-14 republish requires Ollama 0.40.4. The tag
+    # is a manifest list; on 0.40.5 /api/tags reports its llamacpp child,
+    # 73e026ff... as of 2026-10-16: a Q8_0 GGUF of 9,657,260,192 bytes, a
+    # 921,704,928-byte vision projector, params {"num_ctx":16384}, config
+    # "requires": "0.40.4", no SYSTEM layer (the prompt template lives in
+    # the GGUF). Text only here: the bot sends it no image.
     ModelProfile(
         "colab",
-        "nimble:9b",
+        "clef-flash:9b",
         SYSTEMONE,
         can_think=False,
         tools=False,
         json_modes=frozenset(),
-        digest="24e550a16a7081881be2f1f0d91e8cc13a597472735c04119f035a0a85c67e0c",
+        verified_digest="73e026ff389b28464bb26f8978f3164851a76832f0d339032747e2c56f98ea29",
     ),
 )
 
@@ -293,7 +305,7 @@ def generic_profile(provider: str, model: str, kind: str = CHAT) -> ModelProfile
 
     None when *provider* cannot serve *kind* at all (only NVIDIA embeds and
     draws) or serves only profiled ids (Colab, whose VM pulls only the
-    pinned models). Nothing is assumed that would refuse a request: every
+    models versions.json lists). Nothing is assumed that would refuse a request: every
     input type, JSON mode and effort is allowed, and "off" is always sent.
     """
     if kind == CHAT:

@@ -14,16 +14,19 @@ controller's heartbeat cell prints its first 300 characters):
   (``--require-hashes``), nothing resolved at boot (``--no-deps``), nothing
   built from source (``--only-binary=:all:``);
 - ``zstd``, ``gpu`` (nvidia-smi: at least 38000 MiB and driver 550),
-  ``ollama_install`` (the pinned tarball, sha256-checked, ``zstd -dc | tar``
-  into /usr), ``ollama_start`` (``ollama serve`` with OLLAMA_SERVE_ENV),
-  ``pull`` (both tags, 3 tries, digests checked: the chat model's must be
-  its pin; a router that did not pull or has another digest is logged at
-  ERROR and boots on, see register.py) and ``warmup`` (load qwen3.8 first,
-  then nimble with one tiny /v1/systemone call, then record what each got
+  ``ollama_install`` (the tarball versions.json names, its size and
+  sha256 checked, ``zstd -dc | tar`` into /usr: the launcher wrote that
+  entry, the latest release or the pinned fallback), ``ollama_start`` (``ollama serve`` with
+  OLLAMA_SERVE_ENV), ``pull`` (both tags, 3 tries; the models follow their
+  tags, so each digest is only logged, beside the last verified one: the
+  chat model must pull, a router that did not is logged at ERROR and boots
+  on, see register.py) and ``warmup`` (load qwen3.8 first, then the router
+  (clef-flash) with one tiny /v1/systemone call, then record what each got
   in VRAM: /api/ps and nvidia-smi's memory.used go to state.json and the
   ready event's ``gpu``; a router that did not load or is not wholly in
-  VRAM is logged at ERROR and boots on, like one off its pin, and one whose
-  loading evicted qwen3.8 is unloaded and qwen3.8 loaded again alone).
+  VRAM is logged at ERROR and boots on, and one whose loading evicted
+  qwen3.8 is unloaded and qwen3.8 loaded again alone). Why the router is
+  missing, if it is, goes to the bot in the ready event's ``error``.
   With DRYRUN=1 all of these become
   ``stub_start``: a stub upstream on the Ollama port that answers the
   readiness probe with canned values, so the whole control path runs on a
@@ -32,11 +35,12 @@ controller's heartbeat cell prints its first 300 characters):
   bearer token;
 - ``probe``: ``register.probe_problems`` through the proxy, the same check
   the bot makes through the tunnel;
-- ``tunnel``: the pinned cloudflared (sha256-checked), a quick tunnel (host
-  from the metrics server's /quicktunnel) or a named one (TUNNEL_TOKEN in
-  its environment, never in argv; its public host is TUNNEL_HOST), retried
-  with ``--protocol http2`` when not ready in 90 s; ``tunnel_check`` then
-  calls /api/version through it (a failure there is only logged);
+- ``tunnel``: the pinned cloudflared (size and sha256 checked), a quick
+  tunnel (host from the metrics server's /quicktunnel) or a named one
+  (TUNNEL_TOKEN in its environment, never in argv; its public host is
+  TUNNEL_HOST), retried with ``--protocol http2`` when not ready in 90 s;
+  ``tunnel_check`` then calls /api/version through it (a failure there is
+  only logged);
 - ``register``: the signed ``ready`` event, retried on 5xx and 422 (the bot
   could not resolve a brand-new tunnel host yet); the VM is then ``ready``.
 
@@ -149,7 +153,7 @@ class BootstrapError(Exception):
 
 
 class DownloadError(BootstrapError):
-    """A pinned download failed or did not match its sha256."""
+    """A pinned download failed, or did not match its size or sha256."""
 
 
 class EnvError(ValueError):
@@ -429,25 +433,38 @@ def download_verified(
     url: str,
     dest: Path,
     sha256: str,
+    size: int,
     *,
     open_url: Callable[..., Any] = _DOWNLOAD_OPENER.open,
     attempts: int = 3,
     sleep: Callable[[float], None] = time.sleep,
     timeout: float = 60.0,
 ) -> None:
-    """Puts *url* at *dest* only if its sha256 is *sha256*. A file already there
-    with that hash is kept; network errors are retried, a wrong hash is not."""
-    if dest.exists() and file_sha256(dest) == sha256:
+    """Puts *url* at *dest* only if it is *size* bytes with sha256 *sha256*.
+    A file already there that matches is kept. Network errors and a body cut
+    short are retried; a body longer than *size* is cut off at once (it
+    never fills the disk) and, like a wrong hash, is not retried."""
+    if dest.exists() and dest.stat().st_size == size and file_sha256(dest) == sha256:
         return
     name = dest.name
     part = dest.with_name(name + ".part")
     for attempt in range(1, attempts + 1):
         digest = hashlib.sha256()
+        received = 0
         try:
             with open_url(url, timeout=timeout) as response, open(part, "wb") as out:
                 while chunk := response.read(1 << 20):
+                    received += len(chunk)
+                    if received > size:
+                        raise DownloadError(f"{name} is longer than the pinned {size} bytes")
                     digest.update(chunk)
                     out.write(chunk)
+            if received < size:
+                # The connection ended early: a network failure, retried.
+                raise http.client.IncompleteRead(b"", size - received)
+        except DownloadError:
+            part.unlink(missing_ok=True)
+            raise
         except (OSError, http.client.HTTPException) as exc:
             part.unlink(missing_ok=True)
             if attempt == attempts:
@@ -524,8 +541,8 @@ class Ops:
     ) -> tuple[int, bytes]:
         return register.http_request(method, url, body, headers, timeout)
 
-    def download(self, url: str, dest: Path, sha256: str) -> None:
-        download_verified(url, dest, sha256, sleep=self.sleep)
+    def download(self, url: str, dest: Path, sha256: str, size: int) -> None:
+        download_verified(url, dest, sha256, size, sleep=self.sleep)
 
     def terminate(self, proc: subprocess.Popen) -> None:
         """Stops a process this run started, with its process group."""
@@ -691,33 +708,41 @@ def ollama_version(ops: Ops, base: str = OLLAMA_URL, headers: Mapping[str, str] 
 
 
 def models_in_load_order(versions: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any]]]:
-    """The pinned models, the chat model first. Ollama loads a model beside
-    the loaded ones only while it predicts it fits (else it evicts one), and
-    qwen3.8 at 32K context is the one that must stay: nimble then takes
+    """The models, the chat model first. Ollama loads a model beside the
+    loaded ones only while it predicts it fits (else it evicts one), and
+    qwen3.8 at 32K context is the one that must stay: the router then takes
     what is left (colab/README.md, "VRAM")."""
     return sorted(versions["models"].items(), key=lambda item: item[1]["role"] != "chat")
 
 
-def warm_up(versions: Mapping[str, Any], *, ops: Ops, base: str = OLLAMA_URL) -> None:
-    """Loads every pinned model, the chat model first, and keeps it loaded (keep_alive -1).
+def warm_up(
+    versions: Mapping[str, Any], *, ops: Ops, base: str = OLLAMA_URL, skip: Iterable[str] = ()
+) -> list[str]:
+    """Loads every model, the chat model first, and keeps it loaded (keep_alive -1).
 
     The chat model must load (else BootstrapError). A router need not: one
     that does not load is logged at ERROR and left out, and so is one whose
     loading evicted the chat model (Ollama evicts an idle model rather than
-    load the next one partly on the CPU, colab/README.md "VRAM"): it is
-    unloaded and the chat model loaded again, alone. The bot then routes
-    the session without it.
+    load the next one when it predicts no fit, colab/README.md "VRAM"): it
+    is unloaded and the chat model loaded again, alone. The bot then routes
+    the session without it. A router in *skip* (it did not pull) is not
+    tried. Returns why each router is left out, for the ready event.
     """
-    chat = [(model, pin) for model, pin in models_in_load_order(versions) if register.must_be_exact(pin)]
+    chat = [(model, pin) for model, pin in models_in_load_order(versions) if register.required(pin)]
+    skipped = set(skip)
+    problems: list[str] = []
     for model, pin in models_in_load_order(versions):
-        if register.must_be_exact(pin):
+        if register.required(pin):
             _load(model, pin, ops=ops, base=base)
+            continue
+        if model in skipped:
             continue
         try:
             _load(model, pin, ops=ops, base=base)
         except (BootstrapError, OSError) as exc:
             # Ollama may have evicted the chat model before this load failed.
             logger.error("%s did not load (%s); booting on, the bot will route without it", model, exc)
+            problems.append(f"{model} did not load: {exc}")
         running = _running_models(ops, base)
         evicted = [name for name, _ in chat if running is not None and name not in running]
         if not evicted:
@@ -726,9 +751,11 @@ def warm_up(versions: Mapping[str, Any], *, ops: Ops, base: str = OLLAMA_URL) ->
             "loading %s evicted %s (not enough VRAM for both); unloading %s and booting on without it",
             model, ", ".join(evicted), model,
         )
+        problems.append(f"loading {model} evicted {', '.join(evicted)} (not enough VRAM for both); unloaded it")
         _unload(model, ops=ops, base=base)
         for name, chat_pin in chat:
             _load(name, chat_pin, ops=ops, base=base)
+    return problems
 
 
 def _load(model: str, pin: Mapping[str, Any], *, ops: Ops, base: str) -> None:
@@ -900,29 +927,33 @@ def self_unassign(environ: Mapping[str, str], *, send: register.Sender = registe
 
 def stub_payloads(versions: Mapping[str, Any]) -> dict[str, Any]:
     """What the stub answers: canned /api/version, /api/ps, /api/tags and
-    /api/show bodies built from the pins, shaped like Ollama 0.35.0's, which
-    pass the readiness probe (every pinned model loaded fully on the GPU)."""
+    /api/show bodies built from versions.json (each model at its verified
+    digest), shaped like Ollama 0.40.5's, which pass the readiness probe
+    (every model loaded fully on the GPU)."""
     context = int(OLLAMA_SERVE_ENV["OLLAMA_CONTEXT_LENGTH"])
     ps, tags, shows = [], [], {}
     for name, pin in versions["models"].items():
         chat = pin["role"] == "chat"
+        family = "qwen35" if chat else "clef"
         details = {
             "parent_model": "",
             "format": "gguf",
-            "family": "qwen35",
-            "families": ["qwen35"],
-            "parameter_size": "27.3B" if chat else "9.0B",
+            "family": family,
+            "families": [family],
+            "parameter_size": "27.3B" if chat else "9.1B",
             "quantization_level": "Q4_K_M" if chat else "Q8_0",
         }
-        # Loaded: the plan's figure for qwen3.8 at 32K, Ollama's own estimate
-        # for nimble (GGUF + KV cache at 8194); both unmeasured.
-        loaded = 25_300_000_000 if chat else 10_601_505_280
+        # Loaded: the plan's figure for qwen3.8 at 32K; for clef-flash
+        # Ollama 0.40.5's own preflight estimate (the 9,657,260,192-byte
+        # GGUF + 2 GiB of KV at num_ctx 16384 + the 2 GiB batch allowance of
+        # a decision model). Both unmeasured.
+        loaded = 25_300_000_000 if chat else 13_952_227_488
         ps.append(
             {
                 "name": name,
                 "model": name,
                 "size": loaded,
-                "digest": pin["digest"],
+                "digest": pin["verified_digest"],
                 "details": details,
                 "expires_at": "2318-01-01T00:00:00Z",
                 "size_vram": loaded,
@@ -935,16 +966,18 @@ def stub_payloads(versions: Mapping[str, Any]) -> dict[str, Any]:
                 "name": name,
                 "model": name,
                 "modified_at": "2026-09-30T00:00:00Z",
-                # The manifests' config and layers (nimble's has a SYSTEM layer).
-                "size": 17_741_860_480 if chat else 9_527_502_277,
-                "digest": pin["digest"],
+                # The manifests' config and layers (clef-flash's: the GGUF,
+                # its vision projector, params and config).
+                "size": 17_741_860_480 if chat else 10_578_965_269,
+                "digest": pin["verified_digest"],
                 "details": details,
             }
         )
         show: dict[str, Any] = {
             "details": details,
             "model_info": {},
-            "capabilities": ["completion", "vision", "tools", "thinking"] if chat else ["completion", "decision"],
+            # A decision model reports only "decision" (since Ollama 0.35.1).
+            "capabilities": ["completion", "vision", "tools", "thinking"] if chat else ["decision"],
             "modified_at": "2026-09-30T00:00:00Z",
         }
         if pin.get("thinking") is not None:
@@ -1079,6 +1112,9 @@ class Bootstrap:
         self.gpu: dict[str, Any] | None = None
         self.digests: dict[str, str] = {}
         self.ollama_version = ""
+        # Why the router is not serving (it did not pull or load, or is not
+        # wholly in VRAM): the ready event's error, for the bot's log.
+        self.router_problems: list[str] = []
 
     # The proxy's bearer header, for the checks this run makes through it.
     @property
@@ -1102,9 +1138,9 @@ class Bootstrap:
                 self._enter("ollama_start")
                 self.start_upstream_and_wait()
                 self._enter("pull")
-                self.pull_models()
+                unpulled = self.pull_models()
                 self._enter("warmup")
-                warm_up(self.versions, ops=self.ops)
+                self.router_problems += warm_up(self.versions, ops=self.ops, skip=unpulled)
                 self.record_vram()
             self._enter("proxy")
             self.start_proxy()
@@ -1159,7 +1195,8 @@ class Bootstrap:
         )
 
     def ensure_zstd(self) -> None:
-        """Ollama 0.35.0 ships only as .tar.zst."""
+        """Ollama's linux-amd64 build ships only as .tar.zst (0.35.0 through
+        0.40.5 at least), whichever release the launcher picked."""
         if self.ops.which("zstd"):
             return
         env = {**child_env(self.ops.environ()), "DEBIAN_FRONTEND": "noninteractive"}
@@ -1189,7 +1226,7 @@ class Bootstrap:
     def install_ollama(self) -> None:
         pin = self.versions["ollama"]
         archive = self.paths.ollama_archive
-        self.ops.download(pin["url"], archive, pin["sha256"])
+        self.ops.download(pin["url"], archive, pin["sha256"], pin["size"])
         self._run(
             ["bash", "-o", "pipefail", "-c", 'zstd -dc -- "$1" | tar -x -C "$2"', "extract",
              str(archive), str(self.paths.usr)],
@@ -1207,17 +1244,25 @@ class Bootstrap:
         if got != want:
             raise BootstrapError(f"the upstream is Ollama {got}, not {want}")
 
-    def pull_models(self) -> None:
+    def pull_models(self) -> set[str]:
+        """Pulls every tag; returns the routers that did not pull.
+
+        The models follow their tags (2026-10-16): a digest other than the
+        last verified one is logged at INFO, never refused. Only the chat
+        model must pull; a router that does not is logged at ERROR and the
+        bot routes the session without it.
+        """
         unpulled: set[str] = set()
         for model, pin in models_in_load_order(self.versions):
             try:
                 self._pull(model)
             except BootstrapError as exc:
-                if register.must_be_exact(pin):
+                if register.required(pin):
                     raise
                 # The ready event reports no digest for it and the bot
                 # routes the session without it.
                 logger.error("%s; booting on, the bot will route without it", exc)
+                self.router_problems.append(str(exc))
                 unpulled.add(model)
         status, body = self.ops.http("GET", OLLAMA_URL + "/api/tags", None, None, 10.0)
         if status != 200:
@@ -1228,18 +1273,19 @@ class Bootstrap:
             if isinstance(m, dict)
         }
         for model, pin in self.versions["models"].items():
-            got = listed.get(model, "")
-            if got == pin["digest"] or model in unpulled:
+            got = listed.get(model)
+            if got is None:
+                if model not in unpulled:
+                    # The probe names a missing chat model; the bot reads a
+                    # router missing from /api/tags as not pulled.
+                    logger.warning("%s pulled but /api/tags does not list it", model)
+                    if not register.required(pin):
+                        self.router_problems.append(f"{model} pulled but /api/tags does not list it")
                 continue
-            if not register.must_be_exact(pin):
-                # A republished (or missing) router: the ready event reports
-                # what there is and the bot routes the session without it.
-                logger.error(
-                    "%s has digest %s, not the pinned %s; booting on, the bot will route without it",
-                    model, got or "(none)", pin["digest"],
-                )
-                continue
-            raise BootstrapError(f"{model} has digest {got[:12] or '(none)'}, not the pinned {pin['digest'][:12]}")
+            verified = pin["verified_digest"]
+            note = "the verified one" if got == verified else f"tag moved since it was verified ({verified[:12]})"
+            logger.info("%s is at digest %s, %s", model, got or "(none)", note)
+        return unpulled
 
     def _pull(self, model: str) -> None:
         payload = json.dumps({"model": model, "stream": False}).encode()
@@ -1281,10 +1327,13 @@ class Bootstrap:
                 continue  # the probe names the chat model; warm_up logged a router
             in_vram, size = register.gpu_share(entry)
             report[f"{pin['role']}_on_gpu"] = f"{register.mib(in_vram)}/{register.mib(size)} MiB"
-            if not register.on_gpu(entry) and not register.must_be_exact(pin):
+            if not register.on_gpu(entry) and not register.required(pin):
                 logger.error(
                     "%s is not fully on the GPU (%s of %s MiB in VRAM); booting on, the bot will route without it",
                     model, register.mib(in_vram), register.mib(size),
+                )
+                self.router_problems.append(
+                    f"{model} is not fully on the GPU ({register.mib(in_vram)} of {register.mib(size)} MiB in VRAM)"
                 )
         used = self.gpu_memory_used()
         if used is not None:
@@ -1359,7 +1408,7 @@ class Bootstrap:
 
     def start_tunnel(self) -> str:
         pin = self.versions["cloudflared"]
-        self.ops.download(pin["url"], self.paths.cloudflared, pin["sha256"])
+        self.ops.download(pin["url"], self.paths.cloudflared, pin["sha256"], pin["size"])
         os.chmod(self.paths.cloudflared, 0o755)
         for moved in move_cloudflared_config_aside(self.paths.cloudflared_config_dir):
             logger.warning("moved %s aside: quick tunnels refuse to run with it", moved)
@@ -1424,6 +1473,9 @@ class Bootstrap:
             versions={"ollama": self.ollama_version, "cloudflared": self.versions["cloudflared"]["version"]},
             digests=self.digests,
             gpu=self.gpu,
+            # Why the router is not serving, for the bot's log (the VM's own
+            # log never reaches Cloud Logging); None when it is.
+            error="; ".join(self.router_problems) or None,
         )
         error = ""
         for attempt in range(1, REGISTER_ATTEMPTS + 1):
